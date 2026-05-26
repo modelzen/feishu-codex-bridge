@@ -1,6 +1,7 @@
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import { isAdmin, type AppConfig } from '../config/schema';
 import { buildDmMenuCard } from '../card/dm-cards';
+import { sendManagedCard } from '../card/managed';
 import { log, withTrace } from '../core/logger';
 import { createProject } from '../project/lifecycle';
 import { listProjects, getProjectByName, removeProject } from '../project/registry';
@@ -94,7 +95,11 @@ export async function handleDmConsole(channel: LarkChannel, cfg: AppConfig, msg:
         default:
           // card-first console: text commands still work, but the default
           // surface is the interactive menu (buttons → CardDispatcher dm.*).
-          await channel.send(msg.chatId, { card: buildDmMenuCard() }, { replyTo: msg.messageId }).catch(() => undefined);
+          // Sent as a CardKit entity so dm.* button clicks can update it in
+          // place (raw-JSON cards can't be patched — they flash and revert).
+          await sendManagedCard(channel, msg.chatId, buildDmMenuCard(), msg.messageId).catch((err) =>
+            log.fail('console', err, { cmd: 'menu-send' }),
+          );
       }
     } catch (err) {
       log.fail('console', err, { cmd });

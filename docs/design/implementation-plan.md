@@ -82,7 +82,7 @@ interface AgentRun { events: AsyncIterable<AgentEvent>; turnId(); waitForExit(ms
 ## 4. M1 需用户准备
 1. **appSecret**（WSClient 必需，存 keystore）
 2. **开放平台事件订阅(长连接)**：im.message.receive_v1 + card.action.trigger + application.bot.menu_v6，发布版本
-3. **scope**：im:message / im:message:send_as_bot / im:resource / im:chat / im:pin(或 im:message.pins:write_only)；可选 drive:drive。**不需 im:chat:delete**
+3. **scope**：im:message / im:message:send_as_bot / im:resource / im:chat / im:pin(或 im:message.pins:write_only) / **cardkit:card:write**(交互按钮卡片用 CardKit 实体，缺则 cardkit.card.create 报 200610)；可选 drive:drive。**不需 im:chat:delete**
 4. 机器人自定义菜单 5 项 event_key（M2 用，可同时配）
 5. codex 已 login（M1 真实跑 turn 耗 token）；记 codex 版本对齐 generate-ts
 6. 一个测试群(bot 在内)+测试 cwd（M1 写死用）

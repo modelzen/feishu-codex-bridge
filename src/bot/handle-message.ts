@@ -14,6 +14,7 @@ import {
 } from '../config/schema';
 import { saveConfig } from '../config/store';
 import { CardDispatcher } from '../card/dispatcher';
+import { sendManagedCard, updateManagedCard } from '../card/managed';
 import { RunRender } from '../card/run-render';
 import {
   buildConfigDoneCard,
@@ -221,11 +222,9 @@ export function createOrchestrator(
         mode: 'config',
         createdAt: Date.now(),
       };
-      const res = await channel.send(
-        msg.chatId,
-        { card: buildSessionConfigCard(state) },
-        { replyTo: msg.messageId },
-      );
+      // CardKit entity so the model/effort/create/resume buttons can update it
+      // in place (raw-JSON cards flash and revert on click).
+      const res = await sendManagedCard(channel, msg.chatId, buildSessionConfigCard(state), msg.messageId);
       prunePending();
       pending.set(res.messageId, state);
       log.info('card', 'config', { project: project?.name ?? '(unregistered)', model, effort });
@@ -235,6 +234,22 @@ export function createOrchestrator(
   // ── card actions ──────────────────────────────────────────────────
   const dispatcher = new CardDispatcher(channel, cfg);
   const PENDING_TTL_MS = 30 * 60_000; // abandoned config cards expire after 30 min
+
+  // A card update issued from inside a cardAction handler must land AFTER the
+  // callback's HTTP-200 ack — Feishu locks the card during the click's
+  // interaction window and reverts any concurrent/earlier update to the
+  // pre-click state (official "处理卡片回调"; cardkit err 200810; the symptom is
+  // the card flashing then snapping back). So handlers return immediately
+  // (letting the SDK ack) and we apply the update detached, after a short
+  // settle. Cards must be CardKit entities (sendManagedCard) for the update to
+  // target them — im.v1.message.patch only does "unconditional" updates.
+  const CARD_SETTLE_MS = 500;
+  const settleUpdate = (msgId: string, c: object): void => {
+    void (async () => {
+      await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
+      await updateManagedCard(channel, msgId, c);
+    })();
+  };
 
   function prunePending(): void {
     const now = Date.now();
@@ -261,8 +276,8 @@ export function createOrchestrator(
     return state;
   }
 
-  function refresh(cardMsgId: string, state: SessionConfigState): Promise<void> {
-    return channel.updateCard(cardMsgId, buildSessionConfigCard(state)).catch(() => undefined) as Promise<void>;
+  function refresh(cardMsgId: string, state: SessionConfigState): void {
+    settleUpdate(cardMsgId, buildSessionConfigCard(state));
   }
 
   dispatcher
@@ -301,7 +316,7 @@ export function createOrchestrator(
       const state = authConfig(evt);
       if (!state || state.launching) return;
       state.launching = true;
-      await channel.updateCard(evt.messageId, buildConfigLaunchingCard(state, 'created')).catch(() => undefined);
+      settleUpdate(evt.messageId, buildConfigLaunchingCard(state, 'created'));
       // detach: don't hold the cardAction callback for the whole Codex run
       void launchFromCard(evt, state, 'created', () =>
         backend.startThread({ cwd: state.cwd, model: state.model, effort: state.effort }),
@@ -312,7 +327,7 @@ export function createOrchestrator(
       const codexThreadId = typeof value.t === 'string' ? value.t : undefined;
       if (!state || !codexThreadId || state.launching) return;
       state.launching = true;
-      await channel.updateCard(evt.messageId, buildConfigLaunchingCard(state, 'resumed')).catch(() => undefined);
+      settleUpdate(evt.messageId, buildConfigLaunchingCard(state, 'resumed'));
       void launchFromCard(evt, state, 'resumed', () =>
         backend.resumeThread({ cwd: state.cwd, codexThreadId, model: state.model, effort: state.effort }),
       );
@@ -380,8 +395,9 @@ export function createOrchestrator(
   // DM management console buttons (design §3.1). Admin-gated; sub-views patch
   // the same card in place, each carrying a ⬅️ 菜单 back button.
   const dmAdmin = (openId?: string): boolean => isAdmin(cfg, openId ?? '');
-  const patch = (msgId: string, c: object): Promise<void> =>
-    channel.updateCard(msgId, c).catch(() => undefined) as Promise<void>;
+  // DM cards are CardKit entities (sendManagedCard); update them via the
+  // settle-then-cardkit path so the click's callback acks first.
+  const patch = (msgId: string, c: object): void => settleUpdate(msgId, c);
 
   async function applyPref(evt: CardActionEvent, mut: (p: AppPreferences) => void): Promise<void> {
     if (!dmAdmin(evt.operator?.openId)) return;
@@ -526,15 +542,13 @@ export function createOrchestrator(
       log.info('card', 'launch', { kind, model: state.model, effort: state.effort });
       await launchSessionFromCard(state, thread, () => {
         pending.delete(evt.messageId);
-        void channel.updateCard(evt.messageId, buildConfigDoneCard(state, kind)).catch(() => undefined);
+        void updateManagedCard(channel, evt.messageId, buildConfigDoneCard(state, kind));
       });
     } catch (err) {
       state.launching = false; // keep pending → card stays retryable
       log.fail('card', err, { phase: `${kind}-launch` });
       if (thread) void thread.close().catch(() => undefined);
-      await channel
-        .updateCard(evt.messageId, buildConfigErrorCard(state, err instanceof Error ? err.message : String(err)))
-        .catch(() => undefined);
+      await updateManagedCard(channel, evt.messageId, buildConfigErrorCard(state, err instanceof Error ? err.message : String(err)));
     }
   }
 
