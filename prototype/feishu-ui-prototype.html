@@ -1,0 +1,429 @@
+<!doctype html>
+<!--
+  ⚠️ THROWAWAY PROTOTYPE — feishu-codex-bridge UI preview
+  =======================================================
+  This is NOT production code and NOT the "3 radically different variants"
+  shape from the prototype skill. It is ONE Feishu-faithful design rendered
+  across many SCREENS/STATES, so we can preview the agreed interaction model
+  before writing the real bridge.
+
+  Question it answers: "Does the DM-menu + project-group + thread interaction
+  surface feel right, rendered in a realistic Lark UI?"
+
+  Run: just open this file in a browser. No build, no backend.
+  Switch screens: floating bottom bar (← →), or ←/→ arrow keys, or click the
+  menu items / buttons inside the mock (they navigate).
+
+  Delete me once the design is locked.
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>feishu-codex-bridge · UI 预览原型</title>
+<style>
+  :root{
+    --rail:#f4f5f7; --rail-icon:#8f959e; --blue:#3370ff; --blue-soft:#eaf1ff;
+    --ink:#1f2329; --ink2:#51565d; --gray:#8f959e; --line:#eceef0; --line2:#e6e8eb;
+    --card:#ffffff; --bubble-me:#e8f1ff; --bubble-bot:#f5f6f7; --chip-bot:#f0ecff;
+    --chip-bot-fg:#7c5cff; --pin:#fff8e6; --pin-line:#ffe7a8; --ok:#1a9c5a;
+    --select-bg:#fff; --select-line:#d6d9dd;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:#dfe1e5;color:var(--ink)}
+  .app{position:absolute;inset:18px;background:#fff;border-radius:12px;overflow:hidden;display:flex;box-shadow:0 12px 40px rgba(0,0,0,.18)}
+  /* left rail */
+  .rail{width:60px;background:var(--rail);display:flex;flex-direction:column;align-items:center;padding:10px 0;gap:14px;border-right:1px solid var(--line)}
+  .rail .ava{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,#7aa8ff,#b39bff);margin-bottom:4px}
+  .rail .ri{width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;color:var(--rail-icon);font-size:17px;position:relative;cursor:default}
+  .rail .ri.on{background:#e6ecf5;color:var(--blue)}
+  .rail .badge{position:absolute;top:-2px;right:-3px;background:#f53f3f;color:#fff;font-size:9px;line-height:1;padding:2px 4px;border-radius:8px}
+  .rail .ri small{font-size:9px;position:absolute;bottom:-1px}
+  .rail .spacer{flex:1}
+  /* chat list */
+  .list{width:286px;border-right:1px solid var(--line);display:flex;flex-direction:column;background:#fff}
+  .list .lh{display:flex;align-items:center;gap:8px;padding:14px 16px 8px;font-weight:600;font-size:17px}
+  .list .lh .mi{color:var(--gray);font-weight:400}
+  .list .pinrow{display:flex;align-items:center;gap:8px;padding:6px 16px 10px;color:var(--ink2);font-size:12px}
+  .list .pinrow .dot{width:30px;height:30px;border-radius:50%;background:conic-gradient(from 0deg,#ff8a8a,#ffd36e,#7ee0a1,#7ab8ff,#c79bff,#ff8a8a)}
+  .item{display:flex;gap:10px;padding:9px 14px;cursor:pointer;border-left:3px solid transparent}
+  .item:hover{background:#f7f8fa}
+  .item.on{background:var(--blue-soft);border-left-color:var(--blue)}
+  .item .iav{width:42px;height:42px;border-radius:11px;flex:0 0 42px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:18px}
+  .iav.bot{background:linear-gradient(135deg,#ff9a8b,#ff6a88)}
+  .iav.grp{background:#fff;border:1.5px solid #2bb673;color:#2bb673}
+  .iav.thr{background:#fff;border:1.5px solid #2bb673;color:#2bb673}
+  .iav.dev{background:#eef1f6;color:#5b6b8c}
+  .item .ibody{flex:1;min-width:0}
+  .item .itop{display:flex;align-items:center;gap:6px}
+  .item .iname{font-size:14px;font-weight:500;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
+  .item .itime{margin-left:auto;font-size:11px;color:var(--gray);flex:0 0 auto}
+  .item .iprev{font-size:12px;color:var(--gray);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px}
+  .chip{font-size:10px;padding:1px 5px;border-radius:4px;line-height:1.5}
+  .chip.bot{background:var(--chip-bot);color:var(--chip-bot-fg)}
+  .chip.grp{background:#eafaf0;color:#1a9c5a}
+  .chip.ext{background:#eef1ff;color:#5b7cff}
+  /* main pane */
+  .main{flex:1;display:flex;flex-direction:column;min-width:0;background:#fff}
+  .mh{display:flex;align-items:center;gap:10px;padding:13px 18px;border-bottom:1px solid var(--line)}
+  .mh .mav{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;color:#fff}
+  .mh .mtitle{font-size:17px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .mh .sub{font-size:12px;color:var(--gray)}
+  .mh .acts{margin-left:auto;display:flex;gap:16px;color:var(--gray);font-size:16px}
+  .mtabs{display:flex;gap:18px;padding:4px 18px 0;border-bottom:1px solid var(--line);font-size:13px}
+  .mtabs .t{padding:8px 2px;color:var(--ink2);border-bottom:2px solid transparent;cursor:default}
+  .mtabs .t.on{color:var(--blue);border-bottom-color:var(--blue);font-weight:500}
+  .body{flex:1;overflow:auto;padding:18px 22px;background:#fff}
+  /* messages */
+  .msg{display:flex;gap:10px;margin-bottom:18px}
+  .msg .mava{width:34px;height:34px;border-radius:9px;flex:0 0 34px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:16px}
+  .mava.me{background:linear-gradient(135deg,#8fd3ff,#6aa0ff)}
+  .mava.bot{background:linear-gradient(135deg,#ff9a8b,#ff6a88)}
+  .msg .mc{min-width:0;flex:1}
+  .msg .nm{font-size:12px;color:var(--gray);margin-bottom:5px;display:flex;align-items:center;gap:6px}
+  .bubble{display:inline-block;background:var(--bubble-me);color:var(--ink);padding:9px 13px;border-radius:10px;font-size:14px;max-width:680px;line-height:1.55}
+  .bubble.cmd{font-family:ui-monospace,Menlo,monospace}
+  .mention{color:var(--blue)}
+  /* card */
+  .fcard{background:var(--card);border:1px solid var(--line2);border-radius:10px;max-width:680px;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,.03)}
+  .fcard .ct{padding:14px 16px 10px;font-weight:600;font-size:15px;display:flex;align-items:center;gap:7px}
+  .fcard .cb{padding:0 16px 14px}
+  .fcard hr{border:none;border-top:1px solid var(--line);margin:6px 0 12px}
+  .desc{color:var(--gray);font-size:12.5px;line-height:1.5;margin:0 0 8px}
+  .desc i{font-style:italic}
+  .flabel{font-weight:600;font-size:13.5px;margin:14px 0 7px}
+  .flabel:first-child{margin-top:2px}
+  .sel{display:flex;align-items:center;justify-content:space-between;background:var(--select-bg);border:1px solid var(--select-line);border-radius:7px;padding:9px 12px;font-size:13.5px;cursor:pointer;color:var(--ink)}
+  .sel .cv{color:var(--gray)}
+  .inp{width:100%;border:1px solid var(--select-line);border-radius:7px;padding:9px 12px;font-size:13.5px;outline:none}
+  .inp:focus{border-color:var(--blue)}
+  .row2{display:flex;gap:10px}
+  .row2>*{flex:1}
+  .btns{display:flex;gap:10px;justify-content:flex-end;margin-top:14px}
+  .btn{padding:8px 16px;border-radius:7px;font-size:13.5px;border:1px solid var(--select-line);background:#fff;color:var(--ink2);cursor:pointer}
+  .btn.pri{background:var(--blue);border-color:var(--blue);color:#fff}
+  .btn.danger{background:#f53f3f;border-color:#f53f3f;color:#fff}
+  .btn.ghost{background:#f2f3f5;border-color:#f2f3f5}
+  .mono{font-family:ui-monospace,Menlo,monospace;background:#f3f4f6;border-radius:4px;padding:1px 6px;font-size:12.5px}
+  /* pinned banner */
+  .pin{background:var(--pin);border:1px solid var(--pin-line);border-radius:9px;padding:11px 14px;font-size:13px;line-height:1.7;margin-bottom:18px;max-width:680px}
+  .pin .pt{font-weight:600;margin-bottom:2px}
+  /* project list */
+  .plist .prow{display:flex;align-items:center;gap:10px;padding:11px 2px;border-bottom:1px solid var(--line)}
+  .plist .prow:last-child{border-bottom:none}
+  .plist .pmeta{flex:1;min-width:0}
+  .plist .pn{font-weight:600;font-size:14px;display:flex;gap:8px;align-items:center}
+  .plist .pp{font-size:12px;color:var(--gray);font-family:ui-monospace,Menlo,monospace;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .br{font-size:11px;color:#2a8c4a;background:#eafaf0;border-radius:4px;padding:1px 6px}
+  /* tool block */
+  .tool{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink2);padding:4px 0}
+  .tool .tg{font-family:ui-monospace,Menlo,monospace;background:#f3f4f6;border-radius:5px;padding:2px 7px;font-size:12px}
+  .typing{display:inline-flex;align-items:center;gap:7px;color:var(--ink2);font-weight:600;font-size:14px}
+  .blink{width:7px;height:14px;background:var(--blue);display:inline-block;animation:bk 1s steps(2) infinite}
+  @keyframes bk{0%{opacity:1}50%{opacity:0}}
+  .resume .rr{display:flex;align-items:center;gap:10px;padding:11px 2px;border-bottom:1px solid var(--line);font-size:13.5px}
+  .resume .rr:last-child{border-bottom:none}
+  .resume .rt{flex:1}
+  .resume .rtime{color:var(--gray);font-size:12px}
+  /* composer */
+  .composer{border-top:1px solid var(--line);padding:10px 16px 14px}
+  .botmenu{display:flex;gap:8px;margin-bottom:9px;flex-wrap:wrap}
+  .mitem{display:flex;align-items:center;gap:6px;border:1px solid var(--line2);background:#fff;border-radius:18px;padding:6px 13px;font-size:13px;color:var(--ink2);cursor:pointer}
+  .mitem:hover{border-color:var(--blue);color:var(--blue)}
+  .cbox{display:flex;align-items:center;border:1px solid var(--line2);border-radius:10px;padding:11px 14px;color:var(--gray);font-size:14px}
+  .cbox .cicons{margin-left:auto;display:flex;gap:15px;color:var(--gray);font-size:15px;align-items:center}
+  .sendbtn{color:var(--blue)}
+  .threadcompose{border:1px solid var(--line2);border-radius:10px;padding:10px 14px}
+  .threadcompose .ck{font-size:12px;color:var(--ink2);margin-top:8px;display:flex;align-items:center;gap:6px}
+  /* steering hint */
+  .hint{font-size:11px;color:var(--gray);margin-top:5px}
+  .reply-link{color:var(--blue);font-size:13px;margin-top:8px;display:inline-block}
+  .earlier{color:var(--blue);font-size:13px;border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:10px}
+  /* switcher */
+  .switch{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);display:flex;align-items:center;gap:4px;background:#1f2329;color:#fff;border-radius:999px;padding:6px 8px;box-shadow:0 8px 28px rgba(0,0,0,.32);z-index:99;font-size:13px}
+  .switch button{background:transparent;border:none;color:#fff;font-size:16px;cursor:pointer;width:30px;height:30px;border-radius:50%}
+  .switch button:hover{background:rgba(255,255,255,.15)}
+  .switch .lab{padding:0 10px;min-width:230px;text-align:center}
+  .switch .lab b{color:#8fb4ff}
+  .switch .grp{opacity:.6;font-size:11px}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- left rail -->
+  <div class="rail">
+    <div class="ava"></div>
+    <div class="ri">🔍</div>
+    <div class="ri">＋</div>
+    <div class="ri on">💬<span class="badge">30</span></div>
+    <div class="ri">🧠</div>
+    <div class="ri">📅</div>
+    <div class="ri">📄</div>
+    <div class="ri">🎬</div>
+    <div class="ri">🛠️</div>
+    <div class="spacer"></div>
+    <div class="ri">···</div>
+  </div>
+
+  <!-- chat list -->
+  <div class="list">
+    <div class="lh"><span class="mi">☰</span> 消息</div>
+    <div class="pinrow"><span class="dot"></span> 知识问答</div>
+    <div id="chatlist"></div>
+  </div>
+
+  <!-- main -->
+  <div class="main">
+    <div id="mainhead"></div>
+    <div class="body" id="mainbody"></div>
+    <div id="composer"></div>
+  </div>
+</div>
+
+<div class="switch">
+  <button onclick="nav(-1)">‹</button>
+  <div class="lab"><span class="grp" id="sgrp"></span><br><b id="sidx"></b> <span id="sname"></span></div>
+  <button onclick="nav(1)">›</button>
+</div>
+
+<script>
+/* ---------- shared fragments ---------- */
+const BOT='<span class="chip bot">智能体</span>';
+
+function chatList(active){
+  const items=[
+    {k:'dm', cls:'bot', ic:'🤖', name:'Codex Bridge', chip:BOT, t:'17:07', prev:'使用帮助 / 偏好设置'},
+    {k:'grp', cls:'grp', ic:'👥', name:'my-app', chip:'', t:'16:50', prev:'凯伦: @Codex Bridge 帮我重构登录…'},
+    {k:'thr', cls:'thr', ic:'🧵', name:'重构登录模块', chip:'', t:'16:51', prev:'Codex Bridge: ✍️ 正在输出…'},
+    {k:'grp2', cls:'grp', ic:'👥', name:'gemini', chip:'', t:'昨天', prev:'Codex Bridge: 已开始新会话。'},
+    {k:'dev', cls:'dev', ic:'</>', name:'开发者小助手', chip:'<span class="chip ext">机器人</span>', t:'14:20', prev:'应用审批通过, 已发布成功'},
+  ];
+  return items.map(i=>`
+    <div class="item ${i.k===active?'on':''}">
+      <div class="iav ${i.cls}">${i.ic}</div>
+      <div class="ibody">
+        <div class="itop"><span class="iname">${i.name}</span>${i.chip}<span class="itime">${i.t}</span></div>
+        <div class="iprev">${i.prev}</div>
+      </div>
+    </div>`).join('');
+}
+
+function head(opts){
+  const tabs = opts.tabs ? `<div class="mtabs">
+      <div class="t on">💬 消息</div><div class="t">📣 群公告</div><div class="t">＋</div></div>` : '';
+  return `<div class="mh">
+      <div class="mav" style="background:${opts.avbg}">${opts.ic}</div>
+      <div>
+        <div class="mtitle">${opts.title}${opts.chip||''}${opts.count?`<span class="sub">👥 ${opts.count}</span>`:''}</div>
+        ${opts.sub?`<div class="sub">${opts.sub}</div>`:''}
+      </div>
+      <div class="acts">🔍 ＋ ✔ ⚙</div>
+    </div>${tabs}`;
+}
+const HEAD_DM   = ()=>head({ic:'🤖',avbg:'linear-gradient(135deg,#ff9a8b,#ff6a88)',title:'Codex Bridge',chip:BOT});
+const HEAD_GRP  = (n)=>head({ic:'👥',avbg:'#fff" style="border:1.5px solid #2bb673;color:#2bb673',title:n,count:'2',tabs:true});
+const HEAD_THR  = ()=>head({ic:'🧵',avbg:'#fff" style="border:1.5px solid #2bb673;color:#2bb673',title:'话题',sub:'来自: my-app'});
+
+/* composer variants */
+function botMenuComposer(){
+  return `<div class="composer">
+    <div class="botmenu">
+      <div class="mitem" onclick="go('dm_new')">➕ 新建项目</div>
+      <div class="mitem" onclick="go('dm_list')">📁 项目列表</div>
+      <div class="mitem" onclick="go('dm_set')">⚙️ 设置</div>
+      <div class="mitem" onclick="go('dm_diag')">🩺 诊断</div>
+      <div class="mitem">🔄 重连</div>
+    </div>
+    <div class="cbox">发送给 Codex Bridge
+      <span class="cicons">Aa 😊 @ ✂ ＋ ⤢ <span class="sendbtn">➤</span></span>
+    </div>
+  </div>`;
+}
+function plainComposer(to){
+  return `<div class="composer"><div class="cbox">发送给 ${to}
+     <span class="cicons">Aa 😊 @ ✂ ＋ ⤢ <span class="sendbtn">➤</span></span></div></div>`;
+}
+function threadComposer(){
+  return `<div class="composer"><div class="threadcompose">回复话题
+     <div class="ck">☐ 同时发送到群</div></div></div>`;
+}
+
+/* a user message (left aligned, lark style) */
+function meMsg(html,name){return `<div class="msg"><div class="mava me"></div><div class="mc">
+   ${name?`<div class="nm">${name} <span>16:50</span></div>`:''}<div class="bubble">${html}</div></div></div>`;}
+function botMsg(inner,name){return `<div class="msg"><div class="mava bot"></div><div class="mc">
+   ${name?`<div class="nm">Codex Bridge ${BOT} <span>16:51</span></div>`:''}${inner}</div></div>`;}
+
+/* ---------- screens ---------- */
+const screens=[
+/* ===== 私聊 ===== */
+{grp:'私聊 · 管理控制台',name:'DM 首页 + 机器人菜单',list:'dm',id:'dm_home',
+ head:HEAD_DM, composer:botMenuComposer,
+ body:()=> botMsg(`<div class="bubble" style="background:var(--bubble-bot)">你好！我是你的 <b>Codex Bridge</b> 🤖<br>点下方菜单开始，或直接发消息问我怎么用。</div>`)
+},
+{grp:'私聊 · 管理控制台',name:'新建项目（名称 + 类型）',list:'dm',id:'dm_new',
+ head:HEAD_DM, composer:botMenuComposer,
+ body:()=> meMsg('（点了 ➕ 新建项目）')+ botMsg(`<div class="fcard">
+    <div class="ct">➕ 新建项目</div>
+    <div class="cb"><hr>
+      <div class="flabel">项目名称</div>
+      <input class="inp" value="my-app">
+      <div class="flabel">选择方式</div>
+      <div class="row2">
+        <div class="btn ghost" style="justify-content:center;text-align:center" onclick="go('dm_home')">📄 新建空白项目</div>
+        <div class="btn pri" style="justify-content:center;text-align:center" onclick="go('dm_existing')">📂 指定现有文件夹</div>
+      </div>
+    </div></div>`)
+},
+{grp:'私聊 · 管理控制台',name:'指定现有文件夹',list:'dm',id:'dm_existing',
+ head:HEAD_DM, composer:botMenuComposer,
+ body:()=> botMsg(`<div class="fcard">
+    <div class="ct">📂 指定现有文件夹</div>
+    <div class="cb"><hr>
+      <div class="desc">项目名称：<span class="mono">my-app</span></div>
+      <div class="flabel">文件夹路径</div>
+      <input class="inp" value="/Users/clay/devlop/src/my-app">
+      <div class="btns">
+        <div class="btn">取消</div>
+        <div class="btn pri" onclick="go('dm_created')">✅ 创建</div>
+      </div>
+    </div></div>`)
+},
+{grp:'私聊 · 管理控制台',name:'创建成功',list:'dm',id:'dm_created',
+ head:HEAD_DM, composer:botMenuComposer,
+ body:()=> botMsg(`<div class="fcard"><div class="ct">✅ 项目「my-app」已创建</div>
+    <div class="cb"><div class="desc">cwd: <span class="mono">/Users/clay/devlop/src/my-app</span><br>已建群并把你拉入。</div>
+    <div class="btns"><div class="btn pri" onclick="go('grp_config')">进群 ›</div></div></div></div>`)
+},
+{grp:'私聊 · 管理控制台',name:'项目列表',list:'dm',id:'dm_list',
+ head:HEAD_DM, composer:botMenuComposer,
+ body:()=> botMsg(`<div class="fcard"><div class="ct">📁 项目列表（3）</div>
+   <div class="cb plist">
+     <div class="prow"><div class="pmeta"><div class="pn">my-app <span class="br">🌿 main</span></div><div class="pp">/Users/clay/devlop/src/my-app</div></div><div class="btn" onclick="go('grp_config')">进群 ›</div><div class="btn danger" onclick="go('dm_del')">🗑</div></div>
+     <div class="prow"><div class="pmeta"><div class="pn">gemini <span class="br">🌿 release</span></div><div class="pp">/Users/clay/devlop/src/gptlab/gemini</div></div><div class="btn">进群 ›</div><div class="btn danger">🗑</div></div>
+     <div class="prow"><div class="pmeta"><div class="pn">blank-demo <span class="br">🌿 main</span></div><div class="pp">~/.feishu-codex-bridge/projects/blank-demo</div></div><div class="btn">进群 ›</div><div class="btn danger">🗑</div></div>
+   </div></div>`)
+},
+{grp:'私聊 · 管理控制台',name:'删除项目（二次确认）',list:'dm',id:'dm_del',
+ head:HEAD_DM, composer:botMenuComposer,
+ body:()=> botMsg(`<div class="fcard"><div class="ct">⚠️ 删除项目「my-app」？</div>
+   <div class="cb"><div class="desc">• 仅<b>解绑项目</b>，之后 bot 不再响应该群<br>• 删除后会提示你<b>自行在飞书解散该群</b><br>• <b>代码目录不会被删除</b></div>
+   <div class="btns"><div class="btn" onclick="go('dm_list')">取消</div><div class="btn danger">确认删除（解绑）</div></div></div></div>`)
+},
+{grp:'私聊 · 管理控制台',name:'全局设置卡',list:'dm',id:'dm_set',
+ head:HEAD_DM, composer:botMenuComposer,
+ body:()=> meMsg('（点了 ⚙️ 设置）')+ botMsg(`<div class="fcard">
+   <div class="ct">⚙️ 全局设置</div>
+   <div class="cb"><div class="desc">调整 bot 行为偏好。改完点提交，<b>立即生效</b>并写入 <span class="mono">~/.feishu-codex-bridge/config.json</span>。</div><hr>
+     <div class="flabel">消息回复方式</div><div class="sel">消息卡片(流式·默认) <span class="cv">▾</span></div>
+     <div class="flabel">工具调用显示</div><div class="sel">显示(默认) <span class="cv">▾</span></div>
+     <div class="flabel">并发上限</div><input class="inp" value="10">
+     <div class="flabel">卡死探活（秒）</div><input class="inp" value="120">
+     <div class="flabel">运行中发新消息</div><div class="sel">引导 steer（默认） <span class="cv">▾</span></div>
+     <hr>
+     <div class="flabel">🔒 访问控制</div>
+     <div class="desc">管理员 admins（能私聊建项目/改配置）</div><input class="inp" value="ou_xxx（你自己）">
+     <div class="desc" style="margin-top:8px">群+话题白名单 allowedUsers</div><input class="inp" placeholder="空 = 不限制">
+     <div class="desc" style="margin-top:8px">群白名单 allowedChats</div><input class="inp" placeholder="空 = 不限制">
+     <div class="btns"><div class="btn pri">✅ 提交</div></div>
+   </div></div>`)
+},
+{grp:'私聊 · 管理控制台',name:'诊断',list:'dm',id:'dm_diag',
+ head:HEAD_DM, composer:botMenuComposer,
+ body:()=> meMsg('（点了 🩺 诊断）')+ botMsg(`<div class="fcard"><div class="ct">🩺 自检</div>
+   <div class="cb"><div class="tool">✅ <span>codex CLI</span><span class="tg">0.131.0</span></div>
+     <div class="tool">✅ <span>codex 登录</span> 正常</div>
+     <div class="tool">✅ <span>lark-cli</span><span class="tg">1.0.40</span></div>
+     <div class="tool">✅ <span>长连接</span> 已连接</div>
+     <div class="tool">✅ <span>活跃会话</span> 1 · 僵尸进程 0</div>
+   </div></div>`)
+},
+/* ===== 项目群 ===== */
+{grp:'项目群',name:'@bot → 会话配置卡',list:'grp',id:'grp_config',
+ head:()=>HEAD_GRP('my-app'), composer:()=>plainComposer('my-app'),
+ body:()=> `<div class="pin"><div class="pt">📌 项目: my-app</div>
+     📂 cwd: <span class="mono">/Users/clay/devlop/src/my-app</span><br>
+     🌿 分支: <b>main</b>（只读，自动更新）<br>
+     ⚙️ 默认: gpt-5.5 · effort high · fast 开</div>`
+   + meMsg('<span class="mention">@Codex Bridge</span> 帮我重构登录模块','凯伦')
+   + botMsg(`<div class="fcard"><div class="ct">🆕 新会话配置</div>
+       <div class="cb"><hr>
+         <div class="flabel">模型</div><div class="sel">gpt-5.5 <span class="cv">▾</span></div>
+         <div class="flabel">reasoning effort</div><div class="sel">high <span class="cv">▾</span></div>
+         <div class="flabel">fast 模式</div><div class="sel">开 <span class="cv">▾</span></div>
+         <hr><div class="desc">首条消息：帮我重构登录模块</div>
+         <div class="btns">
+           <div class="btn pri" onclick="go('thr_run')">✅ 创建新会话</div>
+           <div class="btn" onclick="go('grp_resume')">🔁 恢复历史会话</div>
+         </div>
+       </div></div>`,'')
+},
+{grp:'项目群',name:'恢复历史会话',list:'grp',id:'grp_resume',
+ head:()=>HEAD_GRP('my-app'), composer:()=>plainComposer('my-app'),
+ body:()=> botMsg(`<div class="fcard"><div class="ct">🔁 恢复历史会话（my-app）</div>
+   <div class="cb resume">
+     <div class="rr"><div class="rt">帮我重构登录模块…<div class="rtime">3 天前</div></div><div class="btn pri" onclick="go('thr_run')">恢复</div></div>
+     <div class="rr"><div class="rt">修复支付回调超时…<div class="rtime">5 天前</div></div><div class="btn">恢复</div></div>
+     <div class="rr"><div class="rt">加一个 docker-compose…<div class="rtime">上周</div></div><div class="btn">恢复</div></div>
+   </div></div>`,'')
+},
+/* ===== 话题 ===== */
+{grp:'话题 thread（= 一个 session）',name:'运行中（流式 + 工具 + 中止）',list:'thr',id:'thr_run',
+ head:HEAD_THR, composer:threadComposer,
+ body:()=> meMsg('<span class="mention">@Codex Bridge</span> 帮我重构登录模块','凯伦')
+   + botMsg(`<div class="bubble" style="background:var(--bubble-bot)">✅ 已开始新会话 · gpt-5.5 · effort high · fast 开 · cwd <span class="mono">…/my-app</span> · 🌿 main<br><span style="color:var(--gray);font-size:12px">（开场介绍，会随对话滚走——设置控件在下方运行卡上）</span></div>`,'CLI')
+   + botMsg(`<div class="fcard">
+       <div class="cb" style="padding-top:14px">
+         <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;font-size:12px;color:var(--gray)">
+           <span class="tg" style="cursor:pointer">⚙️ 设置</span>
+           gpt-5.5 · high · fast开 · …/my-app · 🌿main
+           <span style="margin-left:auto;font-size:11px">（仅最新卡片显示，新一轮后自动从旧卡移除）</span></div>
+         <div class="typing">✍️ 正在输出 <span class="blink"></span></div>
+         <p style="font-size:14px;line-height:1.6;margin:10px 0">我先看一下登录模块的结构：</p>
+         <div class="tool">▸ 🔧 <span class="tg">Read</span> src/auth/login.ts</div>
+         <div class="tool">▸ 🔧 <span class="tg">Bash</span> npm test auth</div>
+         <p style="font-size:14px;line-height:1.6;margin:10px 0">发现 3 处问题，正在重构…</p>
+         <div class="btns"><div class="btn danger" onclick="go('thr_abort')">⏹ 中止</div></div>
+       </div></div>`,'')
+   + meMsg('现在本地 docker 启动了吗？','凯伦')
+   + `<div class="hint">↑ 运行中发新消息 → 默认 steer：注入当前 turn 引导（可在设置改为 排队）</div>`
+},
+{grp:'话题 thread（= 一个 session）',name:'卡死被 watchdog 中止',list:'thr',id:'thr_abort',
+ head:HEAD_THR, composer:threadComposer,
+ body:()=> botMsg(`<div class="fcard">
+     <div class="cb" style="padding-top:14px">
+       <div class="tool">▸ 🔧 <span class="tg">Bash</span> docker compose up</div>
+       <p style="font-size:14px;color:var(--gray);margin:8px 0">（120 秒无输出…）</p>
+       <hr style="margin:6px 0 12px">
+       <div style="font-size:14px;font-weight:600">⏱ 似乎卡住了（120s 无响应），已中止</div>
+       <div class="desc" style="margin-top:6px">已对子进程发 turn/interrupt → SIGKILL。你可以重新发消息继续。</div>
+       <div class="btns"><div class="btn pri" onclick="go('thr_run')">🔄 重试上一条</div></div>
+     </div></div>`,'')
+},
+];
+
+/* ---------- runtime ---------- */
+let cur=0;
+const byId=id=>screens.findIndex(s=>s.id===id);
+function render(){
+  const s=screens[cur];
+  document.getElementById('chatlist').innerHTML=chatList(s.list);
+  document.getElementById('mainhead').innerHTML=(typeof s.head==='function'?s.head():s.head);
+  document.getElementById('mainbody').innerHTML=(typeof s.body==='function'?s.body():s.body);
+  document.getElementById('composer').innerHTML=(typeof s.composer==='function'?s.composer():s.composer);
+  document.getElementById('sgrp').textContent=s.grp;
+  document.getElementById('sidx').textContent=`[${cur+1}/${screens.length}]`;
+  document.getElementById('sname').textContent=s.name;
+  location.hash=s.id;
+}
+function nav(d){cur=(cur+d+screens.length)%screens.length;render();}
+function go(id){const i=byId(id);if(i>=0){cur=i;render();}}
+window.addEventListener('keydown',e=>{
+  if(['INPUT','TEXTAREA'].includes(document.activeElement.tagName))return;
+  if(e.key==='ArrowLeft')nav(-1);if(e.key==='ArrowRight')nav(1);
+});
+if(location.hash){const i=byId(location.hash.slice(1));if(i>=0)cur=i;}
+render();
+</script>
+</body>
+</html>
