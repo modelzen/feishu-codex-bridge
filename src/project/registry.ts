@@ -13,6 +13,10 @@ export interface Project {
   /** true when bridge created the cwd as a blank project (under projectsRootDir) */
   blank: boolean;
   createdAt: number;
+  /** messageId of the pinned banner card (so it can be patched on branch change) */
+  bannerMessageId?: string;
+  /** last branch shown on the banner (for lazy change detection) */
+  branch?: string;
 }
 
 interface StoreFile {
@@ -60,6 +64,21 @@ export async function addProject(p: Project): Promise<void> {
     throw new Error(`项目名「${p.name}」已存在`);
   }
   projects.push(p);
+  await write(projects);
+}
+
+/** Patch fields of a project by name; no-op if it doesn't exist. */
+export async function updateProject(
+  name: string,
+  patch: Partial<Omit<Project, 'name'>>,
+): Promise<void> {
+  const projects = await read();
+  const p = projects.find((x) => x.name === name);
+  if (!p) return;
+  const target = p as unknown as Record<string, unknown>;
+  for (const [k, v] of Object.entries(patch)) {
+    if (v !== undefined) target[k] = v;
+  }
   await write(projects);
 }
 

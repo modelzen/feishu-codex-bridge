@@ -5,7 +5,8 @@ import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { paths } from '../config/paths';
 import { log } from '../core/logger';
 import { addProject, getProjectByName, type Project } from './registry';
-import { currentBranch, gitInit } from './git-info';
+import { gitInit } from './git-info';
+import { setBanner } from './banner';
 
 export interface CreateProjectInput {
   name: string;
@@ -56,18 +57,4 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
   // 4. pinned banner (best-effort)
   await setBanner(channel, project).catch((err) => log.fail('project', err, { phase: 'banner' }));
   return project;
-}
-
-/** Build + send + pin the project banner. Safe to call again to refresh. */
-export async function setBanner(channel: LarkChannel, project: Project): Promise<void> {
-  const branch = (await currentBranch(project.cwd)) ?? '—';
-  const md =
-    `📁 **项目**: ${project.name}\n` +
-    `📂 cwd: \`${project.cwd}\`\n` +
-    `🌿 分支: ${branch}（只读）\n` +
-    `_在主区 @我 即可开一个话题干活_`;
-  const sent = await channel.send(project.chatId, { markdown: md });
-  await channel.rawClient.im.v1.pin
-    .create({ data: { message_id: sent.messageId } })
-    .catch((err) => log.fail('project', err, { phase: 'pin' }));
 }

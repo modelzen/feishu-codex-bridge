@@ -21,6 +21,7 @@ import { buildRunCard, buildRunCardPlain, RC, type RunCardState, type RunStatus 
 import { log, withTrace } from '../core/logger';
 import { currentBranch } from '../project/git-info';
 import { getProjectByChatId } from '../project/registry';
+import { refreshBranch } from '../project/banner';
 import { getSession, patchSession, upsertSession } from './session-store';
 import { handleDmConsole } from './dm-console';
 import { Semaphore, withIdleTimeout } from './watchdog';
@@ -184,6 +185,8 @@ export function createOrchestrator(
     await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       const project = await getProjectByChatId(msg.chatId);
       const cwd = project?.cwd ?? fallbackCwd;
+      // lazy banner branch refresh (design §3.2) — best-effort, non-blocking
+      if (project) void refreshBranch(channel, project).catch(() => undefined);
       const [models, branch] = await Promise.all([listModels(), currentBranch(cwd)]);
       const { model, effort } = pickDefault(models);
       const state: SessionConfigState = {
