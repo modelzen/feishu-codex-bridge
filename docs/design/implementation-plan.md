@@ -18,7 +18,10 @@
 - **运行卡 ⏹/⚙️ ✅ 代码完成**（08ce549）：运行输出改流式卡片，运行中挂 ⏹中止、终态挂 ⚙️设置(改本会话 model/effort，下一轮生效，仅挂最新卡)。`card/run-card.ts` + `runStreamed(input,turn?)` per-turn override。
 - **M5 ✅ 代码完成**（a9cb1ce）：`project/banner.ts` 置顶横幅卡片化 + 分支惰性检测(变了才 patch)；registry 增 bannerMessageId/branch + updateProject。
 - **M7 ✅ 代码完成**（45e2ec8）：`card/dm-cards.ts` 私聊菜单/项目列表/删除确认/全局设置卡；dm.* handlers 接 dispatcher(admin gate)。文本命令保留兜底。新建项目暂用 /new 文本（卡片 form input 后续）。
-- **⬜ 待用户端到端测试**（M3/M4/M5/M7 + 运行卡）：typecheck/build 全绿，未真机验证。
+- **M8 ✅ 代码完成 + 真机验证**（4337d50, service-dev）：launchd 后台服务（adapter/launchd + cli service install/uninstall/status/restart/logs），真机 install→pid→restart→uninstall 清理无残留。
+- **单测 ✅**（e548b8e, test-dev）：test/{event-map,run-render,schema,watchdog} 24 用例 + vitest.config 限定 test/**，npm test 24/24 绿。
+- **reviewer [OK]**（2fd9248, 2026-05-26）：3 轮收敛，全部 HIGH（卡片授权/回调长占/假成功/⏹杀别人 run）+ MEDIUM（泄漏/陈旧/设置语义/pin撤销）关闭；报告见 .plans/reviewer/review-rereview-2fd9248/。
+- **⬜ 待用户端到端真机测试**（M3/M4/M5/M7 + 运行卡 + M8）：typecheck/build/test 全绿、reviewer [OK]，唯一残留=真机 Feishu callback smoke。
 
 ## 已知待办（后续统一处理）
 - **卡片渲染细节统一**：运行卡虽已切 card 模式，工具仍在文本上方堆叠、原样 `/bin/zsh -lc "..."`。后续：有序交错 block + 友好工具头(去 shell 壳) + 可折叠工具面板。（用户明确「先不改，后面统一改」）
