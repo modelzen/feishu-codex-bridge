@@ -19,6 +19,8 @@ const STDOUT_INFO_ALLOWLIST = new Set<string>([
   'ws.reconnecting',
   'ws.reconnected',
   'intake.enter',
+  'intake.recv',
+  'intake.reject',
   'card.final',
   'agent.spawn',
   'agent.exit',

@@ -19,8 +19,17 @@ export function makeMessageHandler(channel: LarkChannel, cwd: string): (msg: Nor
   const busy = new Set<string>();
 
   return async (msg: NormalizedMessage): Promise<void> => {
-    if (msg.chatType === 'p2p') return; // M1: DM console is a later milestone
-    if (!msg.mentionedBot) return; // groups respond only to @bot
+    log.info('intake', 'recv', {
+      chatType: msg.chatType,
+      mentionedBot: msg.mentionedBot,
+      mentionAll: msg.mentionAll,
+      threadId: msg.threadId ?? null,
+      preview: msg.content.slice(0, 40),
+    });
+    // p2p (DM) is the management console (create project / settings) — M2.
+    // M1 only runs codex in project groups via @bot.
+    if (msg.chatType === 'p2p') return;
+    if (!msg.mentionedBot) return;
 
     const key = msg.threadId ?? `pending:${msg.messageId}`;
     if (busy.has(key)) {
@@ -62,6 +71,8 @@ export function makeMessageHandler(channel: LarkChannel, cwd: string): (msg: Nor
           { replyTo: msg.messageId, replyInThread: true },
         );
 
+        // Persist the session under the (possibly new) topic's thread_id so a
+        // follow-up @bot in that thread continues this codex session.
         const threadId = msg.threadId ?? (await getThreadId(channel, res.messageId));
         if (threadId) sessions.set(threadId, thread);
         log.info('card', 'final', { terminal });

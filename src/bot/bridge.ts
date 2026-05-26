@@ -25,6 +25,7 @@ export async function startBridge(opts: BridgeOptions): Promise<LarkChannel> {
   });
 
   channel.on('message', makeMessageHandler(channel, opts.cwd));
+  channel.on('reject', (evt) => log.info('intake', 'reject', { reason: evt.reason, msgId: evt.messageId }));
   channel.on('error', (err) => log.fail('ws', err));
   channel.on('reconnecting', () => log.info('ws', 'reconnecting'));
   channel.on('reconnected', () => log.info('ws', 'reconnected'));
