@@ -5,10 +5,14 @@ import {
   getMaxConcurrentRuns,
   getPendingPolicy,
   getRunIdleTimeoutMs,
+  getShowToolCalls,
+  isAdmin,
   isChatAllowed,
   isUserAllowed,
   type AppConfig,
+  type AppPreferences,
 } from '../config/schema';
+import { saveConfig } from '../config/store';
 import { CardDispatcher } from '../card/dispatcher';
 import { RunRender } from '../card/run-render';
 import {
@@ -19,8 +23,16 @@ import {
 } from '../card/session-config-card';
 import { buildRunCard, buildRunCardPlain, RC, type RunCardState, type RunStatus } from '../card/run-card';
 import { log, withTrace } from '../core/logger';
+import {
+  buildDmMenuCard,
+  buildNewProjectHintCard,
+  buildProjectListCard,
+  buildRmConfirmCard,
+  buildSettingsCard,
+  DM,
+} from '../card/dm-cards';
 import { currentBranch } from '../project/git-info';
-import { getProjectByChatId } from '../project/registry';
+import { getProjectByChatId, listProjects, removeProject } from '../project/registry';
 import { refreshBranch } from '../project/banner';
 import { getSession, patchSession, upsertSession } from './session-store';
 import { handleDmConsole } from './dm-console';
@@ -318,6 +330,99 @@ export function createOrchestrator(
       await channel.updateCard(evt.messageId, buildRunCard(rc)).catch(() => undefined);
     });
 
+  // DM management console buttons (design §3.1). Admin-gated; sub-views patch
+  // the same card in place, each carrying a ⬅️ 菜单 back button.
+  const dmAdmin = (openId?: string): boolean => isAdmin(cfg, openId ?? '');
+  const patch = (msgId: string, c: object): Promise<void> =>
+    channel.updateCard(msgId, c).catch(() => undefined) as Promise<void>;
+
+  async function applyPref(evt: CardActionEvent, mut: (p: AppPreferences) => void): Promise<void> {
+    if (!dmAdmin(evt.operator?.openId)) return;
+    const prefs: AppPreferences = { ...(cfg.preferences ?? {}) };
+    mut(prefs);
+    cfg.preferences = prefs;
+    await saveConfig(cfg).catch((err) => log.fail('console', err, { phase: 'save-config' }));
+    await patch(evt.messageId, buildSettingsCard(cfg));
+  }
+
+  dispatcher
+    .on(DM.menu, async ({ evt }) => {
+      if (dmAdmin(evt.operator?.openId)) await patch(evt.messageId, buildDmMenuCard());
+    })
+    .on(DM.newProject, async ({ evt }) => {
+      if (dmAdmin(evt.operator?.openId)) await patch(evt.messageId, buildNewProjectHintCard());
+    })
+    .on(DM.projects, async ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      await patch(evt.messageId, buildProjectListCard(await listProjects()));
+    })
+    .on(DM.settings, async ({ evt }) => {
+      if (dmAdmin(evt.operator?.openId)) await patch(evt.messageId, buildSettingsCard(cfg));
+    })
+    .on(DM.doctor, async ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const ok = await backend.isAvailable().catch(() => false);
+      const conn = channel.getConnectionStatus?.()?.state ?? 'unknown';
+      await channel
+        .send(evt.chatId, { markdown: `🩺 **诊断**\n- codex: ${ok ? '✅ 可用' : '❌ 不可用（检查 CODEX_BIN/PATH）'}\n- 长连接: ${conn}` }, { replyTo: evt.messageId })
+        .catch(() => undefined);
+    })
+    .on(DM.reconnect, async ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const conn = channel.getConnectionStatus?.()?.state ?? 'unknown';
+      await channel
+        .send(evt.chatId, { markdown: `🔄 长连接状态：**${conn}**\nSDK 会自动重连；若长期断开，请在终端重启 \`feishu-codex-bridge start\`。` }, { replyTo: evt.messageId })
+        .catch(() => undefined);
+    })
+    .on(DM.rmConfirm, async ({ evt, value }) => {
+      const name = typeof value.n === 'string' ? value.n : undefined;
+      if (!dmAdmin(evt.operator?.openId) || !name) return;
+      await patch(evt.messageId, buildRmConfirmCard(name));
+    })
+    .on(DM.rmCancel, async ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      await patch(evt.messageId, buildProjectListCard(await listProjects()));
+    })
+    .on(DM.rmDo, async ({ evt, value }) => {
+      const name = typeof value.n === 'string' ? value.n : undefined;
+      if (!dmAdmin(evt.operator?.openId) || !name) return;
+      const removed = await removeProject(name);
+      // revoke the pinned banner (best-effort); never delete the code dir
+      if (removed?.bannerMessageId) {
+        await channel.rawClient.im.v1.pin
+          .delete({ path: { message_id: removed.bannerMessageId } })
+          .catch(() => undefined);
+      }
+      log.info('console', 'rm', { name });
+      await channel
+        .send(
+          evt.chatId,
+          { markdown: `✅ 已删除项目「${name}」（解绑，未删代码目录）。\nbot 不会自动解散群——如不再需要，请你在飞书里**自行解散该群**。` },
+          { replyTo: evt.messageId },
+        )
+        .catch(() => undefined);
+      await patch(evt.messageId, buildProjectListCard(await listProjects()));
+    })
+    .on(DM.setReply, async ({ evt, option }) => {
+      if (option === 'card' || option === 'markdown' || option === 'text') {
+        await applyPref(evt, (p) => (p.messageReply = option));
+      }
+    })
+    .on(DM.setTools, async ({ evt, option }) => {
+      await applyPref(evt, (p) => (p.showToolCalls = option === 'on'));
+    })
+    .on(DM.setWatchdog, async ({ evt, option }) => {
+      const n = Number(option);
+      if (Number.isFinite(n)) await applyPref(evt, (p) => (p.runIdleTimeoutSeconds = n));
+    })
+    .on(DM.setPending, async ({ evt, option }) => {
+      if (option === 'steer' || option === 'queue') await applyPref(evt, (p) => (p.pendingPolicy = option));
+    })
+    .on(DM.setConcurrency, async ({ evt, option }) => {
+      const n = Number(option);
+      if (Number.isFinite(n)) await applyPref(evt, (p) => (p.maxConcurrentRuns = n));
+    });
+
   /** Create the topic (reply_in_thread) and run the first turn from a config card. */
   async function launchSessionFromCard(
     state: SessionConfigState,
@@ -404,6 +509,7 @@ export function createOrchestrator(
         const run = state.thread.runStreamed({ text: turnText }, { model: turnModel, effort: turnEffort });
         state.run = run;
         const render = new RunRender();
+        render.showTools = getShowToolCalls(cfg);
         let terminal: RunStatus = 'done';
         let cardMsgId: string | undefined;
         const rc: RunCardState = { body: '', status: 'running', model: turnModel, effort: turnEffort, cwd: opts.cwd, models };

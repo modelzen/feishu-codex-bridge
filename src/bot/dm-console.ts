@@ -1,17 +1,9 @@
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import { isAdmin, type AppConfig } from '../config/schema';
+import { buildDmMenuCard } from '../card/dm-cards';
 import { log, withTrace } from '../core/logger';
 import { createProject } from '../project/lifecycle';
 import { listProjects, getProjectByName, removeProject } from '../project/registry';
-
-const HELP =
-  '🤖 **Codex Bridge 管理台**\n' +
-  '私聊用于建项目和管理（任务请在项目群里 @我）。\n\n' +
-  '- `/new <名>` — 新建空白项目（建群+拉你进群+git init）\n' +
-  '- `/new <名> <路径>` — 用现有文件夹建项目\n' +
-  '- `/projects` — 列出所有项目\n' +
-  '- `/rm <名>` — 删除项目（解绑，群请你自行解散）\n' +
-  '- `/help` — 本帮助';
 
 /**
  * p2p (DM) console. Admin-gated (design §5: only admins may create projects /
@@ -80,8 +72,12 @@ export async function handleDmConsole(channel: LarkChannel, cfg: AppConfig, msg:
           );
           break;
         }
+        case '/menu':
+        case '/help':
         default:
-          await reply(HELP);
+          // card-first console: text commands still work, but the default
+          // surface is the interactive menu (buttons → CardDispatcher dm.*).
+          await channel.send(msg.chatId, { card: buildDmMenuCard() }, { replyTo: msg.messageId }).catch(() => undefined);
       }
     } catch (err) {
       log.fail('console', err, { cmd });
