@@ -55,6 +55,11 @@ export class RunRender {
     }
   }
 
+  /** Current lifecycle state, for the run card's button/footer logic. */
+  state(): 'running' | 'done' | 'error' {
+    return this.status;
+  }
+
   private append(itemId: string, delta: string): void {
     if (!this.texts.has(itemId)) {
       this.texts.set(itemId, '');

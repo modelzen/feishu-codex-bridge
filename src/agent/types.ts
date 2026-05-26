@@ -55,10 +55,16 @@ export interface AgentRun {
   turnId(): string | undefined;
 }
 
+/** Per-turn overrides (apply to this turn and persist for subsequent turns). */
+export interface TurnOptions {
+  model?: string;
+  effort?: ReasoningEffort;
+}
+
 export interface AgentThread {
   readonly codexThreadId: string;
   /** start a turn, streaming events until turn completion/error */
-  runStreamed(input: AgentInput): AgentRun;
+  runStreamed(input: AgentInput, turn?: TurnOptions): AgentRun;
   /** inject input into the in-flight turn (引导) */
   steer(input: AgentInput, expectedTurnId: string): Promise<void>;
   /** interrupt the in-flight turn (watchdog 中止) */

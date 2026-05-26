@@ -17,6 +17,7 @@ import {
   SC,
   type SessionConfigState,
 } from '../card/session-config-card';
+import { buildRunCard, buildRunCardPlain, RC, type RunCardState, type RunStatus } from '../card/run-card';
 import { log, withTrace } from '../core/logger';
 import { currentBranch } from '../project/git-info';
 import { getProjectByChatId } from '../project/registry';
@@ -59,6 +60,12 @@ export function createOrchestrator(
   const policy = getPendingPolicy(cfg);
   /** pending config cards, keyed by the card's messageId */
   const pending = new Map<string, SessionConfigState>();
+  /** active runs indexed by their run card's messageId (for ⏹ 中止) */
+  const runsByCard = new Map<string, ActiveState>();
+  /** final run-card state by messageId (for ⚙️ settings on the latest card) */
+  const runCards = new Map<string, RunCardState>();
+  /** the latest settings-bearing run card per topic thread */
+  const lastRunCard = new Map<string, string>();
   let modelsCache: ModelInfo[] | null = null;
 
   async function listModels(): Promise<ModelInfo[]> {
@@ -265,6 +272,49 @@ export function createOrchestrator(
       await launchSessionFromCard(state, thread, 'resumed');
     });
 
+  // run card buttons (design §3.3)
+  dispatcher
+    .on(RC.stop, async ({ evt, value }) => {
+      const key = typeof value.m === 'string' ? value.m : evt.messageId;
+      const st = runsByCard.get(key);
+      const tid = st?.run?.turnId();
+      if (st && tid) {
+        await st.thread.abort(tid).catch(() => undefined);
+        log.info('card', 'action', { actionId: 'run.stop', aborted: tid });
+      }
+    })
+    .on(RC.settings, async ({ evt }) => {
+      const rc = runCards.get(evt.messageId);
+      if (!rc) return;
+      rc.expanded = !rc.expanded;
+      rc.settingsNote = undefined;
+      if (rc.expanded) {
+        rc.models = await listModels();
+        if (rc.cwd) rc.branch = (await currentBranch(rc.cwd)) ?? undefined;
+      }
+      await channel.updateCard(evt.messageId, buildRunCard(rc)).catch(() => undefined);
+    })
+    .on(RC.model, async ({ evt, option }) => {
+      const rc = runCards.get(evt.messageId);
+      if (!rc || !option) return;
+      rc.model = option;
+      const m = rc.models?.find((x) => x.id === option);
+      if (m && m.supportedEfforts.length && rc.effort && !m.supportedEfforts.includes(rc.effort)) {
+        rc.effort = m.defaultEffort;
+      }
+      if (rc.threadId) await patchSession(rc.threadId, { model: rc.model, effort: rc.effort });
+      rc.settingsNote = `✅ 已切换模型「${m?.displayName ?? option}」，下一轮生效`;
+      await channel.updateCard(evt.messageId, buildRunCard(rc)).catch(() => undefined);
+    })
+    .on(RC.effort, async ({ evt, option }) => {
+      const rc = runCards.get(evt.messageId);
+      if (!rc || !option) return;
+      rc.effort = option as ReasoningEffort;
+      if (rc.threadId) await patchSession(rc.threadId, { effort: rc.effort });
+      rc.settingsNote = `✅ 已设置 effort，下一轮生效`;
+      await channel.updateCard(evt.messageId, buildRunCard(rc)).catch(() => undefined);
+    });
+
   /** Create the topic (reply_in_thread) and run the first turn from a config card. */
   async function launchSessionFromCard(
     state: SessionConfigState,
@@ -306,9 +356,11 @@ export function createOrchestrator(
   async function launchRun(opts: LaunchOpts): Promise<void> {
     const release = await sema.acquire();
     let activeKey = opts.knownThreadId ?? `pending:${opts.replyTo}`;
+    let topicThreadId = opts.knownThreadId;
     const state: ActiveState = { thread: opts.thread, queue: [] };
     active.set(activeKey, state);
     if (opts.knownThreadId) sessions.set(opts.knownThreadId, opts.thread);
+    const models = modelsCache ?? (await listModels());
 
     const persist = async (threadId: string): Promise<void> => {
       await upsertSession({
@@ -324,54 +376,97 @@ export function createOrchestrator(
       }).catch(() => undefined);
     };
 
+    /** Demote the previous turn's card (drop its ⚙️) and promote this one. */
+    const promoteCard = (cardMsgId: string, rc: RunCardState): void => {
+      if (!topicThreadId) return;
+      const prev = lastRunCard.get(topicThreadId);
+      if (prev && prev !== cardMsgId) {
+        const prevState = runCards.get(prev);
+        if (prevState) void channel.updateCard(prev, buildRunCardPlain(prevState)).catch(() => undefined);
+        runCards.delete(prev);
+      }
+      lastRunCard.set(topicThreadId, cardMsgId);
+      runCards.set(cardMsgId, rc);
+    };
+
     try {
       let turnText = opts.firstText;
       let replyTo = opts.replyTo;
       let replyInThread = opts.replyInThread ?? Boolean(opts.knownThreadId);
       for (;;) {
-        const run = state.thread.runStreamed({ text: turnText });
+        // per-turn model/effort: prefer latest persisted (⚙️ may have changed it)
+        const rec = topicThreadId ? await getSession(topicThreadId) : undefined;
+        const turnModel = rec?.model ?? opts.model;
+        const turnEffort = rec?.effort ?? opts.effort;
+        const run = state.thread.runStreamed({ text: turnText }, { model: turnModel, effort: turnEffort });
         state.run = run;
         const render = new RunRender();
-        let terminal: 'done' | 'error' | 'timeout' = 'done';
+        let terminal: RunStatus = 'done';
+        let cardMsgId: string | undefined;
+        const rc: RunCardState = { body: '', status: 'running', model: turnModel, effort: turnEffort, cwd: opts.cwd, models };
 
         const adoptThreadId = async (messageId: string): Promise<void> => {
-          if (!activeKey.startsWith('pending:')) return;
-          const tid = await getThreadId(channel, messageId);
-          if (!tid) return;
-          active.delete(activeKey);
-          active.set(tid, state);
-          sessions.set(tid, state.thread);
-          activeKey = tid;
-          await persist(tid);
+          if (activeKey.startsWith('pending:')) {
+            const tid = await getThreadId(channel, messageId);
+            if (tid) {
+              active.delete(activeKey);
+              active.set(tid, state);
+              sessions.set(tid, state.thread);
+              activeKey = tid;
+              topicThreadId = tid;
+              rc.threadId = tid;
+              await persist(tid);
+            }
+          } else {
+            topicThreadId = activeKey;
+            rc.threadId = activeKey;
+          }
         };
 
         const res = await channel.stream(
           opts.chatId,
           {
-            markdown: async (ctrl) => {
-              await adoptThreadId(ctrl.messageId);
-              const guarded = withIdleTimeout(run.events, idleMs, () => {
-                terminal = 'timeout';
-                const tid = run.turnId();
-                if (tid) void state.thread.abort(tid).catch(() => undefined);
-              });
-              for await (const ev of guarded) {
-                if (ev.type === 'error') terminal = 'error';
-                render.apply(ev);
-                await ctrl.setContent(render.markdown());
-              }
-              if (terminal === 'timeout') {
-                render.apply({ type: 'error', message: '⏱ 似乎卡住了（无响应），已中止，可重试', willRetry: false });
-              }
-              await ctrl.setContent(render.markdown());
+            card: {
+              initial: buildRunCard(rc),
+              producer: async (ctrl) => {
+                cardMsgId = ctrl.messageId;
+                rc.cardKey = ctrl.messageId;
+                runsByCard.set(ctrl.messageId, state);
+                await adoptThreadId(ctrl.messageId);
+                await ctrl.update(buildRunCard(rc));
+
+                const guarded = withIdleTimeout(run.events, idleMs, () => {
+                  terminal = 'timeout';
+                  const tid = run.turnId();
+                  if (tid) void state.thread.abort(tid).catch(() => undefined);
+                });
+                for await (const ev of guarded) {
+                  if (ev.type === 'error') terminal = 'error';
+                  render.apply(ev);
+                  rc.body = render.markdown();
+                  await ctrl.update(buildRunCard(rc));
+                }
+                if (terminal === 'timeout') {
+                  render.apply({ type: 'error', message: '⏱ 似乎卡住了（无响应），已中止，可重试', willRetry: false });
+                }
+                rc.body = render.markdown();
+                rc.status = terminal === 'timeout' ? 'timeout' : render.state() === 'error' ? 'error' : 'done';
+                await ctrl.update(buildRunCard(rc));
+              },
             },
           },
           { replyTo, replyInThread },
         );
 
-        await adoptThreadId(res.messageId);
-        if (!activeKey.startsWith('pending:')) await patchSession(activeKey, { updatedAt: Date.now() });
-        replyTo = res.messageId;
+        const finalMsgId = cardMsgId ?? res.messageId;
+        await adoptThreadId(finalMsgId);
+        // re-render terminal card now that threadId is known (adds ⚙️)
+        rc.cardKey = finalMsgId;
+        await channel.updateCard(finalMsgId, buildRunCard(rc)).catch(() => undefined);
+        if (cardMsgId) runsByCard.delete(cardMsgId);
+        promoteCard(finalMsgId, rc);
+        if (topicThreadId) await patchSession(topicThreadId, { updatedAt: Date.now() });
+        replyTo = finalMsgId;
         replyInThread = true; // stay in the topic for queued turns
         log.info('card', 'final', { terminal });
 

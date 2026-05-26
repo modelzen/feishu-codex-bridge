@@ -10,6 +10,7 @@ import type {
   ResumeThreadOptions,
   StartThreadOptions,
   ThreadSummary,
+  TurnOptions,
 } from '../types';
 import { AppServerClient } from './app-server-client';
 import { mapNotification } from './event-map';
@@ -31,13 +32,16 @@ class CodexThread implements AgentThread {
   constructor(
     private readonly client: AppServerClient,
     readonly codexThreadId: string,
-    private readonly model: string | undefined,
-    private readonly effort: ReasoningEffort | undefined,
+    private model: string | undefined,
+    private effort: ReasoningEffort | undefined,
   ) {}
 
-  runStreamed(input: AgentInput): AgentRun {
+  runStreamed(input: AgentInput, turn?: TurnOptions): AgentRun {
     const self = this;
     this.currentTurnId = undefined;
+    // Per-turn overrides persist for subsequent turns (matches turn/start semantics).
+    if (turn?.model) this.model = turn.model;
+    if (turn?.effort) this.effort = turn.effort;
     async function* gen(): AsyncGenerator<AgentEvent> {
       // Fire turn/start; events arrive via notifications while it's in flight.
       const params: Record<string, unknown> = {
