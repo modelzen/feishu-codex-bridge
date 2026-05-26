@@ -74,7 +74,7 @@ export function createOrchestrator(
   const active = new Map<string, ActiveState>();
   const sema = new Semaphore(getMaxConcurrentRuns(cfg));
   const idleMs = getRunIdleTimeoutMs(cfg) ?? 0;
-  const policy = getPendingPolicy(cfg);
+  // pendingPolicy is read per-message (settings card can change it live)
   /** pending config cards, keyed by the card's messageId */
   const pending = new Map<string, SessionConfigState>();
   /** active runs indexed by their run card's messageId (for ⏹ 中止) */
@@ -130,7 +130,7 @@ export function createOrchestrator(
     // Mid-turn: steer (引导) or queue (排队).
     const existing = active.get(threadId);
     if (existing) {
-      if (policy === 'steer' && existing.run) {
+      if (getPendingPolicy(cfg) === 'steer' && existing.run) {
         const tid = existing.run.turnId();
         if (tid) {
           try {
@@ -506,11 +506,6 @@ export function createOrchestrator(
       const groups = await listBotGroups(channel).catch(() => []);
       await patch(evt.messageId, buildGroupsCard(groups, evt.operator?.name));
     })
-    .on(DM.setReply, async ({ evt, option }) => {
-      if (option === 'card' || option === 'markdown' || option === 'text') {
-        await applyPref(evt, (p) => (p.messageReply = option));
-      }
-    })
     .on(DM.setTools, async ({ evt, option }) => {
       await applyPref(evt, (p) => (p.showToolCalls = option === 'on'));
     })
@@ -600,6 +595,9 @@ export function createOrchestrator(
       runCards.set(cardMsgId, rc);
     };
 
+    // tracks the latest run card key so the finally can clear runsByCard even
+    // if the stream producer throws mid-turn (avoids leaking a stale stop target)
+    let curCardKey: string | undefined;
     try {
       let turnText = opts.firstText;
       let replyTo = opts.replyTo;
@@ -642,6 +640,7 @@ export function createOrchestrator(
               initial: buildRunCard(rc),
               producer: async (ctrl) => {
                 cardMsgId = ctrl.messageId;
+                curCardKey = ctrl.messageId;
                 rc.cardKey = ctrl.messageId;
                 runsByCard.set(ctrl.messageId, state);
                 await adoptThreadId(ctrl.messageId);
@@ -692,6 +691,7 @@ export function createOrchestrator(
         .catch(() => undefined);
     } finally {
       active.delete(activeKey);
+      if (curCardKey) runsByCard.delete(curCardKey);
       release();
     }
   }

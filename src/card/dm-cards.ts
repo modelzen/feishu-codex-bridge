@@ -1,6 +1,5 @@
 import {
   getMaxConcurrentRuns,
-  getMessageReplyMode,
   getPendingPolicy,
   getShowToolCalls,
   type AppConfig,
@@ -22,7 +21,6 @@ export const DM = {
   rmCancel: 'dm.rmCancel',
   groups: 'dm.groups',
   transferOwner: 'dm.transferOwner',
-  setReply: 'dm.set.reply',
   setTools: 'dm.set.tools',
   setWatchdog: 'dm.set.watchdog',
   setPending: 'dm.set.pending',
@@ -116,8 +114,6 @@ export function buildGroupsCard(groups: BotGroup[], adminName?: string): CardObj
   return card(elements, { header: { title: '🚪 群管理', template: 'orange' } });
 }
 
-const REPLY_LABEL: Record<string, string> = { card: '卡片', markdown: 'Markdown', text: '纯文本' };
-
 /** Global preferences card. Selecting an option mutates config + saves. */
 export function buildSettingsCard(cfg: AppConfig): CardObject {
   const watchdogSec = cfg.preferences?.runIdleTimeoutSeconds;
@@ -126,16 +122,6 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
     [
       md('**全局设置**（管理员）'),
       actions([
-        selectStatic({
-          actionId: DM.setReply,
-          placeholder: '回复方式',
-          initial: getMessageReplyMode(cfg),
-          options: [
-            { label: '回复方式：卡片', value: 'card' },
-            { label: '回复方式：Markdown', value: 'markdown' },
-            { label: '回复方式：纯文本', value: 'text' },
-          ],
-        }),
         selectStatic({
           actionId: DM.setTools,
           placeholder: '工具调用显示',
@@ -180,10 +166,10 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
         }),
       ]),
       note(
-        `当前：回复 ${REPLY_LABEL[getMessageReplyMode(cfg)]} · 工具 ${getShowToolCalls(cfg) ? '显示' : '隐藏'} · ` +
+        `当前：工具 ${getShowToolCalls(cfg) ? '显示' : '隐藏'} · ` +
           `假死 ${watchdogVal === '0' ? '关' : `${watchdogVal}s`} · ${getPendingPolicy(cfg) === 'steer' ? '引导' : '排队'} · 并发 ${getMaxConcurrentRuns(cfg)}`,
       ),
-      note('⚠️ 假死超时 / 并发上限 改后需重启 bridge 生效；回复方式 / 工具显示即时生效。'),
+      note('⚠️ 假死超时 / 并发上限 改后需**重启**生效；工具显示 / 运行中新消息 即时生效。'),
       actions([button('⬅️ 菜单', { a: DM.menu })]),
     ],
     { header: { title: '⚙️ 设置', template: 'blue' } },

@@ -44,6 +44,12 @@ export async function refreshBranch(channel: LarkChannel, project: Project): Pro
   const branch = (await currentBranch(project.cwd)) ?? '—';
   if (branch === (project.branch ?? '—')) return;
   log.info('project', 'branch-change', { name: project.name, from: project.branch ?? '—', to: branch });
-  await channel.updateCard(project.bannerMessageId, buildBannerCard(project, branch)).catch((err) => log.fail('project', err, { phase: 'banner-patch' }));
-  await updateProject(project.name, { branch });
+  // Only persist the new branch if the card patch succeeded — otherwise leave
+  // the stored branch stale so the next message/run retries (no false "current").
+  try {
+    await channel.updateCard(project.bannerMessageId, buildBannerCard(project, branch));
+    await updateProject(project.name, { branch });
+  } catch (err) {
+    log.fail('project', err, { phase: 'banner-patch' });
+  }
 }
