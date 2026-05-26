@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import { runDoctor } from './commands/doctor';
 import { runStart } from './commands/start';
 import { secretsGet, secretsSet, secretsList, secretsRemove } from './commands/secrets';
+import { registerServiceCommand } from './commands/service';
 
 const program = new Command();
 
@@ -50,13 +51,7 @@ secrets
     await secretsRemove(id);
   });
 
-program
-  .command('service')
-  .description('后台常驻服务（macOS launchd）')
-  .action(() => {
-    console.error('service：尚未实现（M8）。');
-    process.exitCode = 1;
-  });
+registerServiceCommand(program);
 
 program.parseAsync(process.argv).catch((err) => {
   console.error(err instanceof Error ? err.message : String(err));
