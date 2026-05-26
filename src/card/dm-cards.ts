@@ -6,12 +6,13 @@ import {
 } from '../config/schema';
 import type { Project } from '../project/registry';
 import type { BotGroup } from '../project/group-ops';
-import { actions, button, card, hr, md, note, selectStatic, type CardObject } from './cards';
+import { actions, button, card, form, hr, input, md, note, selectStatic, submitButton, type CardObject } from './cards';
 
 /** Action ids for the DM (private chat) management console. */
 export const DM = {
   menu: 'dm.menu',
   newProject: 'dm.newProject',
+  newProjectSubmit: 'dm.newProject.submit',
   projects: 'dm.projects',
   settings: 'dm.settings',
   doctor: 'dm.doctor',
@@ -48,15 +49,30 @@ export function buildDmMenuCard(): CardObject {
   );
 }
 
-export function buildNewProjectHintCard(): CardObject {
+/** Interactive new-project form: project name + optional CWD, submit/cancel. */
+export function buildNewProjectFormCard(opts: { name?: string; cwd?: string; error?: string } = {}): CardObject {
+  const elements = [];
+  if (opts.error) elements.push(md(`❌ **创建失败**：${opts.error}`));
+  elements.push(
+    md('填项目名（必填）。**CWD 留空** = 在默认目录新建空白项目并 `git init`；**填绝对路径** = 用现有文件夹。'),
+    form('new_project', [
+      input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
+      input({ name: 'cwd', label: 'CWD（可选，绝对路径）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
+      actions([submitButton('✅ 创建', { a: DM.newProjectSubmit }), button('⬅️ 菜单', { a: DM.menu })]),
+    ]),
+  );
+  return card(elements, { header: { title: '➕ 新建项目', template: 'turquoise' } });
+}
+
+/** Shown after a project is created. */
+export function buildNewProjectDoneCard(p: Project): CardObject {
   return card(
     [
-      md('**新建项目**：发我一条命令：'),
-      md('- `/new 项目名` — 新建空白项目（建群 + 拉你进群 + git init）\n- `/new 项目名 /现有/绝对路径` — 用现有文件夹'),
-      note('例：`/new my-app` 或 `/new my-app /Users/you/code/my-app`'),
-      actions([button('⬅️ 菜单', { a: DM.menu })]),
+      md(`✅ 已创建项目 **${p.name}**${p.blank ? ' _(空白 + git init)_' : ''}`),
+      note(`📂 \`${p.cwd}\`${p.chatId ? `   群已建好，去群里 @我 干活` : ''}`),
+      actions([button('📁 项目列表', { a: DM.projects }), button('⬅️ 菜单', { a: DM.menu })]),
     ],
-    { header: { title: '➕ 新建项目', template: 'turquoise' } },
+    { header: { title: '➕ 新建项目', template: 'green' } },
   );
 }
 

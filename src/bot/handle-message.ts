@@ -30,7 +30,8 @@ import { log, withTrace } from '../core/logger';
 import {
   buildDmMenuCard,
   buildGroupsCard,
-  buildNewProjectHintCard,
+  buildNewProjectDoneCard,
+  buildNewProjectFormCard,
   buildProjectListCard,
   buildRmConfirmCard,
   buildSettingsCard,
@@ -38,6 +39,7 @@ import {
 } from '../card/dm-cards';
 import { currentBranch } from '../project/git-info';
 import { getProjectByChatId, listProjects, removeProject } from '../project/registry';
+import { createProject } from '../project/lifecycle';
 import { refreshBranch } from '../project/banner';
 import { listBotGroups, transferOwnership } from '../project/group-ops';
 import { getSession, patchSession, upsertSession } from './session-store';
@@ -248,10 +250,17 @@ export function createOrchestrator(
   // settle. Cards must be CardKit entities (sendManagedCard) for the update to
   // target them — im.v1.message.patch only does "unconditional" updates.
   const CARD_SETTLE_MS = 500;
-  const settleUpdate = (msgId: string, c: object): void => {
+  // `c` may be a card object or a (possibly async) builder. Passing a builder
+  // lets a handler return *immediately* (so the SDK acks the click's callback
+  // right away, closing the interaction window) while any slow work — API
+  // calls, createProject — runs inside the settle, after the ack. Awaiting slow
+  // work in the handler instead holds the callback open and the next click's
+  // update collides with the still-open window (err 200810 → revert).
+  const settleUpdate = (msgId: string, c: object | (() => object | Promise<object>)): void => {
     void (async () => {
       await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
-      await updateManagedCard(channel, msgId, c);
+      const card = typeof c === 'function' ? await c() : c;
+      await updateManagedCard(channel, msgId, card);
     })();
   };
   // Same settle discipline for a run card's CardKit entity: mutate state +
@@ -417,27 +426,48 @@ export function createOrchestrator(
   const dmAdmin = (openId?: string): boolean => isAdmin(cfg, openId ?? '');
   // DM cards are CardKit entities (sendManagedCard); update them via the
   // settle-then-cardkit path so the click's callback acks first.
-  const patch = (msgId: string, c: object): void => settleUpdate(msgId, c);
+  const patch = (msgId: string, c: object | (() => object | Promise<object>)): void =>
+    settleUpdate(msgId, c);
 
-  async function applyPref(evt: CardActionEvent, mut: (p: AppPreferences) => void): Promise<void> {
+  function applyPref(evt: CardActionEvent, mut: (p: AppPreferences) => void): void {
     if (!dmAdmin(evt.operator?.openId)) return;
     const prefs: AppPreferences = { ...(cfg.preferences ?? {}) };
     mut(prefs);
     cfg.preferences = prefs;
-    await saveConfig(cfg).catch((err) => log.fail('console', err, { phase: 'save-config' }));
-    await patch(evt.messageId, buildSettingsCard(cfg));
+    // persist in the background; the card only needs the in-memory cfg
+    void saveConfig(cfg).catch((err) => log.fail('console', err, { phase: 'save-config' }));
+    patch(evt.messageId, buildSettingsCard(cfg));
   }
 
   dispatcher
     .on(DM.menu, async ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) await patch(evt.messageId, buildDmMenuCard());
     })
-    .on(DM.newProject, async ({ evt }) => {
-      if (dmAdmin(evt.operator?.openId)) await patch(evt.messageId, buildNewProjectHintCard());
+    .on(DM.newProject, ({ evt }) => {
+      if (dmAdmin(evt.operator?.openId)) patch(evt.messageId, buildNewProjectFormCard());
     })
-    .on(DM.projects, async ({ evt }) => {
+    .on(DM.newProjectSubmit, ({ evt, formValue }) => {
+      const op = evt.operator?.openId;
+      if (!dmAdmin(op)) return;
+      const name = String((formValue?.name as string) ?? '').trim();
+      const cwdIn = String((formValue?.cwd as string) ?? '').trim();
+      // createProject is slow (group create + git init) — do it in the settle
+      // builder so the submit callback acks immediately.
+      patch(evt.messageId, async () => {
+        if (!name) return buildNewProjectFormCard({ cwd: cwdIn, error: '项目名不能为空' });
+        if (!op) return buildNewProjectFormCard({ name, cwd: cwdIn, error: '无法识别操作者身份' });
+        try {
+          const p = await createProject(channel, { name, ownerOpenId: op, existingPath: cwdIn || undefined });
+          log.info('console', 'new-project', { name: p.name, blank: p.blank });
+          return buildNewProjectDoneCard(p);
+        } catch (err) {
+          return buildNewProjectFormCard({ name, cwd: cwdIn, error: err instanceof Error ? err.message : String(err) });
+        }
+      });
+    })
+    .on(DM.projects, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      await patch(evt.messageId, buildProjectListCard(await listProjects()));
+      patch(evt.messageId, async () => buildProjectListCard(await listProjects()));
     })
     .on(DM.settings, async ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) await patch(evt.messageId, buildSettingsCard(cfg));
@@ -462,71 +492,76 @@ export function createOrchestrator(
       if (!dmAdmin(evt.operator?.openId) || !name) return;
       await patch(evt.messageId, buildRmConfirmCard(name));
     })
-    .on(DM.rmCancel, async ({ evt }) => {
+    .on(DM.rmCancel, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      await patch(evt.messageId, buildProjectListCard(await listProjects()));
+      patch(evt.messageId, async () => buildProjectListCard(await listProjects()));
     })
-    .on(DM.rmDo, async ({ evt, value }) => {
+    .on(DM.rmDo, ({ evt, value }) => {
       const name = typeof value.n === 'string' ? value.n : undefined;
       const op = evt.operator?.openId;
       if (!dmAdmin(op) || !name) return;
-      const removed = await removeProject(name);
-      // revoke the pinned banner (best-effort); never delete the code dir
-      if (removed?.bannerMessageId) {
-        await channel.rawClient.im.v1.pin
-          .delete({ path: { message_id: removed.bannerMessageId } })
+      // all the slow work (remove + unpin + owner transfer + reply) runs in the
+      // settle builder so the click acks immediately.
+      patch(evt.messageId, async () => {
+        const removed = await removeProject(name);
+        if (removed?.bannerMessageId) {
+          await channel.rawClient.im.v1.pin
+            .delete({ path: { message_id: removed.bannerMessageId } })
+            .catch(() => undefined);
+        }
+        let transferred = false;
+        if (removed?.chatId && op) {
+          transferred = await transferOwnership(channel, removed.chatId, op)
+            .then(() => true)
+            .catch((err) => {
+              log.fail('console', err, { phase: 'owner-transfer' });
+              return false;
+            });
+        }
+        log.info('console', 'rm', { name, transferred });
+        const tail = transferred
+          ? '群主已转给你 → 请在飞书里**自行解散该群**（机器人不主动解散）。'
+          : '⚠️ 群主转让失败（可能 bot 非群主），请用「🚪 群管理」手动转让后解散。';
+        await channel
+          .send(evt.chatId, { markdown: `✅ 已删除项目「${name}」（解绑，未删代码目录）。\n${tail}` }, { replyTo: evt.messageId })
           .catch(() => undefined);
-      }
-      // bot owns the group → transfer ownership to the admin so they can disband
-      let transferred = false;
-      if (removed?.chatId && op) {
-        transferred = await transferOwnership(channel, removed.chatId, op)
+        return buildProjectListCard(await listProjects());
+      });
+    })
+    .on(DM.groups, ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      patch(evt.messageId, async () => {
+        const groups = await listBotGroups(channel).catch((err) => {
+          log.fail('console', err, { phase: 'list-groups' });
+          return [];
+        });
+        return buildGroupsCard(groups, evt.operator?.name);
+      });
+    })
+    .on(DM.transferOwner, ({ evt, value }) => {
+      const chatId = typeof value.c === 'string' ? value.c : undefined;
+      const op = evt.operator?.openId;
+      if (!dmAdmin(op) || !chatId || !op) return;
+      patch(evt.messageId, async () => {
+        const ok = await transferOwnership(channel, chatId, op)
           .then(() => true)
           .catch((err) => {
             log.fail('console', err, { phase: 'owner-transfer' });
             return false;
           });
-      }
-      log.info('console', 'rm', { name, transferred });
-      const tail = transferred
-        ? '群主已转给你 → 请在飞书里**自行解散该群**（机器人不主动解散）。'
-        : '⚠️ 群主转让失败（可能 bot 非群主），请用「🚪 群管理」手动转让后解散。';
-      await channel
-        .send(evt.chatId, { markdown: `✅ 已删除项目「${name}」（解绑，未删代码目录）。\n${tail}` }, { replyTo: evt.messageId })
-        .catch(() => undefined);
-      await patch(evt.messageId, buildProjectListCard(await listProjects()));
-    })
-    .on(DM.groups, async ({ evt }) => {
-      if (!dmAdmin(evt.operator?.openId)) return;
-      const groups = await listBotGroups(channel).catch((err) => {
-        log.fail('console', err, { phase: 'list-groups' });
-        return [];
+        await channel
+          .send(
+            evt.chatId,
+            {
+              markdown: ok
+                ? '✅ 群主已转给你。现在去那个群 → 设置 → **解散群聊**。'
+                : '❌ 转让失败（可能 bot 不是该群群主，或缺 im:chat 权限）。',
+            },
+            { replyTo: evt.messageId },
+          )
+          .catch(() => undefined);
+        return buildGroupsCard(await listBotGroups(channel).catch(() => []), evt.operator?.name);
       });
-      await patch(evt.messageId, buildGroupsCard(groups, evt.operator?.name));
-    })
-    .on(DM.transferOwner, async ({ evt, value }) => {
-      const chatId = typeof value.c === 'string' ? value.c : undefined;
-      const op = evt.operator?.openId;
-      if (!dmAdmin(op) || !chatId || !op) return;
-      const ok = await transferOwnership(channel, chatId, op)
-        .then(() => true)
-        .catch((err) => {
-          log.fail('console', err, { phase: 'owner-transfer' });
-          return false;
-        });
-      await channel
-        .send(
-          evt.chatId,
-          {
-            markdown: ok
-              ? '✅ 群主已转给你。现在去那个群 → 设置 → **解散群聊**。'
-              : '❌ 转让失败（可能 bot 不是该群群主，或缺 im:chat 权限）。',
-          },
-          { replyTo: evt.messageId },
-        )
-        .catch(() => undefined);
-      const groups = await listBotGroups(channel).catch(() => []);
-      await patch(evt.messageId, buildGroupsCard(groups, evt.operator?.name));
     })
     .on(DM.setTools, async ({ evt, option }) => {
       await applyPref(evt, (p) => (p.showToolCalls = option === 'on'));

@@ -13,6 +13,8 @@ export interface CardActionContext {
   option?: string;
   /** the element's value payload (buttons carry their payload here) */
   value: Record<string, unknown>;
+  /** form inputs (by `name`) when a submit button fired — needs includeRawEvent */
+  formValue?: Record<string, unknown>;
 }
 
 export type CardActionHandler = (ctx: CardActionContext) => Promise<void> | void;
@@ -50,6 +52,8 @@ export class CardDispatcher {
       log.info('card', 'action-nohandler', { actionId });
       return;
     }
+    const formValue = (evt as CardActionEvent & { raw?: { action?: { form_value?: Record<string, unknown> } } })
+      .raw?.action?.form_value;
     await withTrace({ chatId: evt.chatId, msgId: evt.messageId }, async () => {
       log.info('card', 'action', { actionId, by: evt.operator?.openId?.slice(-6) });
       try {
@@ -60,6 +64,7 @@ export class CardDispatcher {
           actionId,
           option: evt.action?.option,
           value,
+          formValue,
         });
       } catch (err) {
         log.fail('card', err, { actionId });

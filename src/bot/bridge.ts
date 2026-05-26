@@ -24,6 +24,9 @@ export async function startBridge(opts: BridgeOptions): Promise<LarkChannel> {
     appSecret: opts.appSecret,
     domain: app.tenant === 'lark' ? Domain.Lark : Domain.Feishu,
     source: 'feishu-codex-bridge',
+    // surface raw events so card-action handlers can read form submissions
+    // (action.form_value) — used by the new-project form.
+    includeRawEvent: true,
   });
 
   const orchestrator = createOrchestrator(channel, opts.cfg, opts.fallbackCwd);

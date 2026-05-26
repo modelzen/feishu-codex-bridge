@@ -79,19 +79,29 @@ export async function updateManagedCard(
 ): Promise<boolean> {
   const entry = byMessageId.get(messageId);
   if (!entry) return false;
-  entry.sequence += 1;
-  try {
+  const data = JSON.stringify(card);
+  const push = async (): Promise<void> => {
+    entry.sequence += 1;
     await channel.rawClient.cardkit.v1.card.update({
       path: { card_id: entry.cardId },
-      data: {
-        card: { type: 'card_json', data: JSON.stringify(card) },
-        sequence: entry.sequence,
-      },
+      data: { card: { type: 'card_json', data }, sequence: entry.sequence, uuid: `u_${entry.cardId}_${entry.sequence}` },
     });
+  };
+  try {
+    await push();
     return true;
   } catch (err) {
-    log.fail('card', err, { phase: 'managed-update', cardId: entry.cardId, seq: entry.sequence });
-    return false;
+    // err 200810: the card is still in a previous click's interaction window.
+    // Wait out the 3s callback window and retry once with the next sequence.
+    log.fail('card', err, { phase: 'managed-update', cardId: entry.cardId, seq: entry.sequence, retry: true });
+    await new Promise((r) => setTimeout(r, 3200));
+    try {
+      await push();
+      return true;
+    } catch (err2) {
+      log.fail('card', err2, { phase: 'managed-update-retry', cardId: entry.cardId, seq: entry.sequence });
+      return false;
+    }
   }
 }
 

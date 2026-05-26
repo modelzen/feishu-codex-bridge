@@ -108,6 +108,44 @@ export function button(label: string, value: ActionValue, type: ButtonType = 'de
   };
 }
 
+/** A text input (schema 2.0 `input` component). `name` keys its value in the
+ * form's `form_value` on submit. */
+export function input(opts: {
+  name: string;
+  label?: string;
+  placeholder?: string;
+  value?: string;
+  required?: boolean;
+}): CardElement {
+  return {
+    tag: 'input',
+    name: opts.name,
+    ...(opts.label ? { label: { tag: 'plain_text', content: opts.label } } : {}),
+    ...(opts.placeholder ? { placeholder: { tag: 'plain_text', content: opts.placeholder } } : {}),
+    ...(opts.value ? { default_value: opts.value } : {}),
+    required: Boolean(opts.required),
+  };
+}
+
+/** A form container (schema 2.0). Inputs inside it surface their values in
+ * `action.form_value` when a `form_action_type:'submit'` button is clicked. */
+export function form(name: string, elements: CardElement[]): CardElement {
+  return { tag: 'form', name, elements };
+}
+
+/** A button that submits its enclosing form — its click callback carries the
+ * collected `form_value`. */
+export function submitButton(label: string, value: ActionValue, type: ButtonType = 'primary'): CardElement {
+  return {
+    tag: 'button',
+    name: 'submit',
+    text: { tag: 'plain_text', content: label },
+    type,
+    form_action_type: 'submit',
+    behaviors: [{ type: 'callback', value }],
+  };
+}
+
 export interface SelectOption {
   label: string;
   /** option value returned in CardActionEvent.action.option */
