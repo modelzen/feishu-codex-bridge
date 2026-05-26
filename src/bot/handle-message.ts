@@ -46,6 +46,8 @@ interface ActiveState {
   thread: AgentThread;
   run?: AgentRun;
   queue: string[];
+  /** who started this run — gates destructive ⏹ (design §5) */
+  requesterOpenId?: string;
 }
 
 export interface Orchestrator {
@@ -165,10 +167,10 @@ export function createOrchestrator(
           createdAt: Date.now(),
           updatedAt: Date.now(),
         });
-        await launchRun({ chatId: msg.chatId, replyTo: msg.messageId, thread: fresh, firstText: text, knownThreadId: threadId });
+        await launchRun({ chatId: msg.chatId, replyTo: msg.messageId, thread: fresh, firstText: text, knownThreadId: threadId, requesterOpenId: msg.senderId });
         return;
       }
-      await launchRun({ chatId: msg.chatId, replyTo: msg.messageId, thread, firstText: text, knownThreadId: threadId });
+      await launchRun({ chatId: msg.chatId, replyTo: msg.messageId, thread, firstText: text, knownThreadId: threadId, requesterOpenId: msg.senderId });
     });
   }
 
@@ -319,23 +321,33 @@ export function createOrchestrator(
   /** Run-card actions: gated by chat/user allow lists (design §5). */
   const runAllowed = (evt: CardActionEvent): boolean =>
     isChatAllowed(cfg, evt.chatId) && isUserAllowed(cfg, evt.operator?.openId ?? '');
+  /**
+   * Owner-or-admin gate for run-card controls. Killing/altering someone else's
+   * run is destructive (design §5: 杀别人的 run 限 admins), and `allowedUsers`
+   * defaults to "everyone", so the allow-list alone is not enough. Only the run
+   * starter (requester) or an admin may ⏹/⚙️ it.
+   */
+  const runOwnerOrAdmin = (evt: CardActionEvent, ownerOpenId?: string): boolean => {
+    if (!runAllowed(evt)) return false;
+    const op = evt.operator?.openId ?? '';
+    return op === ownerOpenId || isAdmin(cfg, op);
+  };
 
   // run card buttons (design §3.3)
   dispatcher
     .on(RC.stop, async ({ evt, value }) => {
-      if (!runAllowed(evt)) return;
       const key = typeof value.m === 'string' ? value.m : evt.messageId;
       const st = runsByCard.get(key);
-      const tid = st?.run?.turnId();
-      if (st && tid) {
+      if (!st || !runOwnerOrAdmin(evt, st.requesterOpenId)) return;
+      const tid = st.run?.turnId();
+      if (tid) {
         await st.thread.abort(tid).catch(() => undefined);
         log.info('card', 'action', { actionId: 'run.stop', aborted: tid });
       }
     })
     .on(RC.settings, async ({ evt }) => {
-      if (!runAllowed(evt)) return;
       const rc = runCards.get(evt.messageId);
-      if (!rc) return;
+      if (!rc || !runOwnerOrAdmin(evt, rc.requesterOpenId)) return;
       rc.expanded = !rc.expanded;
       rc.settingsNote = undefined;
       if (rc.expanded) {
@@ -345,9 +357,8 @@ export function createOrchestrator(
       await channel.updateCard(evt.messageId, buildRunCard(rc)).catch(() => undefined);
     })
     .on(RC.model, async ({ evt, option }) => {
-      if (!runAllowed(evt)) return;
       const rc = runCards.get(evt.messageId);
-      if (!rc || !option) return;
+      if (!rc || !option || !runOwnerOrAdmin(evt, rc.requesterOpenId)) return;
       rc.model = option;
       const m = rc.models?.find((x) => x.id === option);
       if (m && m.supportedEfforts.length && rc.effort && !m.supportedEfforts.includes(rc.effort)) {
@@ -358,9 +369,8 @@ export function createOrchestrator(
       await channel.updateCard(evt.messageId, buildRunCard(rc)).catch(() => undefined);
     })
     .on(RC.effort, async ({ evt, option }) => {
-      if (!runAllowed(evt)) return;
       const rc = runCards.get(evt.messageId);
-      if (!rc || !option) return;
+      if (!rc || !option || !runOwnerOrAdmin(evt, rc.requesterOpenId)) return;
       rc.effort = option as ReasoningEffort;
       if (rc.threadId) await patchSession(rc.threadId, { effort: rc.effort });
       rc.settingsNote = `✅ 已设置 effort，下一轮生效`;
@@ -547,6 +557,7 @@ export function createOrchestrator(
           effort: state.effort,
           cwd: state.cwd,
           summary: state.text.slice(0, 80) || '(空)',
+          requesterOpenId: state.requesterOpenId,
         },
         onFirstCard,
       );
@@ -567,6 +578,8 @@ export function createOrchestrator(
     effort?: ReasoningEffort;
     cwd?: string;
     summary?: string;
+    /** who triggered this run (for ⏹/⚙️ ownership gating) */
+    requesterOpenId?: string;
   }
 
   async function launchRun(opts: LaunchOpts, onFirstCard?: () => void): Promise<void> {
@@ -574,7 +587,7 @@ export function createOrchestrator(
     let firstCardSent = false;
     let activeKey = opts.knownThreadId ?? `pending:${opts.replyTo}`;
     let topicThreadId = opts.knownThreadId;
-    const state: ActiveState = { thread: opts.thread, queue: [] };
+    const state: ActiveState = { thread: opts.thread, queue: [], requesterOpenId: opts.requesterOpenId };
     active.set(activeKey, state);
     if (opts.knownThreadId) sessions.set(opts.knownThreadId, opts.thread);
     const models = modelsCache ?? (await listModels());
@@ -624,7 +637,7 @@ export function createOrchestrator(
         render.showTools = getShowToolCalls(cfg);
         let terminal: RunStatus = 'done';
         let cardMsgId: string | undefined;
-        const rc: RunCardState = { body: '', status: 'running', model: turnModel, effort: turnEffort, cwd: opts.cwd, models };
+        const rc: RunCardState = { body: '', status: 'running', model: turnModel, effort: turnEffort, cwd: opts.cwd, models, requesterOpenId: opts.requesterOpenId };
 
         const adoptThreadId = async (messageId: string): Promise<void> => {
           if (activeKey.startsWith('pending:')) {

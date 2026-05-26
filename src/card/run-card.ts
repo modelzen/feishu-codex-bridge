@@ -43,6 +43,8 @@ export interface RunCardState {
   cardKey?: string;
   /** topic thread id for ⚙️ settings routing (known after topic created) */
   threadId?: string;
+  /** who started this run — only they (or an admin) may ⏹/⚙️ it (design §5) */
+  requesterOpenId?: string;
   /** ⚙️ settings panel open */
   expanded?: boolean;
   models?: ModelInfo[];

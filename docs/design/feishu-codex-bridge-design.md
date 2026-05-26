@@ -167,7 +167,7 @@
 
 ## 9. 开放平台配置（onboarding 文档需覆盖）
 
-- 权限 scope：`im:message` `im:message:send_as_bot` `im:resource` `im:chat`（建群）`im:pin`/`im:message.pins:write_only`（置顶）`drive:drive`（云文档评论，可选）。**不需要 `im:chat:delete`**——删项目只解绑，群由用户自行解散。
+- 权限 scope：`im:message` `im:message:send_as_bot` `im:resource` `im:chat`（建群 + **转让群主** `chat.update owner_id`）`im:pin`/`im:message.pins:write_only`（置顶）`drive:drive`（云文档评论，可选）。**不需要 `im:chat:delete`**——删项目时 bot 不主动解散，而是**把群主转让给 admin**（用 `im:chat`，与建群同款），由 admin 自行解散（bot 是群主、用户无法自行解散，见 §3.1 + decisions.md 2026-05-26）。
 - 事件（长连接）：`im.message.receive_v1` `card.action.trigger` `application.bot.menu_v6`；可选 `im.message.reaction.*` `im.chat.member.bot.added_v1`
 - 机器人自定义菜单：后台「机器人能力 → 机器人自定义菜单」配置 5 项（推送事件，各设 event_key），发布版本生效。
 
@@ -186,7 +186,7 @@
 - `im +chat-create --as bot`：建群、拉人、返回 chat_id + share_link ✓
 - **`reply_in_thread` 建话题**：对根消息做 `+messages-reply --reply-in-thread` → 生成 `thread_id`(omt_xxx)，`root_id/parent_id` 指向根消息。**普通群(group) 和话题群(topic) 都成立** → 项目群用普通群即可（主区普通聊 + @消息派生话题）。注意：lark-cli reply 响应不透出 thread_id，需从消息(`GET /im/v1/messages/:id`)或 receive 事件取。
 - `im pins create --as bot`：置顶消息成功 ✓（群横幅可行）。
-- 发现：缺 `im:chat:delete` scope，bot 无法解散群（99991672）→ **决策：删项目只"解绑"，群由用户自行解散，不需要该 scope**。
+- 发现：缺 `im:chat:delete` scope，bot 无法解散群（99991672）。**初版决策"群由用户自行解散"已作废**——群是 bot 建的、bot 是群主，用户只能退群、无法解散。→ **修正决策（2026-05-26）：删项目时 bot 把群主 `chat.update owner_id` 转让给 admin（用 `im:chat`），由 admin 自行解散；另设 DM「🚪群管理」转让遗留群。见 decisions.md。**
 
 **⏳ 待验证**
 - 真实 `turn/start`+`turn/steer`+`turn/interrupt` 全链路（需模型请求耗 token；schema 已确认、yepanywhere 生产在用，风险低）。
