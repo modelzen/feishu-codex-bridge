@@ -9,6 +9,7 @@ import type {
   ReasoningEffort,
   ResumeThreadOptions,
   StartThreadOptions,
+  ThreadSummary,
 } from '../types';
 import { AppServerClient } from './app-server-client';
 import { mapNotification } from './event-map';
@@ -107,6 +108,35 @@ export class CodexAppServerBackend implements AgentBackend {
     }
   }
 
+  async listThreads(cwd: string, limit = 15): Promise<ThreadSummary[]> {
+    const bin = resolveCodexBin();
+    if (!bin) return [];
+    const client = new AppServerClient({ bin, cwd, clientName: 'feishu-codex-bridge-threads' });
+    try {
+      await client.connect();
+      const res = await client.request<{ data?: RawThread[] }>('thread/list', {
+        cwd,
+        limit,
+        sortKey: 'created_at',
+        sortDirection: 'desc',
+      });
+      return (res.data ?? [])
+        .filter((t) => !t.ephemeral)
+        .map((t) => ({
+          codexThreadId: t.id,
+          preview: t.preview ?? '',
+          createdAt: t.createdAt ?? 0,
+          updatedAt: t.updatedAt ?? t.createdAt ?? 0,
+          name: t.name ?? undefined,
+        }));
+    } catch (err) {
+      log.fail('agent', err, { phase: 'thread/list' });
+      return [];
+    } finally {
+      await client.close();
+    }
+  }
+
   async startThread(opts: StartThreadOptions): Promise<AgentThread> {
     const client = await this.spawn(opts.cwd);
     const res = await client.request<{ thread: { id: string } }>('thread/start', {
@@ -137,6 +167,15 @@ export class CodexAppServerBackend implements AgentBackend {
     await client.connect();
     return client;
   }
+}
+
+interface RawThread {
+  id: string;
+  preview?: string;
+  createdAt?: number;
+  updatedAt?: number;
+  name?: string | null;
+  ephemeral?: boolean;
 }
 
 interface RawModel {

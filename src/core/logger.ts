@@ -22,6 +22,9 @@ const STDOUT_INFO_ALLOWLIST = new Set<string>([
   'intake.recv',
   'intake.reject',
   'card.final',
+  'card.config',
+  'card.action',
+  'card.launch',
   'agent.spawn',
   'agent.exit',
 ]);

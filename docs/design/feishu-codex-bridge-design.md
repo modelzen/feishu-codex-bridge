@@ -66,9 +66,10 @@
 - **群置顶横幅**（`im pins create` + 卡片 patch；chat 级）：
   `📁项目 / 📂cwd / 🌿分支(只读) / ⚙️默认参数`。分支变化**惰性检测**（消息进来 / run 结束时读 `git rev-parse --abbrev-ref HEAD`，变了 patch 横幅）。
 - **主区 @bot[+首条消息]** → **会话配置卡**（预填默认，可直接创建）：
-  `模型 ▾`（动态 model/list）`effort ▾` `fast ▾` + `[✅ 创建新会话]` `[🔁 恢复历史会话]`
+  `模型 ▾`（动态 model/list）`effort ▾` + `[✅ 创建新会话]` `[🔁 恢复历史会话]`
+  （注：codex 无 `fast` 参数，effort 即速度/质量杆，故去掉 fast 下拉，见 .plans/decisions.md 2026-05-26）
   - 创建 → `reply_in_thread` 把这条消息变成话题、开跑
-  - 恢复 → 列出该项目 cwd 下最近会话（首条消息摘要 + 相对时间）→ 选一条 `thread/resume` 到新话题
+  - 恢复 → `thread/list`（按 cwd 过滤，codex 自己的会话库）列最近会话（`preview` 首条消息 + 相对时间）→ 选一条 `thread/resume` 到新话题
   - **resume 只在新建会话时可选；话题中途不允许恢复**
 
 ### 3.3 话题（thread，= 一个 session）
@@ -78,9 +79,9 @@
 - **@bot 文本** = 与 codex 对话
 - **运行输出卡**（流式，原地 patch 更新）：正在输出 / 工具调用块（可隐藏）/ 文本
   - 底部按钮行（即"菜单"，卡片按钮在话题里有效）：`⏹ 中止` + `⚙️ 设置`
-  - `⚙️ 设置`：展开改本会话 `模型/effort/fast`（改下一轮）+ 显示 cwd/分支
+  - `⚙️ 设置`：展开改本会话 `模型/effort`（改下一轮）+ 显示 cwd/分支
   - **设置控件仅挂最新一张卡**；新一轮开始时 patch 上一张卡移除它 → 翻历史干净
-- **会话开场**：话题首条 bot 消息播报 模型/effort/fast/cwd/分支（一次性，会滚走，不依赖它常驻）
+- **会话开场**：话题首条 bot 消息播报 模型/effort/cwd/分支（一次性，会滚走，不依赖它常驻）
 
 > 群 / 话题里**没有钉住的菜单**（机器人菜单仅单聊）；卡片底部按钮行就是事实上的菜单。
 
@@ -96,8 +97,8 @@
 - **AgentBackend 接口隔离**（`startThread / run / runStreamed / resume / abort` 等），未来可换 exec / SDK / 远程而上层不动。
 - **run 参数映射**：
   - 模型 → `thread/start.model`
-  - effort → 配置 `model_reasoning_effort`（low/medium/high；待确认 minimal/xhigh）
-  - fast → `features.fast_mode`（`--enable/--disable fast_mode`）
+  - effort → `turn/start.effort`（none/minimal/low/medium/high/xhigh；按模型 supportedReasoningEfforts 联动）
+  - ~~fast~~ → codex 无此参数，已删（见 .plans/decisions.md）
   - 权限 → 固定 `approvalPolicy:"never"` + `sandbox:"danger-full-access"`（= dangerously bypass）→ 无 mid-turn 审批
   - 图片 → input `{ type:"local_image", path }`
 - **传输层**：`@larksuiteoapi/node-sdk` 长连接（WSClient）收 `im.message.receive_v1` + `card.action.trigger`(卡片回调) + `application.bot.menu_v6`(菜单)。lark-cli **收不到卡片回调**，仅用于出站动作（发卡/置顶/建群/reply_in_thread）+ OAuth onboarding。
@@ -141,7 +142,7 @@
 | `/config` | DM 菜单「⚙️ 设置」 |
 | `/doctor` | DM 菜单「🩺 诊断」 |
 | `/help` | DM 自由文本 → 引导卡 |
-| `/model` `/effort` `/fast` | 话题运行卡「⚙️ 设置」下拉 |
+| `/model` `/effort` | 话题运行卡「⚙️ 设置」下拉（codex 无 fast） |
 | `/stop` | 运行卡「⏹ 中止」按钮 |
 | `/new` `/reset` `/status` | 回群开新话题 / 置顶横幅 / 运行卡 |
 | `/resume` | 配置卡「🔁 恢复历史会话」 |

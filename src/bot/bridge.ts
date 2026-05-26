@@ -1,7 +1,7 @@
 import { createLarkChannel, Domain, type LarkChannel } from '@larksuiteoapi/node-sdk';
 import type { AppConfig } from '../config/schema';
 import { log } from '../core/logger';
-import { makeMessageHandler } from './handle-message';
+import { createOrchestrator } from './handle-message';
 
 export interface BridgeOptions {
   cfg: AppConfig;
@@ -11,9 +11,11 @@ export interface BridgeOptions {
 }
 
 /**
- * Bring up the long-connection bot. M1 wires the `message` handler
- * (group @bot → thread → codex → streaming card). cardAction / bot.menu
- * handlers come with later milestones.
+ * Bring up the long-connection bot. Wires the `message` handler (group @bot →
+ * 会话配置卡 → reply_in_thread topic → codex → streaming card) and the
+ * `cardAction` dispatcher (config card model/effort/创建/恢复 buttons), which
+ * share run state via the orchestrator. Long-connection is required for
+ * `card.action.trigger` (lark-cli doesn't deliver it).
  */
 export async function startBridge(opts: BridgeOptions): Promise<LarkChannel> {
   const app = opts.cfg.accounts.app;
@@ -24,7 +26,9 @@ export async function startBridge(opts: BridgeOptions): Promise<LarkChannel> {
     source: 'feishu-codex-bridge',
   });
 
-  channel.on('message', makeMessageHandler(channel, opts.cfg, opts.fallbackCwd));
+  const orchestrator = createOrchestrator(channel, opts.cfg, opts.fallbackCwd);
+  channel.on('message', orchestrator.onMessage);
+  channel.on('cardAction', orchestrator.dispatcher.handle);
   channel.on('reject', (evt) => log.info('intake', 'reject', { reason: evt.reason, msgId: evt.messageId }));
   channel.on('error', (err) => log.fail('ws', err));
   channel.on('reconnecting', () => log.info('ws', 'reconnecting'));

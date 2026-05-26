@@ -22,6 +22,19 @@ export interface ModelInfo {
   hidden: boolean;
 }
 
+/** A past codex thread, for the "恢复历史会话" picker (from thread/list). */
+export interface ThreadSummary {
+  /** codex thread id (pass to resumeThread) */
+  codexThreadId: string;
+  /** first user message preview */
+  preview: string;
+  /** unix seconds */
+  createdAt: number;
+  updatedAt: number;
+  /** optional user-facing title */
+  name?: string;
+}
+
 /** Normalized stream events, mapped from app-server notifications. */
 export type AgentEvent =
   | { type: 'system'; threadId: string }
@@ -69,6 +82,8 @@ export interface AgentBackend {
   readonly displayName: string;
   isAvailable(): Promise<boolean>;
   listModels(): Promise<ModelInfo[]>;
+  /** recent codex threads under `cwd`, newest first (for resume picker) */
+  listThreads(cwd: string, limit?: number): Promise<ThreadSummary[]>;
   startThread(opts: StartThreadOptions): Promise<AgentThread>;
   resumeThread(opts: ResumeThreadOptions): Promise<AgentThread>;
 }
