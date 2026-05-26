@@ -17,6 +17,8 @@ import { CardDispatcher } from '../card/dispatcher';
 import { RunRender } from '../card/run-render';
 import {
   buildConfigDoneCard,
+  buildConfigErrorCard,
+  buildConfigLaunchingCard,
   buildSessionConfigCard,
   SC,
   type SessionConfigState,
@@ -213,12 +215,14 @@ export function createOrchestrator(
         model,
         effort,
         mode: 'config',
+        createdAt: Date.now(),
       };
       const res = await channel.send(
         msg.chatId,
         { card: buildSessionConfigCard(state) },
         { replyTo: msg.messageId },
       );
+      prunePending();
       pending.set(res.messageId, state);
       log.info('card', 'config', { project: project?.name ?? '(unregistered)', model, effort });
     });
@@ -226,6 +230,32 @@ export function createOrchestrator(
 
   // ── card actions ──────────────────────────────────────────────────
   const dispatcher = new CardDispatcher(channel, cfg);
+  const PENDING_TTL_MS = 30 * 60_000; // abandoned config cards expire after 30 min
+
+  function prunePending(): void {
+    const now = Date.now();
+    for (const [k, s] of pending) if (now - s.createdAt > PENDING_TTL_MS) pending.delete(k);
+  }
+
+  /**
+   * Resolve + authorize a config-card action. Only the original requester may
+   * act on their card (design §5); the chat/user must still be allowed; expired
+   * cards are dropped. Returns undefined (and ignores the action) otherwise.
+   */
+  function authConfig(evt: CardActionEvent): SessionConfigState | undefined {
+    const state = pending.get(evt.messageId);
+    if (!state) return undefined;
+    if (Date.now() - state.createdAt > PENDING_TTL_MS) {
+      pending.delete(evt.messageId);
+      return undefined;
+    }
+    const op = evt.operator?.openId ?? '';
+    if (op !== state.requesterOpenId || !isChatAllowed(cfg, state.chatId) || !isUserAllowed(cfg, op)) {
+      log.info('card', 'action-denied', { actionId: evt.action?.value && 'cfg', reason: 'not-allowed' });
+      return undefined;
+    }
+    return state;
+  }
 
   function refresh(cardMsgId: string, state: SessionConfigState): Promise<void> {
     return channel.updateCard(cardMsgId, buildSessionConfigCard(state)).catch(() => undefined) as Promise<void>;
@@ -233,7 +263,7 @@ export function createOrchestrator(
 
   dispatcher
     .on(SC.model, async ({ evt, option }) => {
-      const state = pending.get(evt.messageId);
+      const state = authConfig(evt);
       if (!state || !option) return;
       state.model = option;
       // re-pick a valid effort if the new model doesn't support the current one
@@ -244,52 +274,78 @@ export function createOrchestrator(
       await refresh(evt.messageId, state);
     })
     .on(SC.effort, async ({ evt, option }) => {
-      const state = pending.get(evt.messageId);
+      const state = authConfig(evt);
       if (!state || !option) return;
       state.effort = option as ReasoningEffort;
       await refresh(evt.messageId, state);
     })
     .on(SC.resume, async ({ evt }) => {
-      const state = pending.get(evt.messageId);
+      const state = authConfig(evt);
       if (!state) return;
       state.mode = 'resume';
       state.threads = await backend.listThreads(state.cwd);
       await refresh(evt.messageId, state);
     })
     .on(SC.back, async ({ evt }) => {
-      const state = pending.get(evt.messageId);
+      const state = authConfig(evt);
       if (!state) return;
       state.mode = 'config';
+      state.launching = false;
       await refresh(evt.messageId, state);
     })
     .on(SC.create, async ({ evt }) => {
-      const state = pending.get(evt.messageId);
-      if (!state) return;
-      pending.delete(evt.messageId);
-      await channel.updateCard(evt.messageId, buildConfigDoneCard(state, 'created')).catch(() => undefined);
-      const thread = await backend.startThread({ cwd: state.cwd, model: state.model, effort: state.effort });
-      log.info('card', 'launch', { kind: 'create', model: state.model, effort: state.effort });
-      await launchSessionFromCard(state, thread, 'created');
+      const state = authConfig(evt);
+      if (!state || state.launching) return;
+      state.launching = true;
+      await channel.updateCard(evt.messageId, buildConfigLaunchingCard(state, 'created')).catch(() => undefined);
+      // detach: don't hold the cardAction callback for the whole Codex run
+      void (async () => {
+        try {
+          const thread = await backend.startThread({ cwd: state.cwd, model: state.model, effort: state.effort });
+          pending.delete(evt.messageId);
+          await channel.updateCard(evt.messageId, buildConfigDoneCard(state, 'created')).catch(() => undefined);
+          log.info('card', 'launch', { kind: 'create', model: state.model, effort: state.effort });
+          await launchSessionFromCard(state, thread, 'created');
+        } catch (err) {
+          state.launching = false; // keep pending → card stays retryable
+          log.fail('card', err, { phase: 'create-launch' });
+          await channel
+            .updateCard(evt.messageId, buildConfigErrorCard(state, err instanceof Error ? err.message : String(err)))
+            .catch(() => undefined);
+        }
+      })();
     })
     .on(SC.pick, async ({ evt, value }) => {
-      const state = pending.get(evt.messageId);
+      const state = authConfig(evt);
       const codexThreadId = typeof value.t === 'string' ? value.t : undefined;
-      if (!state || !codexThreadId) return;
-      pending.delete(evt.messageId);
-      await channel.updateCard(evt.messageId, buildConfigDoneCard(state, 'resumed')).catch(() => undefined);
-      const thread = await backend.resumeThread({
-        cwd: state.cwd,
-        codexThreadId,
-        model: state.model,
-        effort: state.effort,
-      });
-      log.info('card', 'launch', { kind: 'resume', codexThreadId });
-      await launchSessionFromCard(state, thread, 'resumed');
+      if (!state || !codexThreadId || state.launching) return;
+      state.launching = true;
+      await channel.updateCard(evt.messageId, buildConfigLaunchingCard(state, 'resumed')).catch(() => undefined);
+      void (async () => {
+        try {
+          const thread = await backend.resumeThread({ cwd: state.cwd, codexThreadId, model: state.model, effort: state.effort });
+          pending.delete(evt.messageId);
+          await channel.updateCard(evt.messageId, buildConfigDoneCard(state, 'resumed')).catch(() => undefined);
+          log.info('card', 'launch', { kind: 'resume', codexThreadId });
+          await launchSessionFromCard(state, thread, 'resumed');
+        } catch (err) {
+          state.launching = false;
+          log.fail('card', err, { phase: 'resume-launch' });
+          await channel
+            .updateCard(evt.messageId, buildConfigErrorCard(state, err instanceof Error ? err.message : String(err)))
+            .catch(() => undefined);
+        }
+      })();
     });
+
+  /** Run-card actions: gated by chat/user allow lists (design §5). */
+  const runAllowed = (evt: CardActionEvent): boolean =>
+    isChatAllowed(cfg, evt.chatId) && isUserAllowed(cfg, evt.operator?.openId ?? '');
 
   // run card buttons (design §3.3)
   dispatcher
     .on(RC.stop, async ({ evt, value }) => {
+      if (!runAllowed(evt)) return;
       const key = typeof value.m === 'string' ? value.m : evt.messageId;
       const st = runsByCard.get(key);
       const tid = st?.run?.turnId();
@@ -299,6 +355,7 @@ export function createOrchestrator(
       }
     })
     .on(RC.settings, async ({ evt }) => {
+      if (!runAllowed(evt)) return;
       const rc = runCards.get(evt.messageId);
       if (!rc) return;
       rc.expanded = !rc.expanded;
@@ -310,6 +367,7 @@ export function createOrchestrator(
       await channel.updateCard(evt.messageId, buildRunCard(rc)).catch(() => undefined);
     })
     .on(RC.model, async ({ evt, option }) => {
+      if (!runAllowed(evt)) return;
       const rc = runCards.get(evt.messageId);
       if (!rc || !option) return;
       rc.model = option;
@@ -322,6 +380,7 @@ export function createOrchestrator(
       await channel.updateCard(evt.messageId, buildRunCard(rc)).catch(() => undefined);
     })
     .on(RC.effort, async ({ evt, option }) => {
+      if (!runAllowed(evt)) return;
       const rc = runCards.get(evt.messageId);
       if (!rc || !option) return;
       rc.effort = option as ReasoningEffort;
@@ -601,8 +660,11 @@ async function getThreadId(channel: LarkChannel, messageId: string): Promise<str
   try {
     const res = await channel.rawClient.im.v1.message.get({ path: { message_id: messageId } });
     const items = (res.data as { items?: { thread_id?: string }[] } | undefined)?.items;
-    return items?.[0]?.thread_id;
-  } catch {
+    const tid = items?.[0]?.thread_id;
+    if (!tid) log.warn('intake', 'threadid-missing', { messageId });
+    return tid;
+  } catch (err) {
+    log.warn('intake', 'threadid-lookup-failed', { messageId, err: String(err) });
     return undefined;
   }
 }

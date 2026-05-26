@@ -34,6 +34,10 @@ export interface SessionConfigState {
   mode: 'config' | 'resume';
   /** populated in resume mode */
   threads?: ThreadSummary[];
+  /** when the card was posted (ms) — for TTL pruning of abandoned cards */
+  createdAt: number;
+  /** in-flight launch guard (anti double-click) */
+  launching?: boolean;
 }
 
 const EFFORT_LABEL: Record<ReasoningEffort, string> = {
@@ -116,6 +120,26 @@ function buildResumeCard(state: SessionConfigState): CardObject {
   elements.push(hr());
   elements.push(actions([button('⬅️ 返回', { a: SC.back })]));
   return card(elements, { header: { title: '🔁 恢复历史会话', template: 'wathet' } });
+}
+
+/** Transient "launching" card — interactive controls removed (anti double-click). */
+export function buildConfigLaunchingCard(state: SessionConfigState, kind: 'created' | 'resumed'): CardObject {
+  const label = kind === 'created' ? '正在创建新会话…' : '正在恢复历史会话…';
+  return card([md(`⏳ ${label}`), note(metaNote(state))], {
+    header: { title: '🆕 新建会话', template: 'grey' },
+  });
+}
+
+/** Failure card — keeps the action retryable (返回配置). */
+export function buildConfigErrorCard(state: SessionConfigState, message: string): CardObject {
+  return card(
+    [
+      md(`❌ 启动失败：${truncate(message, 200)}`),
+      note(metaNote(state)),
+      actions([button('🔁 重试', { a: SC.back })]),
+    ],
+    { header: { title: '🆕 新建会话', template: 'red' } },
+  );
 }
 
 /** A terminal (non-interactive) card shown after the session is launched. */
