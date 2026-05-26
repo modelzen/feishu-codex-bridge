@@ -13,9 +13,17 @@
 - **M1 onboarding ✅**：keystore + secret-resolver + store/schema + feishu-auth + wizard(扫码 registerApp) + secrets CLI + start 编排。typecheck/build 绿。
 - **M1 bot/bridge ✅ 代码完成**：`bot/bridge.ts`(createLarkChannel 长连接) + `bot/handle-message.ts`(群@bot→reply_in_thread 建话题→app-server turn→`channel.stream` markdown 流式卡片，话题内续用 session) + `card/run-render.ts`。typecheck/build 绿。
 - **M1 ✅ 端到端验证通过**（2026-05-26）：用户扫码复用 cli_aa81b50143785cd9 → 群里 @bot → reply_in_thread 建话题 → app-server 在 cwd 跑一轮 → codex 调工具 + 输出 + 流式 markdown 卡片。终端日志干净。p2p 暂跳过（DM 控制台属 M2）。
+- **M3 ✅ 代码完成**（2026-05-26, ece8f36）：群主区 @bot → 会话配置卡（模型▾/effort▾ + 创建/恢复），点创建→reply_in_thread 建话题开跑；话题内 @bot 直接续跑。`card/dispatcher.ts`(card.action.trigger 路由) + `card/cards.ts` + `card/session-config-card.ts` + `bot/handle-message.ts`(重构 createOrchestrator) + `bot/session-store.ts`。去掉 fast（codex 无此参数，见 decisions.md）。
+- **M4 ✅ 代码完成**（ece8f36）：配置卡模型下拉用 `backend.listModels()`；恢复历史→`backend.listThreads(cwd)`(codex thread/list) 列最近会话→`thread/resume`，仅新建时可选。
+- **运行卡 ⏹/⚙️ ✅ 代码完成**（08ce549）：运行输出改流式卡片，运行中挂 ⏹中止、终态挂 ⚙️设置(改本会话 model/effort，下一轮生效，仅挂最新卡)。`card/run-card.ts` + `runStreamed(input,turn?)` per-turn override。
+- **M5 ✅ 代码完成**（a9cb1ce）：`project/banner.ts` 置顶横幅卡片化 + 分支惰性检测(变了才 patch)；registry 增 bannerMessageId/branch + updateProject。
+- **M7 ✅ 代码完成**（45e2ec8）：`card/dm-cards.ts` 私聊菜单/项目列表/删除确认/全局设置卡；dm.* handlers 接 dispatcher(admin gate)。文本命令保留兜底。新建项目暂用 /new 文本（卡片 form input 后续）。
+- **⬜ 待用户端到端测试**（M3/M4/M5/M7 + 运行卡）：typecheck/build 全绿，未真机验证。
 
 ## 已知待办（后续统一处理）
-- **卡片渲染统一改**（M3 卡片化时一起做）：当前 markdown 流式把工具调用堆在文本上方、且原样 `/bin/zsh -lc "..."`。目标：参考 feishu-claude-code-bridge 的有序 block（文本/工具按发生顺序交错）+ 友好工具头（去 shell 壳）+ 可折叠工具面板（切 card 模式）+ 尊重 `showToolCalls`。
+- **卡片渲染细节统一**：运行卡虽已切 card 模式，工具仍在文本上方堆叠、原样 `/bin/zsh -lc "..."`。后续：有序交错 block + 友好工具头(去 shell 壳) + 可折叠工具面板。（用户明确「先不改，后面统一改」）
+- **新建项目卡片 form**：当前 /new 文本兜底；后续用飞书卡片 input + 提交收 form_value。
+- **app-server 子进程回收**：当前每个活跃话题常驻一个进程；watchdog 管卡死，但完整生命周期回收（话题闲置/超时关进程 + 启动清孤儿）未做。
 - JSON-RPC over stdio：行缓冲 split `\n`，按 id/method 分流 response/notification/server-request，pendingRequests Map + notification 异步队列。
 - reply_in_thread 响应不透出 thread_id → 从 `GET /im/v1/messages/:id` 或 receive 事件取。
 
