@@ -72,9 +72,11 @@ export function mdStream(content: string, elementId: string): CardElement {
   return { tag: 'markdown', element_id: elementId, content };
 }
 
-/** A grey note line (smaller, muted) — good for metadata. */
+/** A grey note line (smaller, muted) — good for metadata. Schema 2.0 dropped
+ * the `note` component; the equivalent is a plain-text block at `notation`
+ * size in grey (lark_md so `code`/**bold** still render). */
 export function note(content: string): CardElement {
-  return { tag: 'note', elements: [{ tag: 'markdown', content }] };
+  return { tag: 'div', text: { tag: 'lark_md', content, text_size: 'notation', text_color: 'grey' } };
 }
 
 export function hr(): CardElement {
