@@ -12,7 +12,10 @@
 - **M1 agent 后端 ✅ 已建 + 实跑验证**：`agent/types.ts`(AgentBackend/Thread/Run/Event) + `codex-appserver/{app-server-client,event-map,backend,locate}.ts` + `agent/index.ts`。typecheck 全绿；`prototype/appserver-probe/turn-probe.mjs` 实跑确认完整 turn 生命周期 + token 级流式。
 - **M1 onboarding ✅**：keystore + secret-resolver + store/schema + feishu-auth + wizard(扫码 registerApp) + secrets CLI + start 编排。typecheck/build 绿。
 - **M1 bot/bridge ✅ 代码完成**：`bot/bridge.ts`(createLarkChannel 长连接) + `bot/handle-message.ts`(群@bot→reply_in_thread 建话题→app-server turn→`channel.stream` markdown 流式卡片，话题内续用 session) + `card/run-render.ts`。typecheck/build 绿。
-- **⏳ M1 端到端验证**：需用户跑 `start` 扫码 + 在群 @bot 实测（交互式，无法非交互验证）。
+- **M1 ✅ 端到端验证通过**（2026-05-26）：用户扫码复用 cli_aa81b50143785cd9 → 群里 @bot → reply_in_thread 建话题 → app-server 在 cwd 跑一轮 → codex 调工具 + 输出 + 流式 markdown 卡片。终端日志干净。p2p 暂跳过（DM 控制台属 M2）。
+
+## 已知待办（后续统一处理）
+- **卡片渲染统一改**（M3 卡片化时一起做）：当前 markdown 流式把工具调用堆在文本上方、且原样 `/bin/zsh -lc "..."`。目标：参考 feishu-claude-code-bridge 的有序 block（文本/工具按发生顺序交错）+ 友好工具头（去 shell 壳）+ 可折叠工具面板（切 card 模式）+ 尊重 `showToolCalls`。
 - JSON-RPC over stdio：行缓冲 split `\n`，按 id/method 分流 response/notification/server-request，pendingRequests Map + notification 异步队列。
 - reply_in_thread 响应不透出 thread_id → 从 `GET /im/v1/messages/:id` 或 receive 事件取。
 
