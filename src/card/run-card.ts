@@ -5,11 +5,13 @@ import {
   card,
   hr,
   md,
+  mdStream,
   note,
   selectStatic,
   type CardObject,
   type HeaderTemplate,
 } from './cards';
+import { RUN_BODY_ELEMENT_ID } from './run-card-stream';
 
 /** Action ids for the in-topic run card. */
 export const RC = {
@@ -59,9 +61,13 @@ function headerTitle(state: RunCardState): string {
   return `🤖 ${name}${eff}`;
 }
 
-/** Build the run card. While running → ⏹ 中止; once终态 → ⚙️ 设置(挂最新卡). */
+/** Build the run card. While running → ⏹ 中止; once终态 → ⚙️ 设置(挂最新卡).
+ * The body is a streamed markdown element so the run card can use Feishu's
+ * native typewriter (see {@link RunCardStream}); while running the card is
+ * marked streaming so cardElement.content pushes animate. */
 export function buildRunCard(state: RunCardState): CardObject {
-  const elements = [md(state.body || '✍️ 正在输出…')];
+  const running = state.status === 'running';
+  const elements = [mdStream(state.body || '✍️ 正在输出…', RUN_BODY_ELEMENT_ID)];
 
   if (state.status === 'running') {
     if (state.cardKey) {
@@ -101,10 +107,10 @@ export function buildRunCard(state: RunCardState): CardObject {
   const template: HeaderTemplate =
     state.status === 'error' || state.status === 'timeout'
       ? 'red'
-      : state.status === 'running'
+      : running
         ? 'turquoise'
         : 'grey';
-  return card(elements, { header: { title: headerTitle(state), template } });
+  return card(elements, { header: { title: headerTitle(state), template }, streaming: running });
 }
 
 /** A plain (button-less) version — used to demote a previous turn's card. */

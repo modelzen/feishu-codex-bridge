@@ -25,6 +25,7 @@ import {
   type SessionConfigState,
 } from '../card/session-config-card';
 import { buildRunCard, buildRunCardPlain, RC, type RunCardState, type RunStatus } from '../card/run-card';
+import { RunCardStream } from '../card/run-card-stream';
 import { log, withTrace } from '../core/logger';
 import {
   buildDmMenuCard,
@@ -84,6 +85,9 @@ export function createOrchestrator(
   const runsByCard = new Map<string, ActiveState>();
   /** final run-card state by messageId (for ⚙️ settings on the latest card) */
   const runCards = new Map<string, RunCardState>();
+  /** CardKit entity backing each run card, by messageId — drives the native
+   * typewriter stream and whole-card (button/settings) updates. */
+  const runStreams = new Map<string, RunCardStream>();
   /** the latest settings-bearing run card per topic thread */
   const lastRunCard = new Map<string, string>();
   let modelsCache: ModelInfo[] | null = null;
@@ -250,6 +254,19 @@ export function createOrchestrator(
       await updateManagedCard(channel, msgId, c);
     })();
   };
+  // Same settle discipline for a run card's CardKit entity: mutate state +
+  // whole-card update, but only after the click's callback has been acked.
+  const scheduleRunUpdate = (
+    rc: RunCardState,
+    stream: RunCardStream,
+    mutate: () => Promise<void> | void,
+  ): void => {
+    void (async () => {
+      await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
+      await mutate();
+      await stream.updateCard(channel, buildRunCard(rc));
+    })();
+  };
 
   function prunePending(): void {
     const now = Date.now();
@@ -360,36 +377,39 @@ export function createOrchestrator(
         log.info('card', 'action', { actionId: 'run.stop', aborted: tid });
       }
     })
-    .on(RC.settings, async ({ evt }) => {
+    .on(RC.settings, ({ evt }) => {
       const rc = runCards.get(evt.messageId);
-      if (!rc || !runOwnerOrAdmin(evt, rc.requesterOpenId)) return;
-      rc.expanded = !rc.expanded;
-      rc.settingsNote = undefined;
-      if (rc.expanded) {
-        rc.models = await listModels();
-        if (rc.cwd) rc.branch = (await currentBranch(rc.cwd)) ?? undefined;
-      }
-      await channel.updateCard(evt.messageId, buildRunCard(rc)).catch(() => undefined);
+      const stream = runStreams.get(evt.messageId);
+      if (!rc || !stream || !runOwnerOrAdmin(evt, rc.requesterOpenId)) return;
+      scheduleRunUpdate(rc, stream, async () => {
+        rc.expanded = !rc.expanded;
+        rc.settingsNote = undefined;
+        if (rc.expanded && rc.cwd) rc.branch = (await currentBranch(rc.cwd)) ?? undefined;
+      });
     })
-    .on(RC.model, async ({ evt, option }) => {
+    .on(RC.model, ({ evt, option }) => {
       const rc = runCards.get(evt.messageId);
-      if (!rc || !option || !runOwnerOrAdmin(evt, rc.requesterOpenId)) return;
-      rc.model = option;
-      const m = rc.models?.find((x) => x.id === option);
-      if (m && m.supportedEfforts.length && rc.effort && !m.supportedEfforts.includes(rc.effort)) {
-        rc.effort = m.defaultEffort;
-      }
-      if (rc.threadId) await patchSession(rc.threadId, { model: rc.model, effort: rc.effort });
-      rc.settingsNote = `✅ 已切换模型「${m?.displayName ?? option}」，下一轮生效`;
-      await channel.updateCard(evt.messageId, buildRunCard(rc)).catch(() => undefined);
+      const stream = runStreams.get(evt.messageId);
+      if (!rc || !stream || !option || !runOwnerOrAdmin(evt, rc.requesterOpenId)) return;
+      scheduleRunUpdate(rc, stream, async () => {
+        rc.model = option;
+        const m = rc.models?.find((x) => x.id === option);
+        if (m && m.supportedEfforts.length && rc.effort && !m.supportedEfforts.includes(rc.effort)) {
+          rc.effort = m.defaultEffort;
+        }
+        if (rc.threadId) await patchSession(rc.threadId, { model: rc.model, effort: rc.effort });
+        rc.settingsNote = `✅ 已切换模型「${m?.displayName ?? option}」，下一轮生效`;
+      });
     })
-    .on(RC.effort, async ({ evt, option }) => {
+    .on(RC.effort, ({ evt, option }) => {
       const rc = runCards.get(evt.messageId);
-      if (!rc || !option || !runOwnerOrAdmin(evt, rc.requesterOpenId)) return;
-      rc.effort = option as ReasoningEffort;
-      if (rc.threadId) await patchSession(rc.threadId, { effort: rc.effort });
-      rc.settingsNote = `✅ 已设置 effort，下一轮生效`;
-      await channel.updateCard(evt.messageId, buildRunCard(rc)).catch(() => undefined);
+      const stream = runStreams.get(evt.messageId);
+      if (!rc || !stream || !option || !runOwnerOrAdmin(evt, rc.requesterOpenId)) return;
+      scheduleRunUpdate(rc, stream, async () => {
+        rc.effort = option as ReasoningEffort;
+        if (rc.threadId) await patchSession(rc.threadId, { effort: rc.effort });
+        rc.settingsNote = `✅ 已设置 effort，下一轮生效`;
+      });
     });
 
   // DM management console buttons (design §3.1). Admin-gated; sub-views patch
@@ -626,8 +646,10 @@ export function createOrchestrator(
       const prev = lastRunCard.get(topicThreadId);
       if (prev && prev !== cardMsgId) {
         const prevState = runCards.get(prev);
-        if (prevState) void channel.updateCard(prev, buildRunCardPlain(prevState)).catch(() => undefined);
+        const prevStream = runStreams.get(prev);
+        if (prevState && prevStream) void prevStream.updateCard(channel, buildRunCardPlain(prevState));
         runCards.delete(prev);
+        runStreams.delete(prev);
       }
       lastRunCard.set(topicThreadId, cardMsgId);
       runCards.set(cardMsgId, rc);
@@ -671,62 +693,55 @@ export function createOrchestrator(
           }
         };
 
-        const res = await channel.stream(
-          opts.chatId,
-          {
-            card: {
-              initial: buildRunCard(rc),
-              producer: async (ctrl) => {
-                cardMsgId = ctrl.messageId;
-                curCardKey = ctrl.messageId;
-                rc.cardKey = ctrl.messageId;
-                runsByCard.set(ctrl.messageId, state);
-                // first topic card is now live → let the config card finalize
-                if (!firstCardSent) {
-                  firstCardSent = true;
-                  try {
-                    onFirstCard?.();
-                  } catch {
-                    /* config-card finalize is best-effort */
-                  }
-                }
-                await adoptThreadId(ctrl.messageId);
-                await ctrl.update(buildRunCard(rc));
+        // CardKit streaming entity: body streams with the native typewriter,
+        // ⏹/⚙️ ride whole-card updates — both on one card_id (see RunCardStream).
+        const stream = new RunCardStream();
+        cardMsgId = await stream.create(channel, opts.chatId, buildRunCard(rc), { replyTo, replyInThread });
+        curCardKey = cardMsgId;
+        rc.cardKey = cardMsgId;
+        runsByCard.set(cardMsgId, state);
+        runStreams.set(cardMsgId, stream);
+        // first topic card is now live → let the config card finalize
+        if (!firstCardSent) {
+          firstCardSent = true;
+          try {
+            onFirstCard?.();
+          } catch {
+            /* config-card finalize is best-effort */
+          }
+        }
+        await adoptThreadId(cardMsgId);
 
-                const guarded = withIdleTimeout(run.events, idleMs, () => {
-                  terminal = 'timeout';
-                  const tid = run.turnId();
-                  if (tid) void state.thread.abort(tid).catch(() => undefined);
-                });
-                for await (const ev of guarded) {
-                  if (ev.type === 'error') terminal = 'error';
-                  render.apply(ev);
-                  rc.body = render.markdown();
-                  await ctrl.update(buildRunCard(rc));
-                }
-                if (terminal === 'timeout') {
-                  render.apply({ type: 'error', message: '⏱ 似乎卡住了（无响应），已中止，可重试', willRetry: false });
-                }
-                rc.body = render.markdown();
-                rc.status = terminal === 'timeout' ? 'timeout' : render.state() === 'error' ? 'error' : 'done';
-                await ctrl.update(buildRunCard(rc));
-              },
-            },
-          },
-          { replyTo, replyInThread },
-        );
+        let timedOut = false;
+        const guarded = withIdleTimeout(run.events, idleMs, () => {
+          timedOut = true;
+          const tid = run.turnId();
+          if (tid) void state.thread.abort(tid).catch(() => undefined);
+        });
+        for await (const ev of guarded) {
+          if (ev.type === 'error') terminal = 'error';
+          render.apply(ev);
+          rc.body = render.markdown();
+          await stream.streamBody(channel, rc.body);
+        }
+        if (timedOut) {
+          render.apply({ type: 'error', message: '⏱ 似乎卡住了（无响应），已中止，可重试', willRetry: false });
+        }
+        rc.body = render.markdown();
+        rc.status = timedOut ? 'timeout' : render.state() === 'error' ? 'error' : 'done';
 
-        const finalMsgId = cardMsgId ?? res.messageId;
+        const finalMsgId = cardMsgId;
         await adoptThreadId(finalMsgId);
-        // re-render terminal card now that threadId is known (adds ⚙️)
         rc.cardKey = finalMsgId;
-        await channel.updateCard(finalMsgId, buildRunCard(rc)).catch(() => undefined);
-        if (cardMsgId) runsByCard.delete(cardMsgId);
+        // terminal whole-card update: final body + switch ⏹→⚙️ and (streaming
+        // off in the terminal card) clear the typewriter cursor.
+        await stream.updateCard(channel, buildRunCard(rc));
+        runsByCard.delete(cardMsgId);
         promoteCard(finalMsgId, rc);
         if (topicThreadId) await patchSession(topicThreadId, { updatedAt: Date.now() });
         replyTo = finalMsgId;
         replyInThread = true; // stay in the topic for queued turns
-        log.info('card', 'final', { terminal });
+        log.info('card', 'final', { terminal: rc.status });
 
         if (state.queue.length === 0) break;
         turnText = state.queue.shift()!;

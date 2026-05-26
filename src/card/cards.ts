@@ -28,13 +28,25 @@ export interface ActionValue {
 
 export function card(
   elements: CardElement[],
-  opts: { header?: { title: string; template?: HeaderTemplate; subtitle?: string } } = {},
+  opts: {
+    header?: { title: string; template?: HeaderTemplate; subtitle?: string };
+    /** Enable native typewriter streaming (a markdown element with an
+     * element_id can then be driven via cardkit.v1.cardElement.content). */
+    streaming?: boolean;
+  } = {},
 ): CardObject {
+  const config: Record<string, unknown> = { update_multi: true };
+  if (opts.streaming) {
+    config.streaming_mode = true;
+    config.streaming_config = {
+      print_frequency_ms: { default: 70 },
+      print_step: { default: 1 },
+      print_strategy: 'fast',
+    };
+  }
   const obj: CardObject = {
     schema: '2.0',
-    // update_multi must be true for a CardKit entity to be updatable (shared
-    // card); streaming_mode stays off — we do full-card updates, not deltas.
-    config: { update_multi: true },
+    config,
     body: { elements },
   };
   if (opts.header) {
@@ -52,6 +64,12 @@ export function card(
 /** A markdown text block (**bold**, `code`, links, emoji). */
 export function md(content: string): CardElement {
   return { tag: 'markdown', content };
+}
+
+/** A markdown element carrying an `element_id`, so it can be driven by the
+ * native typewriter stream (cardkit.v1.cardElement.content) on a streaming card. */
+export function mdStream(content: string, elementId: string): CardElement {
+  return { tag: 'markdown', element_id: elementId, content };
 }
 
 /** A grey note line (smaller, muted) — good for metadata. */
