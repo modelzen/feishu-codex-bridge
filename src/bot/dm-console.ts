@@ -4,6 +4,7 @@ import { buildDmMenuCard } from '../card/dm-cards';
 import { log, withTrace } from '../core/logger';
 import { createProject } from '../project/lifecycle';
 import { listProjects, getProjectByName, removeProject } from '../project/registry';
+import { transferOwnership } from '../project/group-ops';
 
 /**
  * p2p (DM) console. Admin-gated (design §5: only admins may create projects /
@@ -65,10 +66,26 @@ export async function handleDmConsole(channel: LarkChannel, cfg: AppConfig, msg:
             await reply(`未找到项目「${name}」。`);
             return;
           }
-          await removeProject(name);
+          const removed = await removeProject(name);
+          if (removed?.bannerMessageId) {
+            await channel.rawClient.im.v1.pin
+              .delete({ path: { message_id: removed.bannerMessageId } })
+              .catch(() => undefined);
+          }
+          let transferred = false;
+          if (removed?.chatId) {
+            transferred = await transferOwnership(channel, removed.chatId, msg.senderId)
+              .then(() => true)
+              .catch((err) => {
+                log.fail('console', err, { phase: 'owner-transfer' });
+                return false;
+              });
+          }
           await reply(
             `✅ 已删除项目「${name}」（解绑，未删代码目录）。\n` +
-              `bot 不会自动解散群——如不再需要，请你在飞书里**自行解散该群**。`,
+              (transferred
+                ? `群主已转给你 → 请在飞书里**自行解散该群**。`
+                : `⚠️ 群主转让失败，请用「🚪 群管理」手动转让后解散。`),
           );
           break;
         }

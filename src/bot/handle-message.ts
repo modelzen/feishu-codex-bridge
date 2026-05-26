@@ -27,6 +27,7 @@ import { buildRunCard, buildRunCardPlain, RC, type RunCardState, type RunStatus 
 import { log, withTrace } from '../core/logger';
 import {
   buildDmMenuCard,
+  buildGroupsCard,
   buildNewProjectHintCard,
   buildProjectListCard,
   buildRmConfirmCard,
@@ -36,6 +37,7 @@ import {
 import { currentBranch } from '../project/git-info';
 import { getProjectByChatId, listProjects, removeProject } from '../project/registry';
 import { refreshBranch } from '../project/banner';
+import { listBotGroups, transferOwnership } from '../project/group-ops';
 import { getSession, patchSession, upsertSession } from './session-store';
 import { handleDmConsole } from './dm-console';
 import { Semaphore, withIdleTimeout } from './watchdog';
@@ -444,7 +446,8 @@ export function createOrchestrator(
     })
     .on(DM.rmDo, async ({ evt, value }) => {
       const name = typeof value.n === 'string' ? value.n : undefined;
-      if (!dmAdmin(evt.operator?.openId) || !name) return;
+      const op = evt.operator?.openId;
+      if (!dmAdmin(op) || !name) return;
       const removed = await removeProject(name);
       // revoke the pinned banner (best-effort); never delete the code dir
       if (removed?.bannerMessageId) {
@@ -452,15 +455,56 @@ export function createOrchestrator(
           .delete({ path: { message_id: removed.bannerMessageId } })
           .catch(() => undefined);
       }
-      log.info('console', 'rm', { name });
+      // bot owns the group → transfer ownership to the admin so they can disband
+      let transferred = false;
+      if (removed?.chatId && op) {
+        transferred = await transferOwnership(channel, removed.chatId, op)
+          .then(() => true)
+          .catch((err) => {
+            log.fail('console', err, { phase: 'owner-transfer' });
+            return false;
+          });
+      }
+      log.info('console', 'rm', { name, transferred });
+      const tail = transferred
+        ? '群主已转给你 → 请在飞书里**自行解散该群**（机器人不主动解散）。'
+        : '⚠️ 群主转让失败（可能 bot 非群主），请用「🚪 群管理」手动转让后解散。';
+      await channel
+        .send(evt.chatId, { markdown: `✅ 已删除项目「${name}」（解绑，未删代码目录）。\n${tail}` }, { replyTo: evt.messageId })
+        .catch(() => undefined);
+      await patch(evt.messageId, buildProjectListCard(await listProjects()));
+    })
+    .on(DM.groups, async ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const groups = await listBotGroups(channel).catch((err) => {
+        log.fail('console', err, { phase: 'list-groups' });
+        return [];
+      });
+      await patch(evt.messageId, buildGroupsCard(groups, evt.operator?.name));
+    })
+    .on(DM.transferOwner, async ({ evt, value }) => {
+      const chatId = typeof value.c === 'string' ? value.c : undefined;
+      const op = evt.operator?.openId;
+      if (!dmAdmin(op) || !chatId || !op) return;
+      const ok = await transferOwnership(channel, chatId, op)
+        .then(() => true)
+        .catch((err) => {
+          log.fail('console', err, { phase: 'owner-transfer' });
+          return false;
+        });
       await channel
         .send(
           evt.chatId,
-          { markdown: `✅ 已删除项目「${name}」（解绑，未删代码目录）。\nbot 不会自动解散群——如不再需要，请你在飞书里**自行解散该群**。` },
+          {
+            markdown: ok
+              ? '✅ 群主已转给你。现在去那个群 → 设置 → **解散群聊**。'
+              : '❌ 转让失败（可能 bot 不是该群群主，或缺 im:chat 权限）。',
+          },
           { replyTo: evt.messageId },
         )
         .catch(() => undefined);
-      await patch(evt.messageId, buildProjectListCard(await listProjects()));
+      const groups = await listBotGroups(channel).catch(() => []);
+      await patch(evt.messageId, buildGroupsCard(groups, evt.operator?.name));
     })
     .on(DM.setReply, async ({ evt, option }) => {
       if (option === 'card' || option === 'markdown' || option === 'text') {

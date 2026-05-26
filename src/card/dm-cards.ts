@@ -6,6 +6,7 @@ import {
   type AppConfig,
 } from '../config/schema';
 import type { Project } from '../project/registry';
+import type { BotGroup } from '../project/group-ops';
 import { actions, button, card, hr, md, note, selectStatic, type CardObject } from './cards';
 
 /** Action ids for the DM (private chat) management console. */
@@ -19,6 +20,8 @@ export const DM = {
   rmConfirm: 'dm.rmConfirm',
   rmDo: 'dm.rmDo',
   rmCancel: 'dm.rmCancel',
+  groups: 'dm.groups',
+  transferOwner: 'dm.transferOwner',
   setReply: 'dm.set.reply',
   setTools: 'dm.set.tools',
   setWatchdog: 'dm.set.watchdog',
@@ -38,6 +41,7 @@ export function buildDmMenuCard(): CardObject {
         button('⚙️ 设置', { a: DM.settings }),
       ]),
       actions([
+        button('🚪 群管理', { a: DM.groups }),
         button('🩺 诊断', { a: DM.doctor }),
         button('🔄 重连', { a: DM.reconnect }),
       ]),
@@ -89,6 +93,27 @@ export function buildRmConfirmCard(name: string): CardObject {
     ],
     { header: { title: '🗑 删除项目', template: 'red' } },
   );
+}
+
+/** Bot's groups, with 🔑 转让群主给我 on bot-owned ones (so admin can disband). */
+export function buildGroupsCard(groups: BotGroup[], adminName?: string): CardObject {
+  const owned = groups.filter((g) => g.ownedByBot);
+  const elements = [
+    md('机器人是这些群的**群主**——只有群主能解散。点 🔑 把群主转给你，再去飞书自行解散。'),
+    hr(),
+  ];
+  if (owned.length === 0) {
+    elements.push(md('_机器人当前不是任何群的群主。_'));
+  } else {
+    for (const g of owned) {
+      elements.push(md(`**${g.name}**`));
+      elements.push(note(`\`${g.chatId}\``));
+      elements.push(actions([button(`🔑 转让群主给${adminName ? ` ${adminName}` : '我'}`, { a: DM.transferOwner, c: g.chatId })]));
+      elements.push(hr());
+    }
+  }
+  elements.push(actions([button('⬅️ 菜单', { a: DM.menu })]));
+  return card(elements, { header: { title: '🚪 群管理', template: 'orange' } });
 }
 
 const REPLY_LABEL: Record<string, string> = { card: '卡片', markdown: 'Markdown', text: '纯文本' };
