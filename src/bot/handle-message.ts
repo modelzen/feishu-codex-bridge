@@ -301,21 +301,9 @@ export function createOrchestrator(
       state.launching = true;
       await channel.updateCard(evt.messageId, buildConfigLaunchingCard(state, 'created')).catch(() => undefined);
       // detach: don't hold the cardAction callback for the whole Codex run
-      void (async () => {
-        try {
-          const thread = await backend.startThread({ cwd: state.cwd, model: state.model, effort: state.effort });
-          pending.delete(evt.messageId);
-          await channel.updateCard(evt.messageId, buildConfigDoneCard(state, 'created')).catch(() => undefined);
-          log.info('card', 'launch', { kind: 'create', model: state.model, effort: state.effort });
-          await launchSessionFromCard(state, thread, 'created');
-        } catch (err) {
-          state.launching = false; // keep pending → card stays retryable
-          log.fail('card', err, { phase: 'create-launch' });
-          await channel
-            .updateCard(evt.messageId, buildConfigErrorCard(state, err instanceof Error ? err.message : String(err)))
-            .catch(() => undefined);
-        }
-      })();
+      void launchFromCard(evt, state, 'created', () =>
+        backend.startThread({ cwd: state.cwd, model: state.model, effort: state.effort }),
+      );
     })
     .on(SC.pick, async ({ evt, value }) => {
       const state = authConfig(evt);
@@ -323,21 +311,9 @@ export function createOrchestrator(
       if (!state || !codexThreadId || state.launching) return;
       state.launching = true;
       await channel.updateCard(evt.messageId, buildConfigLaunchingCard(state, 'resumed')).catch(() => undefined);
-      void (async () => {
-        try {
-          const thread = await backend.resumeThread({ cwd: state.cwd, codexThreadId, model: state.model, effort: state.effort });
-          pending.delete(evt.messageId);
-          await channel.updateCard(evt.messageId, buildConfigDoneCard(state, 'resumed')).catch(() => undefined);
-          log.info('card', 'launch', { kind: 'resume', codexThreadId });
-          await launchSessionFromCard(state, thread, 'resumed');
-        } catch (err) {
-          state.launching = false;
-          log.fail('card', err, { phase: 'resume-launch' });
-          await channel
-            .updateCard(evt.messageId, buildConfigErrorCard(state, err instanceof Error ? err.message : String(err)))
-            .catch(() => undefined);
-        }
-      })();
+      void launchFromCard(evt, state, 'resumed', () =>
+        backend.resumeThread({ cwd: state.cwd, codexThreadId, model: state.model, effort: state.effort }),
+      );
     });
 
   /** Run-card actions: gated by chat/user allow lists (design §5). */
@@ -521,25 +497,59 @@ export function createOrchestrator(
       if (Number.isFinite(n)) await applyPref(evt, (p) => (p.maxConcurrentRuns = n));
     });
 
+  /**
+   * From a config card: build the codex thread, then create the topic + run.
+   * The config card is only finalized to "done" once the first topic card is
+   * confirmed sent (onFirstCard); any failure before that keeps the pending
+   * state and shows a retryable error card. Detached — never holds the
+   * card-action callback for the whole run.
+   */
+  async function launchFromCard(
+    evt: CardActionEvent,
+    state: SessionConfigState,
+    kind: 'created' | 'resumed',
+    makeThread: () => Promise<AgentThread>,
+  ): Promise<void> {
+    let thread: AgentThread | undefined;
+    try {
+      thread = await makeThread();
+      log.info('card', 'launch', { kind, model: state.model, effort: state.effort });
+      await launchSessionFromCard(state, thread, () => {
+        pending.delete(evt.messageId);
+        void channel.updateCard(evt.messageId, buildConfigDoneCard(state, kind)).catch(() => undefined);
+      });
+    } catch (err) {
+      state.launching = false; // keep pending → card stays retryable
+      log.fail('card', err, { phase: `${kind}-launch` });
+      if (thread) void thread.close().catch(() => undefined);
+      await channel
+        .updateCard(evt.messageId, buildConfigErrorCard(state, err instanceof Error ? err.message : String(err)))
+        .catch(() => undefined);
+    }
+  }
+
   /** Create the topic (reply_in_thread) and run the first turn from a config card. */
   async function launchSessionFromCard(
     state: SessionConfigState,
     thread: AgentThread,
-    _kind: 'created' | 'resumed',
+    onFirstCard: () => void,
   ): Promise<void> {
     await withTrace({ chatId: state.chatId, msgId: state.originalMsgId }, async () => {
       const firstText = state.text || '你好，我们开始吧。';
-      await launchRun({
-        chatId: state.chatId,
-        replyTo: state.originalMsgId,
-        replyInThread: true,
-        thread,
-        firstText,
-        model: state.model,
-        effort: state.effort,
-        cwd: state.cwd,
-        summary: state.text.slice(0, 80) || '(空)',
-      });
+      await launchRun(
+        {
+          chatId: state.chatId,
+          replyTo: state.originalMsgId,
+          replyInThread: true,
+          thread,
+          firstText,
+          model: state.model,
+          effort: state.effort,
+          cwd: state.cwd,
+          summary: state.text.slice(0, 80) || '(空)',
+        },
+        onFirstCard,
+      );
     });
   }
 
@@ -559,8 +569,9 @@ export function createOrchestrator(
     summary?: string;
   }
 
-  async function launchRun(opts: LaunchOpts): Promise<void> {
+  async function launchRun(opts: LaunchOpts, onFirstCard?: () => void): Promise<void> {
     const release = await sema.acquire();
+    let firstCardSent = false;
     let activeKey = opts.knownThreadId ?? `pending:${opts.replyTo}`;
     let topicThreadId = opts.knownThreadId;
     const state: ActiveState = { thread: opts.thread, queue: [] };
@@ -643,6 +654,15 @@ export function createOrchestrator(
                 curCardKey = ctrl.messageId;
                 rc.cardKey = ctrl.messageId;
                 runsByCard.set(ctrl.messageId, state);
+                // first topic card is now live → let the config card finalize
+                if (!firstCardSent) {
+                  firstCardSent = true;
+                  try {
+                    onFirstCard?.();
+                  } catch {
+                    /* config-card finalize is best-effort */
+                  }
+                }
                 await adoptThreadId(ctrl.messageId);
                 await ctrl.update(buildRunCard(rc));
 
@@ -685,6 +705,11 @@ export function createOrchestrator(
         turnText = state.queue.shift()!;
       }
     } catch (err) {
+      // Config-card launches (onFirstCard set): if we failed before the first
+      // card was sent (e.g. reply_in_thread couldn't create the topic), rethrow
+      // so the caller shows a retryable error card. `finally` still runs cleanup
+      // below, so don't release here (would double-release the semaphore).
+      if (!firstCardSent && onFirstCard) throw err;
       log.fail('intake', err);
       await channel
         .send(opts.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: opts.replyTo, replyInThread: true })
