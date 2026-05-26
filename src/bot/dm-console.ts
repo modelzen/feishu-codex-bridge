@@ -1,0 +1,91 @@
+import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
+import { isAdmin, type AppConfig } from '../config/schema';
+import { log, withTrace } from '../core/logger';
+import { createProject } from '../project/lifecycle';
+import { listProjects, getProjectByName, removeProject } from '../project/registry';
+
+const HELP =
+  '🤖 **Codex Bridge 管理台**\n' +
+  '私聊用于建项目和管理（任务请在项目群里 @我）。\n\n' +
+  '- `/new <名>` — 新建空白项目（建群+拉你进群+git init）\n' +
+  '- `/new <名> <路径>` — 用现有文件夹建项目\n' +
+  '- `/projects` — 列出所有项目\n' +
+  '- `/rm <名>` — 删除项目（解绑，群请你自行解散）\n' +
+  '- `/help` — 本帮助';
+
+/**
+ * p2p (DM) console. Admin-gated (design §5: only admins may create projects /
+ * manage). M2: text commands; the bot-menu + cards come later. Never runs codex.
+ */
+export async function handleDmConsole(channel: LarkChannel, cfg: AppConfig, msg: NormalizedMessage): Promise<void> {
+  await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
+    const reply = (markdown: string): Promise<unknown> =>
+      channel.send(msg.chatId, { markdown }, { replyTo: msg.messageId }).catch(() => undefined);
+
+    if (!isAdmin(cfg, msg.senderId)) {
+      log.info('console', 'deny', { sender: msg.senderId.slice(-6) });
+      await reply('⛔ 仅管理员可在私聊里管理项目。');
+      return;
+    }
+
+    const text = msg.content.trim();
+    const parts = text.split(/\s+/);
+    const cmd = parts[0] ?? '';
+    log.info('console', 'cmd', { cmd });
+
+    try {
+      switch (cmd) {
+        case '/new': {
+          const name = parts[1];
+          const path = parts[2];
+          if (!name) {
+            await reply('用法：`/new <名>` 或 `/new <名> <现有路径>`');
+            return;
+          }
+          await reply(`⏳ 正在创建项目「${name}」…`);
+          const p = await createProject(channel, { name, ownerOpenId: msg.senderId, existingPath: path });
+          await reply(
+            `✅ 项目「${p.name}」已创建（${p.blank ? '空白' : '现有文件夹'}）\n` +
+              `cwd: \`${p.cwd}\`\n已建群并把你拉入，去群里 @我 开话题干活。`,
+          );
+          break;
+        }
+        case '/projects': {
+          const list = await listProjects();
+          if (!list.length) {
+            await reply('还没有项目。用 `/new <名>` 建一个。');
+            return;
+          }
+          const lines = list.map(
+            (p) => `- **${p.name}** — \`${p.cwd}\`${p.blank ? ' _(空白)_' : ''}`,
+          );
+          await reply(`📁 **项目（${list.length}）**\n${lines.join('\n')}`);
+          break;
+        }
+        case '/rm': {
+          const name = parts[1];
+          if (!name) {
+            await reply('用法：`/rm <名>`');
+            return;
+          }
+          const existing = await getProjectByName(name);
+          if (!existing) {
+            await reply(`未找到项目「${name}」。`);
+            return;
+          }
+          await removeProject(name);
+          await reply(
+            `✅ 已删除项目「${name}」（解绑，未删代码目录）。\n` +
+              `bot 不会自动解散群——如不再需要，请你在飞书里**自行解散该群**。`,
+          );
+          break;
+        }
+        default:
+          await reply(HELP);
+      }
+    } catch (err) {
+      log.fail('console', err, { cmd });
+      await reply(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+}

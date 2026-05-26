@@ -39,16 +39,11 @@ export async function runStart(): Promise<void> {
   console.log(`✓ 凭据校验通过  bot: ${v.botName ?? '-'}  appId: ${cfg.accounts.app.id}`);
   log.info('start', 'credentials-ok', { appId: cfg.accounts.app.id, bot: v.botName ?? null });
 
-  // M1: fixed cwd (project registry is M2). Override via FEISHU_CODEX_CWD.
-  const cwd = process.env.FEISHU_CODEX_CWD || process.cwd();
-  console.log(`\n正在启动长连接 bot…  cwd(M1 固定): ${cwd}`);
-  console.log('在飞书群里 @bot 发一句话试试（会在话题里流式回复）。Ctrl+C 退出。\n');
-  await startBridge({
-    appId: cfg.accounts.app.id,
-    appSecret: secret,
-    tenant: cfg.accounts.app.tenant,
-    cwd,
-  });
+  // Projects bind their own cwd (registry). Unregistered groups fall back here.
+  const fallbackCwd = process.env.FEISHU_CODEX_CWD || process.cwd();
+  console.log('\n正在启动长连接 bot…');
+  console.log('私聊我 `/new <名>` 建项目；在项目群里 @我 干活。Ctrl+C 退出。\n');
+  await startBridge({ cfg, appSecret: secret, fallbackCwd });
   // keep the process alive; the WS connection drives everything.
   await new Promise<never>(() => {});
 }
