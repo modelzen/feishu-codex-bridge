@@ -59,10 +59,10 @@ export function buildNewProjectFormCard(opts: { name?: string; cwd?: string; err
   const elements = [];
   if (opts.error) elements.push(md(`❌ **创建失败**：${opts.error}`));
   elements.push(
-    md('填项目名（必填）。**CWD 留空** = 在默认目录新建空白项目；**填绝对路径** = 用现有文件夹。'),
+    md('填项目名（必填）。**文件夹路径留空** = 自动在默认位置新建一个空白项目；**填绝对路径** = 用电脑上已有的文件夹。'),
     form('new_project', [
       input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
-      input({ name: 'cwd', label: 'CWD（可选，绝对路径）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
+      input({ name: 'cwd', label: '文件夹路径（选填，留空自动新建）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
       actions([submitButton('✅ 创建', { a: DM.newProjectSubmit }), button('⬅️ 菜单', { a: DM.menu })]),
     ]),
   );
