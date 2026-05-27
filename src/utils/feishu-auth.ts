@@ -1,4 +1,5 @@
 import type { TenantBrand } from '../config/schema';
+import { REQUIRED_SCOPES } from '../config/scopes';
 
 const ENDPOINTS: Record<TenantBrand, string> = {
   feishu: 'https://open.feishu.cn',
@@ -10,6 +11,11 @@ export interface ValidationResult {
   reason?: string;
   botName?: string;
   botOpenId?: string;
+  /**
+   * Required scopes the app hasn't been granted yet (best-effort; undefined if
+   * the scope list couldn't be fetched). Empty array = all granted.
+   */
+  missingScopes?: string[];
 }
 
 interface TokenResp {
@@ -50,8 +56,10 @@ export async function validateAppCredentials(
   if (data.code !== 0 || !data.tenant_access_token) {
     return { ok: false, reason: `code=${data.code ?? '?'} msg=${data.msg ?? '<no msg>'}` };
   }
-  const info = await fetchBotInfo(base, data.tenant_access_token).catch(() => undefined);
-  return { ok: true, botName: info?.bot?.app_name, botOpenId: info?.bot?.open_id };
+  const token = data.tenant_access_token;
+  const info = await fetchBotInfo(base, token).catch(() => undefined);
+  const missingScopes = await fetchMissingScopes(base, token).catch(() => undefined);
+  return { ok: true, botName: info?.bot?.app_name, botOpenId: info?.bot?.open_id, missingScopes };
 }
 
 async function fetchBotInfo(base: string, token: string): Promise<BotInfoResp | undefined> {
@@ -60,4 +68,24 @@ async function fetchBotInfo(base: string, token: string): Promise<BotInfoResp | 
   });
   if (!resp.ok) return undefined;
   return (await resp.json()) as BotInfoResp;
+}
+
+interface ScopeListResp {
+  data?: { scopes?: { scope_name: string; grant_status: number }[] };
+}
+
+/**
+ * Which {@link REQUIRED_SCOPES} the app still lacks. `grant_status === 1` means
+ * granted; scopes missing from the list count as not granted. Returns undefined
+ * (not []) on any failure so callers can tell "all granted" from "couldn't check".
+ */
+async function fetchMissingScopes(base: string, token: string): Promise<string[] | undefined> {
+  const resp = await fetch(`${base}/open-apis/application/v6/scopes`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) return undefined;
+  const body = (await resp.json()) as ScopeListResp;
+  if (!body.data?.scopes) return undefined;
+  const granted = new Set(body.data.scopes.filter((s) => s.grant_status === 1).map((s) => s.scope_name));
+  return REQUIRED_SCOPES.filter((s) => !granted.has(s));
 }

@@ -4,6 +4,7 @@ import { isComplete, secretKeyForApp, type AppConfig } from '../../config/schema
 import { resolveAppSecret } from '../../config/secret-resolver';
 import { runRegistrationWizard } from '../../bot/wizard';
 import { validateAppCredentials } from '../../utils/feishu-auth';
+import { buildScopeGrantUrl } from '../../config/scopes';
 import { resolveCodexBin } from '../../agent/codex-appserver/locate';
 import { startBridge } from '../../bot/bridge';
 import { acquireSingleInstanceLock, BridgeAlreadyRunningError } from '../../core/single-instance';
@@ -39,6 +40,18 @@ export async function runStart(): Promise<void> {
 
   console.log(`✓ 凭据校验通过  bot: ${v.botName ?? '-'}  appId: ${cfg.accounts.app.id}`);
   log.info('start', 'credentials-ok', { appId: cfg.accounts.app.id, bot: v.botName ?? null });
+
+  // Feishu has no API to declare app scopes (even the official CLI can't), so
+  // we point the user at one console URL that pre-selects every missing scope.
+  // Best-effort: v.missingScopes is undefined when the check couldn't run.
+  if (v.missingScopes && v.missingScopes.length > 0) {
+    const url = buildScopeGrantUrl(cfg.accounts.app.id, cfg.accounts.app.tenant);
+    console.log(`\n⚠️ 还差 ${v.missingScopes.length} 项权限未开通：${v.missingScopes.join('  ')}`);
+    console.log('   飞书没有「扫码即授权」的接口，需点下面这个链接一次性开通全部权限（开通后无需重启，即时生效）：');
+    console.log(`\n   ${url}\n`);
+  } else if (v.missingScopes === undefined) {
+    log.info('start', 'scope-check-skipped', { reason: 'scope list unavailable' });
+  }
 
   // Refuse to run alongside another bridge for the same app — two long
   // connections split card callbacks and make buttons flaky (see module doc).
