@@ -50,6 +50,10 @@ async function write(sessions: SessionRecord[]): Promise<void> {
   await rename(tmp, paths.sessionsFile);
 }
 
+export async function listSessions(): Promise<SessionRecord[]> {
+  return read();
+}
+
 export async function getSession(threadId: string): Promise<SessionRecord | undefined> {
   return (await read()).find((s) => s.threadId === threadId);
 }

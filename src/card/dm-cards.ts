@@ -5,8 +5,16 @@ import {
   type AppConfig,
 } from '../config/schema';
 import type { Project } from '../project/registry';
-import type { BotGroup } from '../project/group-ops';
-import { actions, button, card, form, hr, input, md, note, selectStatic, submitButton, type CardObject } from './cards';
+import type { SessionRecord } from '../bot/session-store';
+import { actions, button, card, form, hr, input, linkButton, md, note, selectStatic, submitButton, type CardObject } from './cards';
+import { relativeTime } from './session-config-card';
+
+/** applink to open a Feishu group chat by chat_id (oc_xxx). Feishu has no
+ * deep link to a specific thread/topic, so this lands in the group and the
+ * user scrolls to the topic themselves. */
+function openChatUrl(chatId: string): string {
+  return `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
+}
 
 /** Action ids for the DM (private chat) management console. */
 export const DM = {
@@ -20,8 +28,6 @@ export const DM = {
   rmConfirm: 'dm.rmConfirm',
   rmDo: 'dm.rmDo',
   rmCancel: 'dm.rmCancel',
-  groups: 'dm.groups',
-  transferOwner: 'dm.transferOwner',
   setTools: 'dm.set.tools',
   setWatchdog: 'dm.set.watchdog',
   setPending: 'dm.set.pending',
@@ -40,7 +46,6 @@ export function buildDmMenuCard(): CardObject {
         button('⚙️ 设置', { a: DM.settings }),
       ]),
       actions([
-        button('🚪 群管理', { a: DM.groups }),
         button('🩺 诊断', { a: DM.doctor }),
         button('🔄 重连', { a: DM.reconnect }),
       ]),
@@ -77,18 +82,38 @@ export function buildNewProjectDoneCard(p: Project): CardObject {
   );
 }
 
-export function buildProjectListCard(projects: Project[]): CardObject {
+/** Project list: each project shows its bound group + a jump-to-group link,
+ * and lists that group's topics (sessions, most-recent first). Feishu applink
+ * can only target the group, not a thread — so the link lands in the group. */
+export function buildProjectListCard(
+  projects: Project[],
+  sessionsByChat: Map<string, SessionRecord[]> = new Map(),
+): CardObject {
   if (projects.length === 0) {
     return card(
       [md('还没有项目。点 **➕ 新建项目** 或直接发我一个项目名。'), actions([button('⬅️ 菜单', { a: DM.menu })])],
       { header: { title: '📁 项目列表', template: 'wathet' } },
     );
   }
-  const elements: ReturnType<typeof md>[] = [];
+  const elements: CardObject[] = [];
   for (const p of projects) {
     elements.push(md(`**${p.name}**${p.blank ? ' _(空白)_' : ''}`));
     elements.push(note(`📂 \`${p.cwd}\`${p.branch ? `   🌿 ${p.branch}` : ''}`));
-    elements.push(actions([button('🗑 删除', { a: DM.rmConfirm, n: p.name }, 'danger')]));
+    elements.push(note(p.chatId ? `💬 群：**${p.name}**` : '⚠️ 未绑定群'));
+    const sessions = (p.chatId ? sessionsByChat.get(p.chatId) : undefined) ?? [];
+    if (sessions.length === 0) {
+      elements.push(note('（暂无话题）'));
+    } else {
+      const sorted = [...sessions].sort((a, b) => b.updatedAt - a.updatedAt);
+      for (const s of sorted) {
+        const title = (s.summary || '(空)').replace(/\s+/g, ' ').slice(0, 40);
+        elements.push(note(`· ${title} · ${relativeTime(s.updatedAt)}`));
+      }
+    }
+    const row: CardObject[] = [];
+    if (p.chatId) row.push(linkButton('💬 打开群聊', openChatUrl(p.chatId)));
+    row.push(button('🗑 删除', { a: DM.rmConfirm, n: p.name }, 'danger'));
+    elements.push(actions(row));
     elements.push(hr());
   }
   elements.push(note(`共 ${projects.length} 个项目`));
@@ -100,7 +125,7 @@ export function buildRmConfirmCard(name: string): CardObject {
   return card(
     [
       md(`确定删除项目 **${name}**？`),
-      note('仅解绑（移除注册 + 撤销置顶横幅），**不删代码目录**。群需你自行在飞书解散。'),
+      note('仅解绑（移除注册 + 撤销置顶横幅），**不删代码目录**。群主会转给你，再由你自行在飞书解散群。'),
       actions([
         button('✅ 确认删除', { a: DM.rmDo, n: name }, 'danger'),
         button('取消', { a: DM.rmCancel }),
@@ -108,27 +133,6 @@ export function buildRmConfirmCard(name: string): CardObject {
     ],
     { header: { title: '🗑 删除项目', template: 'red' } },
   );
-}
-
-/** Bot's groups, with 🔑 转让群主给我 on bot-owned ones (so admin can disband). */
-export function buildGroupsCard(groups: BotGroup[], adminName?: string): CardObject {
-  const owned = groups.filter((g) => g.ownedByBot);
-  const elements = [
-    md('机器人是这些群的**群主**——只有群主能解散。点 🔑 把群主转给你，再去飞书自行解散。'),
-    hr(),
-  ];
-  if (owned.length === 0) {
-    elements.push(md('_机器人当前不是任何群的群主。_'));
-  } else {
-    for (const g of owned) {
-      elements.push(md(`**${g.name}**`));
-      elements.push(note(`\`${g.chatId}\``));
-      elements.push(actions([button(`🔑 转让群主给${adminName ? ` ${adminName}` : '我'}`, { a: DM.transferOwner, c: g.chatId })]));
-      elements.push(hr());
-    }
-  }
-  elements.push(actions([button('⬅️ 菜单', { a: DM.menu })]));
-  return card(elements, { header: { title: '🚪 群管理', template: 'orange' } });
 }
 
 /** Global preferences card. Selecting an option mutates config + saves. */

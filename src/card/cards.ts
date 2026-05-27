@@ -108,6 +108,18 @@ export function button(label: string, value: ActionValue, type: ButtonType = 'de
   };
 }
 
+/** A button that opens a URL (e.g. an applink) instead of firing a callback.
+ * Schema 2.0 buttons take an `open_url` behavior; `default_url` covers all
+ * platforms (use the `lark://`/`https://applink.feishu.cn/...` scheme as-is). */
+export function linkButton(label: string, url: string, type: ButtonType = 'default'): CardElement {
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: label },
+    type,
+    behaviors: [{ type: 'open_url', default_url: url }],
+  };
+}
+
 /** A text input (schema 2.0 `input` component). `name` keys its value in the
  * form's `form_value` on submit. */
 export function input(opts: {

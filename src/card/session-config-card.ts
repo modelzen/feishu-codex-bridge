@@ -165,8 +165,8 @@ function truncate(s: string, n: number): string {
   return t.length > n ? `${t.slice(0, n)}…` : t;
 }
 
-/** Coarse relative time from a unix-seconds timestamp. */
-function relativeTime(unixSeconds: number): string {
+/** Coarse relative time from a unix-seconds (or millis) timestamp. */
+export function relativeTime(unixSeconds: number): string {
   if (!unixSeconds) return '未知时间';
   const ms = unixSeconds < 1e12 ? unixSeconds * 1000 : unixSeconds;
   const diff = Date.now() - ms;

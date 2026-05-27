@@ -29,7 +29,6 @@ import { RunCardStream } from '../card/run-card-stream';
 import { log, withTrace } from '../core/logger';
 import {
   buildDmMenuCard,
-  buildGroupsCard,
   buildNewProjectDoneCard,
   buildNewProjectFormCard,
   buildProjectListCard,
@@ -41,8 +40,8 @@ import { currentBranch } from '../project/git-info';
 import { getProjectByChatId, listProjects, removeProject } from '../project/registry';
 import { createProject } from '../project/lifecycle';
 import { refreshBranch } from '../project/banner';
-import { listBotGroups, transferOwnership } from '../project/group-ops';
-import { getSession, patchSession, upsertSession } from './session-store';
+import { transferOwnership } from '../project/group-ops';
+import { getSession, listSessions, patchSession, upsertSession, type SessionRecord } from './session-store';
 import { handleDmConsole } from './dm-console';
 import { Semaphore, withIdleTimeout } from './watchdog';
 
@@ -454,6 +453,19 @@ export function createOrchestrator(
     })();
   };
 
+  // Build the project list card with each project's topics (sessions) grouped
+  // by chatId, most-recent first — shared by the list/cancel/delete handlers.
+  const renderProjectList = async (): Promise<object> => {
+    const [projects, sessions] = await Promise.all([listProjects(), listSessions()]);
+    const byChat = new Map<string, SessionRecord[]>();
+    for (const s of sessions) {
+      const arr = byChat.get(s.chatId);
+      if (arr) arr.push(s);
+      else byChat.set(s.chatId, [s]);
+    }
+    return buildProjectListCard(projects, byChat);
+  };
+
   dispatcher
     .on(DM.menu, ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) freshMenu(evt);
@@ -482,7 +494,7 @@ export function createOrchestrator(
     })
     .on(DM.projects, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      patch(evt.messageId, async () => buildProjectListCard(await listProjects()));
+      patch(evt.messageId, renderProjectList);
     })
     .on(DM.settings, async ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) await patch(evt.messageId, buildSettingsCard(cfg));
@@ -509,7 +521,7 @@ export function createOrchestrator(
     })
     .on(DM.rmCancel, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      patch(evt.messageId, async () => buildProjectListCard(await listProjects()));
+      patch(evt.messageId, renderProjectList);
     })
     .on(DM.rmDo, ({ evt, value }) => {
       const name = typeof value.n === 'string' ? value.n : undefined;
@@ -540,42 +552,7 @@ export function createOrchestrator(
         await channel
           .send(evt.chatId, { markdown: `✅ 已删除项目「${name}」（解绑，未删代码目录）。\n${tail}` }, { replyTo: evt.messageId })
           .catch(() => undefined);
-        return buildProjectListCard(await listProjects());
-      });
-    })
-    .on(DM.groups, ({ evt }) => {
-      if (!dmAdmin(evt.operator?.openId)) return;
-      patch(evt.messageId, async () => {
-        const groups = await listBotGroups(channel).catch((err) => {
-          log.fail('console', err, { phase: 'list-groups' });
-          return [];
-        });
-        return buildGroupsCard(groups, evt.operator?.name);
-      });
-    })
-    .on(DM.transferOwner, ({ evt, value }) => {
-      const chatId = typeof value.c === 'string' ? value.c : undefined;
-      const op = evt.operator?.openId;
-      if (!dmAdmin(op) || !chatId || !op) return;
-      patch(evt.messageId, async () => {
-        const ok = await transferOwnership(channel, chatId, op)
-          .then(() => true)
-          .catch((err) => {
-            log.fail('console', err, { phase: 'owner-transfer' });
-            return false;
-          });
-        await channel
-          .send(
-            evt.chatId,
-            {
-              markdown: ok
-                ? '✅ 群主已转给你。现在去那个群 → 设置 → **解散群聊**。'
-                : '❌ 转让失败（可能 bot 不是该群群主，或缺 im:chat 权限）。',
-            },
-            { replyTo: evt.messageId },
-          )
-          .catch(() => undefined);
-        return buildGroupsCard(await listBotGroups(channel).catch(() => []), evt.operator?.name);
+        return renderProjectList();
       });
     })
     .on(DM.setTools, async ({ evt, option }) => {
