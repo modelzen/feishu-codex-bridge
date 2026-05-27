@@ -439,9 +439,24 @@ export function createOrchestrator(
     patch(evt.messageId, buildSettingsCard(cfg));
   }
 
+  // Back-to-menu: recall the current card and send a *fresh* menu entity.
+  // Updating in place fails if the source card's card_id got locked by a prior
+  // select/form interaction (Feishu locks interactions on a submitted/selected
+  // card_id — buttons re-rendered on it stop firing). A new card_id is never
+  // locked, so 返回 always lands on a working menu.
+  const freshMenu = (evt: CardActionEvent): void => {
+    void (async () => {
+      await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
+      await channel.recallMessage(evt.messageId).catch(() => undefined);
+      await sendManagedCard(channel, evt.chatId, buildDmMenuCard()).catch((err) =>
+        log.fail('console', err, { phase: 'menu-fresh' }),
+      );
+    })();
+  };
+
   dispatcher
-    .on(DM.menu, async ({ evt }) => {
-      if (dmAdmin(evt.operator?.openId)) await patch(evt.messageId, buildDmMenuCard());
+    .on(DM.menu, ({ evt }) => {
+      if (dmAdmin(evt.operator?.openId)) freshMenu(evt);
     })
     .on(DM.newProject, ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) patch(evt.messageId, buildNewProjectFormCard());

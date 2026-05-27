@@ -187,7 +187,7 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
           `假死 ${watchdogVal === '0' ? '关' : `${watchdogVal}s`} · ${getPendingPolicy(cfg) === 'steer' ? '引导' : '排队'} · 并发 ${getMaxConcurrentRuns(cfg)}`,
       ),
       note('⚠️ 假死超时 / 并发上限 改后需**重启**生效；工具显示 / 运行中新消息 即时生效。'),
-      note('改完即留痕。发我 `/menu` 可再次打开管理台。'),
+      actions([button('⬅️ 菜单', { a: DM.menu })]),
     ],
     { header: { title: '⚙️ 设置', template: 'blue' } },
   );
