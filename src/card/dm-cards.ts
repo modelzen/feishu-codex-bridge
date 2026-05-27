@@ -6,7 +6,7 @@ import {
 } from '../config/schema';
 import type { Project } from '../project/registry';
 import type { SessionRecord } from '../bot/session-store';
-import { actions, button, card, form, hr, input, linkButton, md, note, selectStatic, submitButton, type CardObject } from './cards';
+import { actions, button, card, form, hr, input, linkButton, md, note, submitButton, type CardElement, type CardObject } from './cards';
 import { relativeTime } from './session-config-card';
 
 /** applink to open a Feishu group chat by chat_id (oc_xxx). Feishu has no
@@ -135,61 +135,55 @@ export function buildRmConfirmCard(name: string): CardObject {
   );
 }
 
-/** Global preferences card. Selecting an option mutates config + saves. */
+/** A label line + a row of option buttons; the currently-selected option is
+ * highlighted (primary). Each button carries `{ a: actionId, v: <value> }`, so
+ * tapping any option sets that value directly (no cycling). Distinct values keep
+ * each option's callback unique; managed.ts's per-render token lets a value you
+ * already picked once be picked again. */
+function optionRow(
+  label: string,
+  actionId: string,
+  current: string,
+  opts: { label: string; value: string }[],
+): CardElement[] {
+  return [
+    md(label),
+    actions(opts.map((o) => button(o.label, { a: actionId, v: o.value }, o.value === current ? 'primary' : 'default'))),
+  ];
+}
+
+/**
+ * Global preferences card. Each setting is a row of option buttons — tap the
+ * value you want (current one is highlighted). We use buttons, not select_static,
+ * on purpose: Feishu locks a card_id once a select has been interacted with,
+ * after which *every* button on it (including ⬅️ 菜单) stops firing. Buttons
+ * never lock, so this card stays fully interactive and updates in place.
+ */
 export function buildSettingsCard(cfg: AppConfig): CardObject {
-  const watchdogSec = cfg.preferences?.runIdleTimeoutSeconds;
-  const watchdogVal = watchdogSec === 0 ? '0' : String(watchdogSec ?? 120);
+  const watchdogSec = cfg.preferences?.runIdleTimeoutSeconds ?? 120;
   return card(
     [
       md('**全局设置**（管理员）'),
-      actions([
-        selectStatic({
-          actionId: DM.setTools,
-          placeholder: '工具调用显示',
-          initial: getShowToolCalls(cfg) ? 'on' : 'off',
-          options: [
-            { label: '工具调用：显示', value: 'on' },
-            { label: '工具调用：隐藏', value: 'off' },
-          ],
-        }),
+      ...optionRow('🔧 工具调用', DM.setTools, getShowToolCalls(cfg) ? 'on' : 'off', [
+        { label: '显示', value: 'on' },
+        { label: '隐藏', value: 'off' },
       ]),
-      actions([
-        selectStatic({
-          actionId: DM.setWatchdog,
-          placeholder: '假死超时',
-          initial: watchdogVal,
-          options: [
-            { label: '假死超时：关闭', value: '0' },
-            { label: '假死超时：60 秒', value: '60' },
-            { label: '假死超时：120 秒', value: '120' },
-            { label: '假死超时：300 秒', value: '300' },
-          ],
-        }),
-        selectStatic({
-          actionId: DM.setPending,
-          placeholder: '运行中新消息',
-          initial: getPendingPolicy(cfg),
-          options: [
-            { label: '运行中新消息：引导', value: 'steer' },
-            { label: '运行中新消息：排队', value: 'queue' },
-          ],
-        }),
-        selectStatic({
-          actionId: DM.setConcurrency,
-          placeholder: '并发上限',
-          initial: String(getMaxConcurrentRuns(cfg)),
-          options: [
-            { label: '并发上限：1', value: '1' },
-            { label: '并发上限：5', value: '5' },
-            { label: '并发上限：10', value: '10' },
-            { label: '并发上限：20', value: '20' },
-          ],
-        }),
+      ...optionRow('⏱ 假死超时', DM.setWatchdog, String(watchdogSec), [
+        { label: '关闭', value: '0' },
+        { label: '60秒', value: '60' },
+        { label: '120秒', value: '120' },
+        { label: '300秒', value: '300' },
       ]),
-      note(
-        `当前：工具 ${getShowToolCalls(cfg) ? '显示' : '隐藏'} · ` +
-          `假死 ${watchdogVal === '0' ? '关' : `${watchdogVal}s`} · ${getPendingPolicy(cfg) === 'steer' ? '引导' : '排队'} · 并发 ${getMaxConcurrentRuns(cfg)}`,
-      ),
+      ...optionRow('📥 运行中新消息', DM.setPending, getPendingPolicy(cfg), [
+        { label: '引导', value: 'steer' },
+        { label: '排队', value: 'queue' },
+      ]),
+      ...optionRow('⚡ 并发上限', DM.setConcurrency, String(getMaxConcurrentRuns(cfg)), [
+        { label: '1', value: '1' },
+        { label: '5', value: '5' },
+        { label: '10', value: '10' },
+        { label: '20', value: '20' },
+      ]),
       note('⚠️ 假死超时 / 并发上限 改后需**重启**生效；工具显示 / 运行中新消息 即时生效。'),
       actions([button('⬅️ 菜单', { a: DM.menu })]),
     ],

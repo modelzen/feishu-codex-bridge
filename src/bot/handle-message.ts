@@ -11,6 +11,7 @@ import {
   isUserAllowed,
   type AppConfig,
   type AppPreferences,
+  type PendingPolicy,
 } from '../config/schema';
 import { saveConfig } from '../config/store';
 import { CardDispatcher } from '../card/dispatcher';
@@ -240,15 +241,20 @@ export function createOrchestrator(
   const dispatcher = new CardDispatcher(channel, cfg);
   const PENDING_TTL_MS = 30 * 60_000; // abandoned config cards expire after 30 min
 
-  // A card update issued from inside a cardAction handler must land AFTER the
-  // callback's HTTP-200 ack — Feishu locks the card during the click's
-  // interaction window and reverts any concurrent/earlier update to the
-  // pre-click state (official "处理卡片回调"; cardkit err 200810; the symptom is
-  // the card flashing then snapping back). So handlers return immediately
-  // (letting the SDK ack) and we apply the update detached, after a short
-  // settle. Cards must be CardKit entities (sendManagedCard) for the update to
-  // target them — im.v1.message.patch only does "unconditional" updates.
-  const CARD_SETTLE_MS = 500;
+  // A card update issued from inside a cardAction handler must land AFTER Feishu
+  // receives the click's ack — it locks the card during the interaction window
+  // and reverts any earlier update to the pre-click state (official "处理卡片回调";
+  // cardkit err 200810; symptom: the card flashes then snaps back). Over the WS
+  // transport that ack is the response frame the SDK sends *after* our handler
+  // returns (lib/index.js handleEventData: `yield eventDispatcher.invoke(...)`
+  // then `sendMessage(ack)`). Our update handlers return synchronously (they
+  // just arm the detached update below), so the ack goes out at click time —
+  // the only thing left to wait out is its WS round-trip to Feishu (tens of ms),
+  // not a fixed long pause. 150ms covers that round-trip with margin; a rare
+  // miss self-heals via updateManagedCard's post-window retry. Raise it only if
+  // updates start flashing back. Cards must be CardKit entities (sendManagedCard)
+  // for the update to target them — im.v1.message.patch only does "unconditional".
+  const CARD_SETTLE_MS = 150;
   // `c` may be a card object or a (possibly async) builder. Passing a builder
   // lets a handler return *immediately* (so the SDK acks the click's callback
   // right away, closing the interaction window) while any slow work — API
@@ -438,19 +444,11 @@ export function createOrchestrator(
     patch(evt.messageId, buildSettingsCard(cfg));
   }
 
-  // Back-to-menu: recall the current card and send a *fresh* menu entity.
-  // Updating in place fails if the source card's card_id got locked by a prior
-  // select/form interaction (Feishu locks interactions on a submitted/selected
-  // card_id — buttons re-rendered on it stop firing). A new card_id is never
-  // locked, so 返回 always lands on a working menu.
+  // Back-to-menu: the settings card is button-only (never locks) and the
+  // new-project form isn't locked until it's submitted, so 返回 always lands on
+  // a card we can update in place — no recall, no fresh entity needed.
   const freshMenu = (evt: CardActionEvent): void => {
-    void (async () => {
-      await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
-      await channel.recallMessage(evt.messageId).catch(() => undefined);
-      await sendManagedCard(channel, evt.chatId, buildDmMenuCard()).catch((err) =>
-        log.fail('console', err, { phase: 'menu-fresh' }),
-      );
-    })();
+    patch(evt.messageId, buildDmMenuCard());
   };
 
   // Build the project list card with each project's topics (sessions) grouped
@@ -478,19 +476,27 @@ export function createOrchestrator(
       if (!dmAdmin(op)) return;
       const name = String((formValue?.name as string) ?? '').trim();
       const cwdIn = String((formValue?.cwd as string) ?? '').trim();
-      // createProject is slow (group create + git init) — do it in the settle
-      // builder so the submit callback acks immediately.
-      patch(evt.messageId, async () => {
-        if (!name) return buildNewProjectFormCard({ cwd: cwdIn, error: '项目名不能为空' });
-        if (!op) return buildNewProjectFormCard({ name, cwd: cwdIn, error: '无法识别操作者身份' });
-        try {
-          const p = await createProject(channel, { name, ownerOpenId: op, existingPath: cwdIn || undefined });
-          log.info('console', 'new-project', { name: p.name, blank: p.blank });
-          return buildNewProjectDoneCard(p);
-        } catch (err) {
-          return buildNewProjectFormCard({ name, cwd: cwdIn, error: err instanceof Error ? err.message : String(err) });
+      // A submitted form locks its card_id (its buttons — retry/返回 on an error
+      // re-render — stop firing, and an in-place update no-ops). So the result
+      // goes to a *fresh* card; the submitted form stays above as a 留痕. Detach
+      // so the submit callback acks immediately (createProject is slow).
+      void (async () => {
+        let result;
+        if (!name) result = buildNewProjectFormCard({ cwd: cwdIn, error: '项目名不能为空' });
+        else if (!op) result = buildNewProjectFormCard({ name, cwd: cwdIn, error: '无法识别操作者身份' });
+        else {
+          try {
+            const p = await createProject(channel, { name, ownerOpenId: op, existingPath: cwdIn || undefined });
+            log.info('console', 'new-project', { name: p.name, blank: p.blank });
+            result = buildNewProjectDoneCard(p);
+          } catch (err) {
+            result = buildNewProjectFormCard({ name, cwd: cwdIn, error: err instanceof Error ? err.message : String(err) });
+          }
         }
-      });
+        await sendManagedCard(channel, evt.chatId, result).catch((e) =>
+          log.fail('console', e, { phase: 'new-project-result' }),
+        );
+      })();
     })
     .on(DM.projects, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
@@ -555,19 +561,20 @@ export function createOrchestrator(
         return renderProjectList();
       });
     })
-    .on(DM.setTools, async ({ evt, option }) => {
-      await applyPref(evt, (p) => (p.showToolCalls = option === 'on'));
+    // Each setting is a row of option buttons; the click's `v` is the chosen value.
+    .on(DM.setTools, ({ evt, value }) => {
+      applyPref(evt, (p) => (p.showToolCalls = value.v === 'on'));
     })
-    .on(DM.setWatchdog, async ({ evt, option }) => {
-      const n = Number(option);
-      if (Number.isFinite(n)) await applyPref(evt, (p) => (p.runIdleTimeoutSeconds = n));
+    .on(DM.setWatchdog, ({ evt, value }) => {
+      const n = Number(value.v);
+      if (Number.isFinite(n)) applyPref(evt, (p) => (p.runIdleTimeoutSeconds = n));
     })
-    .on(DM.setPending, async ({ evt, option }) => {
-      if (option === 'steer' || option === 'queue') await applyPref(evt, (p) => (p.pendingPolicy = option));
+    .on(DM.setPending, ({ evt, value }) => {
+      if (value.v === 'steer' || value.v === 'queue') applyPref(evt, (p) => (p.pendingPolicy = value.v as PendingPolicy));
     })
-    .on(DM.setConcurrency, async ({ evt, option }) => {
-      const n = Number(option);
-      if (Number.isFinite(n)) await applyPref(evt, (p) => (p.maxConcurrentRuns = n));
+    .on(DM.setConcurrency, ({ evt, value }) => {
+      const n = Number(value.v);
+      if (Number.isFinite(n)) applyPref(evt, (p) => (p.maxConcurrentRuns = n));
     });
 
   /**
