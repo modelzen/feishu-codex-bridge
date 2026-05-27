@@ -26,12 +26,14 @@ function buildBannerCard(project: Project, branch: string): CardObject {
 
 /** Build + send + pin the banner card, persisting its messageId + branch. */
 export async function setBanner(channel: LarkChannel, project: Project): Promise<void> {
-  const branch = (await currentBranch(project.cwd)) ?? '—';
-  const sent = await channel.send(project.chatId, { card: buildBannerCard(project, branch) });
+  const branch = await currentBranch(project.cwd); // null when not a git repo
+  const sent = await channel.send(project.chatId, { card: buildBannerCard(project, branch ?? '—') });
   await channel.rawClient.im.v1.pin
     .create({ data: { message_id: sent.messageId } })
     .catch((err) => log.fail('project', err, { phase: 'pin' }));
-  await updateProject(project.name, { bannerMessageId: sent.messageId, branch });
+  // Persist the real branch only; never store the '—' placeholder (it would
+  // render as a bogus "🌿 —" in the project list for non-git projects).
+  await updateProject(project.name, { bannerMessageId: sent.messageId, branch: branch ?? undefined });
 }
 
 /**
@@ -41,14 +43,14 @@ export async function setBanner(channel: LarkChannel, project: Project): Promise
  */
 export async function refreshBranch(channel: LarkChannel, project: Project): Promise<void> {
   if (!project.bannerMessageId) return;
-  const branch = (await currentBranch(project.cwd)) ?? '—';
-  if (branch === (project.branch ?? '—')) return;
-  log.info('project', 'branch-change', { name: project.name, from: project.branch ?? '—', to: branch });
+  const branch = await currentBranch(project.cwd); // null when not a git repo
+  if ((branch ?? '—') === (project.branch ?? '—')) return;
+  log.info('project', 'branch-change', { name: project.name, from: project.branch ?? '—', to: branch ?? '—' });
   // Only persist the new branch if the card patch succeeded — otherwise leave
   // the stored branch stale so the next message/run retries (no false "current").
   try {
-    await channel.updateCard(project.bannerMessageId, buildBannerCard(project, branch));
-    await updateProject(project.name, { branch });
+    await channel.updateCard(project.bannerMessageId, buildBannerCard(project, branch ?? '—'));
+    await updateProject(project.name, { branch: branch ?? undefined });
   } catch (err) {
     log.fail('project', err, { phase: 'banner-patch' });
   }

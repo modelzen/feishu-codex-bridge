@@ -98,7 +98,7 @@ export function buildProjectListCard(
   const elements: CardObject[] = [];
   for (const p of projects) {
     elements.push(md(`**${p.name}**${p.blank ? ' _(空白)_' : ''}`));
-    elements.push(note(`📂 \`${p.cwd}\`${p.branch ? `   🌿 ${p.branch}` : ''}`));
+    elements.push(note(`📂 \`${p.cwd}\`${p.branch && p.branch !== '—' ? `   🌿 ${p.branch}` : ''}`));
     elements.push(note(p.chatId ? `💬 群：**${p.name}**` : '⚠️ 未绑定群'));
     const sessions = (p.chatId ? sessionsByChat.get(p.chatId) : undefined) ?? [];
     if (sessions.length === 0) {
