@@ -64,13 +64,14 @@ export function buildNewProjectFormCard(opts: { name?: string; cwd?: string; err
   return card(elements, { header: { title: '➕ 新建项目', template: 'turquoise' } });
 }
 
-/** Shown after a project is created. */
+/** Shown after a project is created — a terminal "留痕" record, no nav button.
+ * (Re-open the console any time by messaging the bot.) */
 export function buildNewProjectDoneCard(p: Project): CardObject {
   return card(
     [
       md(`✅ 已创建项目 **${p.name}**${p.blank ? ' _(空白 + git init)_' : ''}`),
-      note(`📂 \`${p.cwd}\`${p.chatId ? `   群已建好，去群里 @我 干活` : ''}`),
-      actions([button('📁 项目列表', { a: DM.projects }), button('⬅️ 菜单', { a: DM.menu })]),
+      note(`📂 \`${p.cwd}\``),
+      md(p.chatId ? '群已建好 👉 去项目群里 **@我** 干活。' : '发我 `/menu` 可再次打开管理台。'),
     ],
     { header: { title: '➕ 新建项目', template: 'green' } },
   );
@@ -186,7 +187,7 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
           `假死 ${watchdogVal === '0' ? '关' : `${watchdogVal}s`} · ${getPendingPolicy(cfg) === 'steer' ? '引导' : '排队'} · 并发 ${getMaxConcurrentRuns(cfg)}`,
       ),
       note('⚠️ 假死超时 / 并发上限 改后需**重启**生效；工具显示 / 运行中新消息 即时生效。'),
-      actions([button('⬅️ 菜单', { a: DM.menu })]),
+      note('改完即留痕。发我 `/menu` 可再次打开管理台。'),
     ],
     { header: { title: '⚙️ 设置', template: 'blue' } },
   );
