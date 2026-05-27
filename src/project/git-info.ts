@@ -20,12 +20,3 @@ export async function currentBranch(cwd: string): Promise<string | null> {
     return null;
   }
 }
-
-/** Initialize an empty git repo at `cwd` (for blank projects). Best-effort. */
-export async function gitInit(cwd: string): Promise<void> {
-  try {
-    await execFileAsync('git', ['init', '-q'], { cwd, timeout: 5000 });
-  } catch {
-    /* non-fatal: project still usable without git */
-  }
-}

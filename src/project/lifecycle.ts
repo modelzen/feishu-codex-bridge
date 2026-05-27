@@ -5,7 +5,6 @@ import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { paths } from '../config/paths';
 import { log } from '../core/logger';
 import { addProject, getProjectByName, type Project } from './registry';
-import { gitInit } from './git-info';
 import { setBanner } from './banner';
 
 export interface CreateProjectInput {
@@ -37,7 +36,6 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
   } else {
     cwd = join(paths.projectsRootDir, name);
     await mkdir(cwd, { recursive: true });
-    await gitInit(cwd);
     blank = true;
   }
 

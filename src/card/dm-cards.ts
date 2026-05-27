@@ -59,7 +59,7 @@ export function buildNewProjectFormCard(opts: { name?: string; cwd?: string; err
   const elements = [];
   if (opts.error) elements.push(md(`❌ **创建失败**：${opts.error}`));
   elements.push(
-    md('填项目名（必填）。**CWD 留空** = 在默认目录新建空白项目并 `git init`；**填绝对路径** = 用现有文件夹。'),
+    md('填项目名（必填）。**CWD 留空** = 在默认目录新建空白项目；**填绝对路径** = 用现有文件夹。'),
     form('new_project', [
       input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
       input({ name: 'cwd', label: 'CWD（可选，绝对路径）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
@@ -74,7 +74,7 @@ export function buildNewProjectFormCard(opts: { name?: string; cwd?: string; err
 export function buildNewProjectDoneCard(p: Project): CardObject {
   return card(
     [
-      md(`✅ 已创建项目 **${p.name}**${p.blank ? ' _(空白 + git init)_' : ''}`),
+      md(`✅ 已创建项目 **${p.name}**${p.blank ? ' _(空白项目)_' : ''}`),
       note(`📂 \`${p.cwd}\``),
       md(p.chatId ? '群已建好 👉 去项目群里 **@我** 干活。' : '发我 `/menu` 可再次打开管理台。'),
     ],
