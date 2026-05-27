@@ -22,3 +22,10 @@ docs/references/
 .lead-sessions.json
 skills-lock.json
 prototype/appserver-probe/schema/
+
+# local test recordings (binary; keep repo clean for future open-source)
+docs/tests/
+
+# per-task review report subdirs (the reviewer/ INDEX files are tracked; the
+# individual review-*/ folders stay local)
+.plans/**/review-*/
