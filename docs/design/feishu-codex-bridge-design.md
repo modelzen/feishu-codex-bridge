@@ -64,8 +64,8 @@
 
 ### 3.2 项目群
 
-- **群置顶横幅**（`im pins create` + 卡片 patch；chat 级）：
-  `📁项目 / 📂cwd / 🌿分支(只读) / ⚙️默认参数`。分支变化**惰性检测**（消息进来 / run 结束时读 `git rev-parse --abbrev-ref HEAD`，变了 patch 横幅）。
+- **群置顶横幅 = 群公告**（docx block 写内容 + `im chatTopNotice.putTopNotice action_type:"2"` 置顶；chat 级）：
+  一行 `📁项目名 · [📂路径(仅绑定已有目录显示)] · [🌿分支(仅 git)]`。**两步**：① docx block API 把群公告内容写成一个 text block；② put_top_notice action_type=2 把"群公告"置顶成顶部横幅（复用 `im:chat`，无需额外权限，无需 message_id）。分支变化**惰性检测**（消息进来 / run 结束时读 `git rev-parse --abbrev-ref HEAD`，变了重写群公告 block；置顶状态保持，不重复置顶）。早期"Pin 一条卡片消息"方案已废（只进 Pin 列表、不在顶部横幅，见 git 史）。
 - **主区 @bot[+首条消息]** → **会话配置卡**（预填默认，可直接创建）：
   `模型 ▾`（动态 model/list）`effort ▾` + `[✅ 创建新会话]` `[🔁 恢复历史会话]`
   （注：codex 无 `fast` 参数，effort 即速度/质量杆，故去掉 fast 下拉，见 .plans/decisions.md 2026-05-26）
@@ -167,7 +167,7 @@
 
 ## 9. 开放平台配置（onboarding 文档需覆盖）
 
-- 权限 scope：`im:message` `im:message:send_as_bot` `im:resource` `im:chat`（建群 + **转让群主** `chat.update owner_id`）`im:pin`/`im:message.pins:write_only`（置顶）`drive:drive`（云文档评论，可选）。**不需要 `im:chat:delete`**——删项目时 bot 不主动解散，而是**把群主转让给 admin**（用 `im:chat`，与建群同款），由 admin 自行解散（bot 是群主、用户无法自行解散，见 §3.1 + decisions.md 2026-05-26）。
+- 权限 scope（**全用细分名**——飞书新应用已把 `im:chat`/`im:message` 等合并 scope 拆开、合并名不可单独开通，用合并名会导致一键链接开不了 + 检测误报）：`im:message.group_at_msg:readonly`(@bot 消息) `im:message.p2p_msg:readonly`(私聊) `im:message:send_as_bot`(发卡/回话题) `im:resource`(上传资源) `im:chat:create`(建群) `im:chat:update`(**转让群主** owner_id) `im:chat.announcement:read`+`im:chat.announcement:write_only`(群公告 docx block 读=list/写=create+delete) `im:chat.top_notice:write_only`(**置顶群公告** put_top_notice action_type=2) `cardkit:card:write`(交互卡片)；可选 `drive:drive`(云文档评论)。**权威清单 = `src/config/scopes.ts` `REQUIRED_SCOPES`。** 飞书无「扫码即授权」接口（`registerApp`/官方 larksuite-cli 均无 scope 参数），故 `start` 用 tenant token 调 `application/v6/scopes` 检测缺失，缺则打印含全部权限的一键开通链接 `…/app/<id>/auth?q=<逗号分隔>`，用户点一次全开（即时生效，无需重启）。**不需要 `im:chat:delete`**——删项目时 bot 不主动解散，而是**把群主转让给 admin**（用 `im:chat`，与建群同款），由 admin 自行解散（bot 是群主、用户无法自行解散，见 §3.1 + decisions.md 2026-05-26）。
 - 事件（长连接）：`im.message.receive_v1` `card.action.trigger` `application.bot.menu_v6`；可选 `im.message.reaction.*` `im.chat.member.bot.added_v1`
 - 机器人自定义菜单：后台「机器人能力 → 机器人自定义菜单」配置 5 项（推送事件，各设 event_key），发布版本生效。
 

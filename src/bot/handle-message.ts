@@ -40,7 +40,7 @@ import {
 import { currentBranch } from '../project/git-info';
 import { getProjectByChatId, listProjects, removeProject } from '../project/registry';
 import { createProject } from '../project/lifecycle';
-import { refreshBranch } from '../project/banner';
+import { refreshBranch } from '../project/announcement';
 import { transferOwnership } from '../project/group-ops';
 import { getSession, listSessions, patchSession, upsertSession, type SessionRecord } from './session-store';
 import { handleDmConsole } from './dm-console';
@@ -550,15 +550,11 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : undefined;
       const op = evt.operator?.openId;
       if (!dmAdmin(op) || !name) return;
-      // all the slow work (remove + unpin + owner transfer + reply) runs in the
-      // settle builder so the click acks immediately.
+      // all the slow work (remove + owner transfer + reply) runs in the
+      // settle builder so the click acks immediately. The announcement vanishes
+      // with the group once the owner dissolves it, so nothing to clean up here.
       patch(evt, async () => {
         const removed = await removeProject(name);
-        if (removed?.bannerMessageId) {
-          await channel.rawClient.im.v1.pin
-            .delete({ path: { message_id: removed.bannerMessageId } })
-            .catch(() => undefined);
-        }
         let transferred = false;
         if (removed?.chatId && op) {
           transferred = await transferOwnership(channel, removed.chatId, op)

@@ -68,11 +68,6 @@ export async function handleDmConsole(channel: LarkChannel, cfg: AppConfig, msg:
             return;
           }
           const removed = await removeProject(name);
-          if (removed?.bannerMessageId) {
-            await channel.rawClient.im.v1.pin
-              .delete({ path: { message_id: removed.bannerMessageId } })
-              .catch(() => undefined);
-          }
           let transferred = false;
           if (removed?.chatId) {
             transferred = await transferOwnership(channel, removed.chatId, msg.senderId)

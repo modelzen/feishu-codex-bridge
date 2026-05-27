@@ -13,9 +13,7 @@ export interface Project {
   /** true when bridge created the cwd as a blank project (under projectsRootDir) */
   blank: boolean;
   createdAt: number;
-  /** messageId of the pinned banner card (so it can be patched on branch change) */
-  bannerMessageId?: string;
-  /** last branch shown on the banner (for lazy change detection) */
+  /** last branch shown in the announcement (for lazy change detection) */
   branch?: string;
 }
 

@@ -5,7 +5,7 @@ import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { paths } from '../config/paths';
 import { log } from '../core/logger';
 import { addProject, getProjectByName, type Project } from './registry';
-import { setBanner } from './banner';
+import { setAnnouncement } from './announcement';
 
 export interface CreateProjectInput {
   name: string;
@@ -17,7 +17,7 @@ export interface CreateProjectInput {
 
 /**
  * Create a project: resolve/prepare the cwd, create a bound Feishu group
- * (bot as manager, owner invited), register it, and set a pinned banner.
+ * (bot as manager, owner invited), register it, and set the group announcement.
  * Throws on duplicate name or missing existing path (before creating a group,
  * so no orphan groups).
  */
@@ -52,7 +52,7 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
   await addProject(project);
   log.info('project', 'create', { name, chatId, cwd, blank });
 
-  // 4. pinned banner (best-effort)
-  await setBanner(channel, project).catch((err) => log.fail('project', err, { phase: 'banner' }));
+  // 4. group announcement (best-effort)
+  await setAnnouncement(channel, project).catch((err) => log.fail('project', err, { phase: 'announcement' }));
   return project;
 }
