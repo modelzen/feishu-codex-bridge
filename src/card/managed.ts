@@ -115,7 +115,13 @@ export async function updateManagedCard(
   card: object,
 ): Promise<boolean> {
   const entry = byMessageId.get(messageId);
-  if (!entry) return false;
+  if (!entry) {
+    // The silent failure that made "返回菜单又没用了" invisible: no mapping (e.g.
+    // the card was sent before a restart — byMessageId is per-process). Log it
+    // so the diagnosis isn't a black box; caller may fall back to a fresh card.
+    log.info('card', 'managed-update-no-entry', { messageId, known: byMessageId.size });
+    return false;
+  }
   stampRenderToken(card);
   const data = JSON.stringify(card);
   const push = async (): Promise<void> => {

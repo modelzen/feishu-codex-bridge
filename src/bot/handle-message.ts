@@ -242,30 +242,45 @@ export function createOrchestrator(
   const PENDING_TTL_MS = 30 * 60_000; // abandoned config cards expire after 30 min
 
   // A card update issued from inside a cardAction handler must land AFTER Feishu
-  // receives the click's ack — it locks the card during the interaction window
-  // and reverts any earlier update to the pre-click state (official "处理卡片回调";
-  // cardkit err 200810; symptom: the card flashes then snaps back). Over the WS
-  // transport that ack is the response frame the SDK sends *after* our handler
-  // returns (lib/index.js handleEventData: `yield eventDispatcher.invoke(...)`
-  // then `sendMessage(ack)`). Our update handlers return synchronously (they
-  // just arm the detached update below), so the ack goes out at click time —
-  // the only thing left to wait out is its WS round-trip to Feishu (tens of ms),
-  // not a fixed long pause. 150ms covers that round-trip with margin; a rare
-  // miss self-heals via updateManagedCard's post-window retry. Raise it only if
-  // updates start flashing back. Cards must be CardKit entities (sendManagedCard)
-  // for the update to target them — im.v1.message.patch only does "unconditional".
-  const CARD_SETTLE_MS = 150;
+  // is done with the click's interaction window — Feishu locks the card during
+  // that window and discards an update that arrives inside it (official "处理卡片
+  //回调"). A hard collision throws cardkit err 200810 (caught + retried below);
+  // but a near-miss returns HTTP 200 yet the *client* still snaps the card back
+  // to its pre-click state — silent, so the 200810 retry never fires and the
+  // update is simply lost (symptom: "点一下没反应 / 要点两下"). We learned 150ms is
+  // inside that soft window; 500ms clears it reliably. These console cards aren't
+  // high-frequency, so the latency is worth the determinism. Cards must be
+  // CardKit entities (sendManagedCard) for the update to target them —
+  // im.v1.message.patch only does "unconditional".
+  const CARD_SETTLE_MS = 500;
   // `c` may be a card object or a (possibly async) builder. Passing a builder
   // lets a handler return *immediately* (so the SDK acks the click's callback
   // right away, closing the interaction window) while any slow work — API
   // calls, createProject — runs inside the settle, after the ack. Awaiting slow
   // work in the handler instead holds the callback open and the next click's
   // update collides with the still-open window (err 200810 → revert).
-  const settleUpdate = (msgId: string, c: object | (() => object | Promise<object>)): void => {
+  //
+  // `fallbackChatId`: byMessageId mappings are per-process (lost on restart), so
+  // a card sent before a restart is an orphan — updateManagedCard finds no entity
+  // and no-ops, leaving a dead card (the "返回菜单又没用了" after I restart). When a
+  // chatId is given we self-heal by posting a fresh managed card instead (no
+  // recall — the stale one just sits above).
+  const settleUpdate = (
+    msgId: string,
+    c: object | (() => object | Promise<object>),
+    fallbackChatId?: string,
+  ): void => {
+    const armedAt = Date.now();
     void (async () => {
       await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
       const card = typeof c === 'function' ? await c() : c;
-      await updateManagedCard(channel, msgId, card);
+      const ok = await updateManagedCard(channel, msgId, card);
+      log.info('console', 'settle-update', { msgId, ok, waitedMs: Date.now() - armedAt, fallback: !ok && !!fallbackChatId });
+      if (!ok && fallbackChatId) {
+        await sendManagedCard(channel, fallbackChatId, card).catch((err) =>
+          log.fail('console', err, { phase: 'settle-fallback' }),
+        );
+      }
     })();
   };
   // Same settle discipline for a run card's CardKit entity: mutate state +
@@ -430,9 +445,11 @@ export function createOrchestrator(
   // the same card in place, each carrying a ⬅️ 菜单 back button.
   const dmAdmin = (openId?: string): boolean => isAdmin(cfg, openId ?? '');
   // DM cards are CardKit entities (sendManagedCard); update them via the
-  // settle-then-cardkit path so the click's callback acks first.
-  const patch = (msgId: string, c: object | (() => object | Promise<object>)): void =>
-    settleUpdate(msgId, c);
+  // settle-then-cardkit path so the click's callback acks first. Passing the
+  // whole evt lets settleUpdate self-heal an orphaned (post-restart) card by
+  // re-posting to evt.chatId.
+  const patch = (evt: CardActionEvent, c: object | (() => object | Promise<object>)): void =>
+    settleUpdate(evt.messageId, c, evt.chatId);
 
   function applyPref(evt: CardActionEvent, mut: (p: AppPreferences) => void): void {
     if (!dmAdmin(evt.operator?.openId)) return;
@@ -441,14 +458,14 @@ export function createOrchestrator(
     cfg.preferences = prefs;
     // persist in the background; the card only needs the in-memory cfg
     void saveConfig(cfg).catch((err) => log.fail('console', err, { phase: 'save-config' }));
-    patch(evt.messageId, buildSettingsCard(cfg));
+    patch(evt, buildSettingsCard(cfg));
   }
 
   // Back-to-menu: the settings card is button-only (never locks) and the
   // new-project form isn't locked until it's submitted, so 返回 always lands on
   // a card we can update in place — no recall, no fresh entity needed.
   const freshMenu = (evt: CardActionEvent): void => {
-    patch(evt.messageId, buildDmMenuCard());
+    patch(evt, buildDmMenuCard());
   };
 
   // Build the project list card with each project's topics (sessions) grouped
@@ -469,7 +486,7 @@ export function createOrchestrator(
       if (dmAdmin(evt.operator?.openId)) freshMenu(evt);
     })
     .on(DM.newProject, ({ evt }) => {
-      if (dmAdmin(evt.operator?.openId)) patch(evt.messageId, buildNewProjectFormCard());
+      if (dmAdmin(evt.operator?.openId)) patch(evt, buildNewProjectFormCard());
     })
     .on(DM.newProjectSubmit, ({ evt, formValue }) => {
       const op = evt.operator?.openId;
@@ -500,10 +517,10 @@ export function createOrchestrator(
     })
     .on(DM.projects, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      patch(evt.messageId, renderProjectList);
+      patch(evt, renderProjectList);
     })
     .on(DM.settings, async ({ evt }) => {
-      if (dmAdmin(evt.operator?.openId)) await patch(evt.messageId, buildSettingsCard(cfg));
+      if (dmAdmin(evt.operator?.openId)) await patch(evt, buildSettingsCard(cfg));
     })
     .on(DM.doctor, async ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
@@ -523,11 +540,11 @@ export function createOrchestrator(
     .on(DM.rmConfirm, async ({ evt, value }) => {
       const name = typeof value.n === 'string' ? value.n : undefined;
       if (!dmAdmin(evt.operator?.openId) || !name) return;
-      await patch(evt.messageId, buildRmConfirmCard(name));
+      await patch(evt, buildRmConfirmCard(name));
     })
     .on(DM.rmCancel, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      patch(evt.messageId, renderProjectList);
+      patch(evt, renderProjectList);
     })
     .on(DM.rmDo, ({ evt, value }) => {
       const name = typeof value.n === 'string' ? value.n : undefined;
@@ -535,7 +552,7 @@ export function createOrchestrator(
       if (!dmAdmin(op) || !name) return;
       // all the slow work (remove + unpin + owner transfer + reply) runs in the
       // settle builder so the click acks immediately.
-      patch(evt.messageId, async () => {
+      patch(evt, async () => {
         const removed = await removeProject(name);
         if (removed?.bannerMessageId) {
           await channel.rawClient.im.v1.pin

@@ -6,6 +6,7 @@ import { runRegistrationWizard } from '../../bot/wizard';
 import { validateAppCredentials } from '../../utils/feishu-auth';
 import { resolveCodexBin } from '../../agent/codex-appserver/locate';
 import { startBridge } from '../../bot/bridge';
+import { acquireSingleInstanceLock, BridgeAlreadyRunningError } from '../../core/single-instance';
 import { log } from '../../core/logger';
 
 /**
@@ -38,6 +39,27 @@ export async function runStart(): Promise<void> {
 
   console.log(`✓ 凭据校验通过  bot: ${v.botName ?? '-'}  appId: ${cfg.accounts.app.id}`);
   log.info('start', 'credentials-ok', { appId: cfg.accounts.app.id, bot: v.botName ?? null });
+
+  // Refuse to run alongside another bridge for the same app — two long
+  // connections split card callbacks and make buttons flaky (see module doc).
+  let releaseLock: () => void;
+  try {
+    releaseLock = acquireSingleInstanceLock(cfg.accounts.app.id);
+  } catch (err) {
+    if (err instanceof BridgeAlreadyRunningError) {
+      console.error(`✗ ${err.message}`);
+      log.info('start', 'already-running', { pid: err.pid });
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
+  }
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+    process.once(sig, () => {
+      releaseLock();
+      process.exit(0);
+    });
+  }
 
   // Projects bind their own cwd (registry). Unregistered groups fall back here.
   const fallbackCwd = process.env.FEISHU_CODEX_CWD || process.cwd();
