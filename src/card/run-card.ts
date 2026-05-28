@@ -1,127 +1,179 @@
-import type { ModelInfo, ReasoningEffort } from '../agent/types';
 import {
   actions,
   button,
   card,
-  hr,
+  collapsiblePanel,
   md,
-  mdStream,
-  note,
-  selectStatic,
+  noteMd,
+  type CardElement,
   type CardObject,
-  type HeaderTemplate,
 } from './cards';
-import { RUN_BODY_ELEMENT_ID } from './run-card-stream';
+import {
+  reasoningContent,
+  type Block,
+  type FooterStatus,
+  type RunState,
+  type ToolEntry,
+} from './run-state';
+import { toolBodyMd, toolHeaderText } from './tool-render';
 
 /** Action ids for the in-topic run card. */
 export const RC = {
   stop: 'run.stop',
-  settings: 'run.settings',
-  model: 'run.model',
-  effort: 'run.effort',
 } as const;
 
-export type RunStatus = 'running' | 'done' | 'error' | 'timeout';
+const REASONING_MAX = 1500;
+/** Collapse N tool calls into one summary panel at/above this count. */
+const COLLAPSE_TOOL_THRESHOLD = 3;
 
-const EFFORT_LABEL: Record<ReasoningEffort, string> = {
-  none: '无',
-  minimal: '极简',
-  low: '低',
-  medium: '中',
-  high: '高',
-  xhigh: '极高',
-};
-
-/** Everything needed to render (and re-render) one run card. */
+/** Routing + render inputs for one run card. */
 export interface RunCardState {
-  /** rendered body markdown (RunRender.markdown()) */
-  body: string;
-  status: RunStatus;
-  model?: string;
-  effort?: ReasoningEffort;
-  cwd?: string;
-  branch?: string;
+  rs: RunState;
   /** identity for ⏹ stop routing (the card's own messageId) */
   cardKey?: string;
-  /** topic thread id for ⚙️ settings routing (known after topic created) */
+  /** topic thread id (known after the topic is created) */
   threadId?: string;
-  /** who started this run — only they (or an admin) may ⏹/⚙️ it (design §5) */
+  /** who started this run — only they (or an admin) may ⏹ it (design §5) */
   requesterOpenId?: string;
-  /** ⚙️ settings panel open */
-  expanded?: boolean;
-  models?: ModelInfo[];
-  /** transient confirmation under the settings panel */
-  settingsNote?: string;
+  /** drop tool blocks from the render (pref) */
+  showTools?: boolean;
 }
 
-function headerTitle(state: RunCardState): string {
-  const model = state.models?.find((m) => m.id === state.model);
-  const name = model?.displayName ?? state.model ?? 'codex';
-  const eff = state.effort ? ` · effort：${EFFORT_LABEL[state.effort]}` : '';
-  return `🤖 ${name}${eff}`;
-}
+/**
+ * Render the run card from its structured state (no header; reasoning + tool
+ * calls as collapsible panels; text streams in order). Modeled on
+ * zara/feishu-claude-code-bridge `src/card/run-renderer.ts`. While running the
+ * card carries streaming_mode so whole-card updates animate the text delta.
+ */
+export function buildRunCard(rc: RunCardState): CardObject {
+  const state = rc.rs;
+  const running = state.terminal === 'running';
+  const elements: CardElement[] = [];
 
-/** Build the run card. While running → ⏹ 中止; once终态 → ⚙️ 设置(挂最新卡).
- * The body is a streamed markdown element so the run card can use Feishu's
- * native typewriter (see {@link RunCardStream}); while running the card is
- * marked streaming so cardElement.content pushes animate. */
-export function buildRunCard(state: RunCardState): CardObject {
-  const running = state.status === 'running';
-  const elements = [mdStream(state.body || '✍️ 正在输出…', RUN_BODY_ELEMENT_ID)];
+  const reasoning = reasoningContent(state);
+  if (reasoning) elements.push(reasoningPanel(reasoning, state.reasoningActive));
 
-  if (state.status === 'running') {
-    if (state.cardKey) {
-      elements.push(actions([button('⏹ 中止', { a: RC.stop, m: state.cardKey }, 'danger')]));
-    }
-  } else if (state.threadId) {
-    // terminal: offer ⚙️ settings on this (the latest) card
-    if (state.expanded) {
-      const models = (state.models ?? []).filter((m) => !m.hidden);
-      const cur = state.models?.find((m) => m.id === state.model);
-      const efforts = cur?.supportedEfforts.length ? cur.supportedEfforts : (['low', 'medium', 'high'] as ReasoningEffort[]);
-      elements.push(hr());
-      elements.push(note(metaNote(state)));
-      elements.push(
-        actions([
-          selectStatic({
-            actionId: RC.model,
-            placeholder: '模型',
-            initial: state.model,
-            options: models.map((m) => ({ label: m.displayName, value: m.id })),
-          }),
-          selectStatic({
-            actionId: RC.effort,
-            placeholder: 'effort',
-            initial: state.effort,
-            options: efforts.map((e) => ({ label: `effort：${EFFORT_LABEL[e]}`, value: e })),
-          }),
-        ]),
-      );
-      if (state.settingsNote) elements.push(note(state.settingsNote));
-      elements.push(actions([button('⬆️ 收起设置', { a: RC.settings, t: state.threadId })]));
+  const blocks = rc.showTools === false ? state.blocks.filter((b) => b.kind !== 'tool') : state.blocks;
+  for (const group of groupBlocks(blocks)) {
+    if (group.kind === 'text') {
+      if (group.content.trim()) elements.push(md(group.content));
     } else {
-      elements.push(actions([button('⚙️ 设置', { a: RC.settings, t: state.threadId })]));
+      elements.push(...renderToolGroup(group.tools, !running));
     }
   }
 
-  const template: HeaderTemplate =
-    state.status === 'error' || state.status === 'timeout'
-      ? 'red'
-      : running
-        ? 'turquoise'
-        : 'grey';
-  return card(elements, { header: { title: headerTitle(state), template }, streaming: running });
+  if (state.terminal === 'interrupted') {
+    elements.push(noteMd('_⏹ 已被中断_'));
+  } else if (state.terminal === 'idle_timeout') {
+    elements.push(noteMd(`_⏱ ${state.idleTimeoutMinutes ?? 0} 分钟无响应，已自动终止_`));
+  } else if (state.terminal === 'error' && state.errorMsg) {
+    elements.push(noteMd(`⚠️ agent 失败：${state.errorMsg}`));
+  } else if (state.terminal === 'done' && elements.length === 0) {
+    elements.push(noteMd('_（未返回内容）_'));
+  }
+
+  if (running) {
+    if (state.footer) elements.push(footerStatus(state.footer));
+    if (rc.cardKey) elements.push(actions([button('⏹ 终止', { a: RC.stop, m: rc.cardKey }, 'danger')]));
+  }
+
+  return card(elements, { streaming: running, summary: summaryText(state) });
 }
 
-/** A plain (button-less) version — used to demote a previous turn's card. */
-export function buildRunCardPlain(state: RunCardState): CardObject {
-  return card([md(state.body || ' ')], { header: { title: headerTitle(state), template: 'grey' } });
+/** Button-less version — used to demote a previous turn's card. */
+export function buildRunCardPlain(rc: RunCardState): CardObject {
+  return buildRunCard({ ...rc, cardKey: undefined });
 }
 
-function metaNote(state: RunCardState): string {
-  const parts: string[] = [];
-  if (state.cwd) parts.push(`📂 \`${state.cwd}\``);
-  if (state.branch) parts.push(`🌿 ${state.branch}`);
-  parts.push('改动下一轮生效');
-  return parts.join('   ');
+interface ToolGroup {
+  kind: 'tools';
+  tools: ToolEntry[];
+}
+interface TextGroup {
+  kind: 'text';
+  content: string;
+}
+type Group = ToolGroup | TextGroup;
+
+function* groupBlocks(blocks: Block[]): Generator<Group> {
+  let toolBuf: ToolEntry[] = [];
+  for (const b of blocks) {
+    if (b.kind === 'tool') {
+      toolBuf.push(b.tool);
+    } else {
+      if (toolBuf.length > 0) {
+        yield { kind: 'tools', tools: toolBuf };
+        toolBuf = [];
+      }
+      yield { kind: 'text', content: b.content };
+    }
+  }
+  if (toolBuf.length > 0) yield { kind: 'tools', tools: toolBuf };
+}
+
+function renderToolGroup(tools: ToolEntry[], finalized: boolean): CardElement[] {
+  if (tools.length === 0) return [];
+  if (tools.length < COLLAPSE_TOOL_THRESHOLD) {
+    return tools.map((t) => toolPanel(t, false));
+  }
+  if (finalized) return [collapsedToolSummary(tools, true)];
+  // running: collapse prior tools into a summary, keep the latest one visible
+  const prior = tools.slice(0, -1);
+  const latest = tools[tools.length - 1];
+  const out: CardElement[] = [];
+  if (prior.length > 0) out.push(collapsedToolSummary(prior, false));
+  if (latest) out.push(toolPanel(latest, true));
+  return out;
+}
+
+function reasoningPanel(content: string, active: boolean): CardElement {
+  return collapsiblePanel({
+    title: active ? '🧠 **思考中**' : '🧠 **思考完成，点击查看**',
+    expanded: active,
+    border: 'grey',
+    body: truncate(content, REASONING_MAX),
+  });
+}
+
+function toolPanel(tool: ToolEntry, expanded: boolean): CardElement {
+  return collapsiblePanel({
+    title: toolHeaderText(tool),
+    expanded,
+    border: tool.status === 'error' ? 'red' : 'grey',
+    body: toolBodyMd(tool) || '_无输出_',
+  });
+}
+
+/**
+ * N tool calls as one collapsed panel — only the per-tool header line is kept
+ * (no bodies). Nesting full output panels can blow past Feishu's ~30KB
+ * per-element limit and 400 the whole card stream.
+ */
+function collapsedToolSummary(tools: ToolEntry[], finalized: boolean): CardElement {
+  const suffix = finalized ? '（已结束）' : '';
+  return collapsiblePanel({
+    title: `☕ **${tools.length} 个工具调用${suffix}**`,
+    expanded: false,
+    border: 'blue',
+    body: tools.map((t) => `- ${toolHeaderText(t)}`).join('\n'),
+  });
+}
+
+function footerStatus(status: Exclude<FooterStatus, null>): CardElement {
+  const text = status === 'thinking' ? '🧠 正在思考' : status === 'tool_running' ? '🧰 正在调用工具' : '✍️ 正在输出';
+  return noteMd(text);
+}
+
+function summaryText(state: RunState): string {
+  if (state.terminal === 'interrupted') return '已中断';
+  if (state.terminal === 'idle_timeout') return '已超时';
+  if (state.terminal === 'error') return '出错';
+  if (state.terminal === 'done') return '已完成';
+  if (state.footer === 'tool_running') return '正在调用工具';
+  if (state.footer === 'streaming') return '正在输出';
+  return '思考中';
+}
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n)}…` : s;
 }

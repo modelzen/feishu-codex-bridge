@@ -50,7 +50,7 @@ worker 靠 `send_message` 才算"说话"，stdout 不可见。
 派任务 `send_message(team,"@<name> ...")` · 看 worker `worker_list(team)` · 复活 `worker_add(...,on_existing="reuse")`。
 
 ## Known Pitfalls
-(空 — 出现重复失败模式时 append)
+- **`onMessage`/卡片回调里禁止 `await` 整轮 codex run**：`@larksuiteoapi/node-sdk` 的 SafetyPipeline 按 **chatId** 串行排队**所有**事件（消息 + `card.action.trigger` 共用一条 FIFO，`queueEnabled` 默认 true）。一个话题群 = 一个 chatId，所以 handler 一旦 await 长 run，就占住整条队列 → 同群其他话题不响应、⏹ 终止按钮排在队尾点了没反应。必须 **detach**（`void withTrace(async …)` 后台跑，handler 立即返回）。同话题双启动用同步预占 `active[threadId]` 防护。
 
 ## Style Decisions
 (空 — 用户表达 taste 偏好时记)

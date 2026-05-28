@@ -64,13 +64,15 @@ export interface ManagedCardSendResult {
 /**
  * Create a CardKit entity and send a message referencing it. With `replyTo`
  * the card threads under the triggering message (im.v1.message.reply);
- * otherwise it posts top-level into `chatId`.
+ * otherwise it posts top-level into `chatId`. Pass `replyInThread` when the
+ * triggering message lives in a topic and the card should stay in it.
  */
 export async function sendManagedCard(
   channel: LarkChannel,
   chatId: string,
   card: object,
   replyTo?: string,
+  replyInThread = false,
 ): Promise<ManagedCardSendResult> {
   stampRenderToken(card);
   const created = await channel.rawClient.cardkit.v1.card.create({
@@ -86,7 +88,7 @@ export async function sendManagedCard(
   if (replyTo) {
     const sent = await channel.rawClient.im.v1.message.reply({
       path: { message_id: replyTo },
-      data: { msg_type: 'interactive', content },
+      data: { msg_type: 'interactive', content, reply_in_thread: replyInThread },
     });
     messageId = (sent as { data?: { message_id?: string } }).data?.message_id;
   } else {

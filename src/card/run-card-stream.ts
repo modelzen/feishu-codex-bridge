@@ -2,24 +2,20 @@ import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
 import type { CardObject } from './cards';
 
-/** element_id of the streaming body markdown element on a run card. */
-export const RUN_BODY_ELEMENT_ID = 'run_body';
-
-/** Min gap between native typewriter pushes (cardElement.content rate cap 50/s). */
-const STREAM_THROTTLE_MS = 120;
+/** Min gap between throttled whole-card stream updates (card.update rate cap). */
+const STREAM_THROTTLE_MS = 250;
 
 /**
- * A run card backed by a single CardKit 2.0 entity. The body markdown element
- * ({@link RUN_BODY_ELEMENT_ID}) streams with Feishu's native typewriter via
- * cardkit.v1.cardElement.content; structural changes (header/buttons/terminal/
- * settings panel) go through whole-card updates (cardkit.v1.card.update). All
- * operations share one strictly-increasing `seq` per card — Feishu rejects
- * out-of-order updates.
+ * A run card backed by a single CardKit 2.0 entity. The whole card is
+ * re-rendered from {@link RunState} each tick and pushed via
+ * cardkit.v1.card.update; while running the card carries streaming_mode so
+ * Feishu animates the markdown delta between pushes (native typewriter feel)
+ * and collapsible panels (reasoning / tools) re-render cleanly. All updates
+ * share one strictly-increasing `seq` — Feishu rejects out-of-order updates.
  *
- * Unlike im.v1.message.patch (which only does unconditional, no-interaction
- * updates and silently reverts a card touched during a click's callback
- * window), this is the correct surface for a card that both streams output and
- * carries clickable controls.
+ * Unlike im.v1.message.patch (unconditional, reverts a card touched during a
+ * click's callback window), this is the correct surface for a card that both
+ * streams and carries clickable controls (⏹).
  */
 export class RunCardStream {
   private cardId = '';
@@ -27,7 +23,6 @@ export class RunCardStream {
   private seq = 0;
   private lastPush = 0;
   private lastContent = '';
-  private streaming = false;
 
   get messageId(): string {
     return this._messageId;
@@ -49,7 +44,7 @@ export class RunCardStream {
       throw new Error(`cardkit.card.create returned no card_id: ${JSON.stringify(created).slice(0, 200)}`);
     }
     this.cardId = cardId;
-    this.streaming = true; // initial run card is built with streaming_mode: true
+    this.lastContent = JSON.stringify(initialCard);
 
     const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
     let messageId: string | undefined;
@@ -71,31 +66,32 @@ export class RunCardStream {
     return messageId;
   }
 
-  /** Push body text with the typewriter. Throttled; `force` flushes regardless. */
-  async streamBody(channel: LarkChannel, content: string, force = false): Promise<void> {
-    if (!this.cardId || !this.streaming) return;
-    if (content === this.lastContent) return;
+  /** Throttled whole-card stream update. Skips identical/too-soon pushes;
+   * `force` flushes regardless (still de-duped on content). */
+  async streamCard(channel: LarkChannel, fullCard: CardObject, force = false): Promise<void> {
+    if (!this.cardId) return;
+    const data = JSON.stringify(fullCard);
+    if (data === this.lastContent) return;
     const now = Date.now();
     if (!force && now - this.lastPush < STREAM_THROTTLE_MS) return;
     this.lastPush = now;
-    this.lastContent = content;
+    this.lastContent = data;
     try {
-      await channel.rawClient.cardkit.v1.cardElement.content({
-        path: { card_id: this.cardId, element_id: RUN_BODY_ELEMENT_ID },
-        data: { content: content || '…', sequence: ++this.seq, uuid: `e_${this.cardId}_${this.seq}` },
+      await channel.rawClient.cardkit.v1.card.update({
+        path: { card_id: this.cardId },
+        data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `s_${this.cardId}_${this.seq}` },
       });
     } catch (err) {
       log.fail('card', err, { phase: 'run-stream', cardId: this.cardId, seq: this.seq });
     }
   }
 
-  /** Whole-card replace for structural changes (buttons, header, settings,
-   * terminal). A terminal card built with streaming off also clears the
-   * typewriter cursor, so no separate finish() call is needed. */
+  /** Forced whole-card replace for structural/terminal updates. A terminal
+   * card built with streaming off clears the typewriter cursor. */
   async updateCard(channel: LarkChannel, fullCard: CardObject): Promise<void> {
     if (!this.cardId) return;
-    this.streaming = Boolean((fullCard.config as { streaming_mode?: boolean })?.streaming_mode);
     const data = JSON.stringify(fullCard);
+    this.lastContent = data;
     const push = async (): Promise<void> => {
       await channel.rawClient.cardkit.v1.card.update({
         path: { card_id: this.cardId },
@@ -105,7 +101,7 @@ export class RunCardStream {
     try {
       await push();
     } catch (err) {
-      // A terminal update fired right as a ⏹/⚙️ click is still in its callback
+      // A terminal update fired right as a ⏹ click is still in its callback
       // window hits err 200810 ("card in ongoing interaction"). Wait out the
       // 3s window and retry once.
       log.fail('card', err, { phase: 'run-update', cardId: this.cardId, seq: this.seq, retry: true });

@@ -7,7 +7,7 @@ import {
 import type { Project } from '../project/registry';
 import type { SessionRecord } from '../bot/session-store';
 import { actions, button, card, form, hr, input, linkButton, md, note, submitButton, type CardElement, type CardObject } from './cards';
-import { relativeTime } from './session-config-card';
+import { relativeTime } from './command-cards';
 
 /** applink to open a Feishu group chat by chat_id (oc_xxx). Feishu has no
  * deep link to a specific thread/topic, so this lands in the group and the

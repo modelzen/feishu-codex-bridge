@@ -30,9 +30,11 @@ export function card(
   elements: CardElement[],
   opts: {
     header?: { title: string; template?: HeaderTemplate; subtitle?: string };
-    /** Enable native typewriter streaming (a markdown element with an
-     * element_id can then be driven via cardkit.v1.cardElement.content). */
+    /** Enable native typewriter streaming. With a streaming card, whole-card
+     * updates (cardkit.v1.card.update) animate markdown deltas between pushes. */
     streaming?: boolean;
+    /** Mobile push-notification preview text (config.summary.content). */
+    summary?: string;
   } = {},
 ): CardObject {
   const config: Record<string, unknown> = { update_multi: true };
@@ -44,6 +46,7 @@ export function card(
       print_strategy: 'fast',
     };
   }
+  if (opts.summary) config.summary = { content: opts.summary };
   const obj: CardObject = {
     schema: '2.0',
     config,
@@ -81,6 +84,41 @@ export function note(content: string): CardElement {
 
 export function hr(): CardElement {
   return { tag: 'hr' };
+}
+
+/** A small/muted markdown line (notation size) — for status & terminal notes. */
+export function noteMd(content: string): CardElement {
+  return { tag: 'markdown', content, text_size: 'notation' };
+}
+
+export type PanelBorder = 'grey' | 'red' | 'blue';
+
+/** A collapsible panel (schema 2.0 `collapsible_panel`): a markdown title with
+ * a rotating chevron, a bordered body that expands/collapses on tap. Used for
+ * reasoning ("思考") and tool-call detail so the card stays compact on mobile. */
+export function collapsiblePanel(opts: {
+  /** markdown title (e.g. `**思考完成，点击查看**`) */
+  title: string;
+  expanded: boolean;
+  border: PanelBorder;
+  /** markdown body shown when expanded */
+  body: string;
+}): CardElement {
+  return {
+    tag: 'collapsible_panel',
+    expanded: opts.expanded,
+    header: {
+      title: { tag: 'markdown', content: opts.title },
+      vertical_align: 'center',
+      icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', size: '16px 16px' },
+      icon_position: 'follow_text',
+      icon_expanded_angle: -180,
+    },
+    border: { color: opts.border, corner_radius: '5px' },
+    vertical_spacing: '8px',
+    padding: '8px 8px 8px 8px',
+    elements: [{ tag: 'markdown', content: opts.body, text_size: 'notation' }],
+  };
 }
 
 /**

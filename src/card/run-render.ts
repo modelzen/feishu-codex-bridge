@@ -1,93 +1,51 @@
 import type { AgentEvent } from '../agent/types';
-
-interface ToolLine {
-  title: string;
-  done: boolean;
-  exitCode?: number | null;
-}
+import {
+  finalizeIfRunning,
+  initialState,
+  markIdleTimeout,
+  markInterrupted,
+  reduce,
+  type RunState,
+  type Terminal,
+} from './run-state';
 
 /**
- * Accumulates AgentEvents into a markdown string for the streaming card.
- * M1: text (agentMessage items, delta-accumulated) + tool lines. Thinking
- * is folded away by default to keep the card focused.
+ * Folds AgentEvents into a structured {@link RunState} (see {@link reduce}).
+ * {@link buildRunCard} renders the snapshot — reasoning and tool calls become
+ * collapsible panels, text streams in arrival order. The whole card is
+ * re-rendered and pushed on each tick (see {@link RunCardStream}).
  */
 export class RunRender {
-  private texts = new Map<string, string>();
-  private textOrder: string[] = [];
-  private tools = new Map<string, ToolLine>();
-  private toolOrder: string[] = [];
-  private status: 'running' | 'done' | 'error' = 'running';
-  private errorMsg = '';
+  private state: RunState = initialState;
+  /** when false, tool blocks are dropped from the rendered card (pref) */
   showTools = true;
 
   apply(ev: AgentEvent): void {
-    switch (ev.type) {
-      case 'text_delta':
-        this.append(ev.itemId, ev.delta);
-        break;
-      case 'text':
-        this.texts.set(ev.itemId, ev.text);
-        if (!this.textOrder.includes(ev.itemId)) this.textOrder.push(ev.itemId);
-        break;
-      case 'tool_use':
-        if (!this.tools.has(ev.itemId)) {
-          this.tools.set(ev.itemId, { title: ev.title, done: false });
-          this.toolOrder.push(ev.itemId);
-        }
-        break;
-      case 'tool_result': {
-        const t = this.tools.get(ev.itemId);
-        if (t) {
-          t.done = true;
-          t.exitCode = ev.exitCode ?? null;
-        }
-        break;
-      }
-      case 'done':
-        this.status = 'done';
-        break;
-      case 'error':
-        this.status = 'error';
-        this.errorMsg = ev.message;
-        break;
-      default:
-        break;
-    }
+    this.state = reduce(this.state, ev);
   }
 
-  /** Current lifecycle state, for the run card's button/footer logic. */
-  state(): 'running' | 'done' | 'error' {
-    return this.status;
+  /** Current structured state for rendering. */
+  snapshot(): RunState {
+    return this.state;
   }
 
-  private append(itemId: string, delta: string): void {
-    if (!this.texts.has(itemId)) {
-      this.texts.set(itemId, '');
-      this.textOrder.push(itemId);
-    }
-    this.texts.set(itemId, (this.texts.get(itemId) ?? '') + delta);
+  /** Lifecycle terminal, for the run loop's status/logging. */
+  terminal(): Terminal {
+    return this.state.terminal;
   }
 
-  markdown(): string {
-    const parts: string[] = [];
-    if (this.showTools && this.toolOrder.length) {
-      for (const id of this.toolOrder) {
-        const t = this.tools.get(id)!;
-        const mark = t.done ? (t.exitCode && t.exitCode !== 0 ? '✗' : '✓') : '▸';
-        parts.push(`${mark} \`${truncate(t.title, 80)}\``);
-      }
-      parts.push('');
-    }
-    const body = this.textOrder.map((id) => this.texts.get(id) ?? '').join('\n').trim();
-    if (body) parts.push(body);
-
-    if (this.status === 'running') parts.push('\n✍️ 正在输出…');
-    else if (this.status === 'error') parts.push(`\n❌ ${this.errorMsg}`);
-    const out = parts.join('\n').trim();
-    return out || '✍️ 正在输出…';
+  /** Mark the run as watchdog-killed (idle timeout). */
+  timeout(minutes: number): void {
+    this.state = markIdleTimeout(this.state, minutes);
   }
-}
 
-function truncate(s: string, n: number): string {
-  return s.length > n ? `${s.slice(0, n)}…` : s;
+  /** Mark the run as user-interrupted (⏹). */
+  interrupt(): void {
+    this.state = markInterrupted(this.state);
+  }
+
+  /** Force a terminal state if the stream ended without done/error. */
+  finalize(): void {
+    this.state = finalizeIfRunning(this.state);
+  }
 }
