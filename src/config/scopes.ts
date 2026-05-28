@@ -19,6 +19,7 @@ export const REQUIRED_SCOPES = [
   // we list those — not the umbrellas (which would be un-grantable + would make
   // the scope check false-positive).
   'im:message.group_at_msg:readonly', // @bot messages in project groups
+  'im:message.group_msg', // ALL group messages (高敏感) — required for 免@ (respond without @)
   'im:message.p2p_msg:readonly', // DM console messages
   'im:message:send_as_bot', // reply_in_thread / send cards
   'im:resource', // upload images / resources

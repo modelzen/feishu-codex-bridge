@@ -27,6 +27,13 @@ export async function startBridge(opts: BridgeOptions): Promise<LarkChannel> {
     // surface raw events so card-action handlers can read form submissions
     // (action.form_value) — used by the new-project form.
     includeRawEvent: true,
+    // Deliver ALL group messages (not just @bot) to `onMessage`. The SDK's
+    // PolicyGate otherwise drops non-@ group messages with reason 'no_mention'
+    // before they reach us, which would make 免@ impossible. We turn the SDK
+    // filter off and let our per-project gate (shouldRespondWithoutMention in
+    // handle-message) be the single source of truth for 免@. Non-@ delivery
+    // still requires the im:message.group_msg scope (Feishu-side push).
+    policy: { requireMention: false },
   });
 
   const orchestrator = createOrchestrator(channel, opts.cfg, opts.fallbackCwd);

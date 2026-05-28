@@ -13,6 +13,8 @@ export interface CreateProjectInput {
   ownerOpenId: string;
   /** when set, bind this existing folder; otherwise create a blank project. */
   existingPath?: string;
+  /** session model for the group (default 'multi'). */
+  kind?: 'multi' | 'single';
 }
 
 /**
@@ -48,7 +50,7 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
   if (!chatId) throw new Error(`建群失败：${JSON.stringify(res).slice(0, 200)}`);
 
   // 3. register
-  const project: Project = { name, chatId, cwd, blank, createdAt: Date.now() };
+  const project: Project = { name, chatId, cwd, blank, createdAt: Date.now(), kind: input.kind ?? 'multi' };
   await addProject(project);
   log.info('project', 'create', { name, chatId, cwd, blank });
 

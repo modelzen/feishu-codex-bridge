@@ -32,14 +32,16 @@ import { RunCardStream } from '../card/run-card-stream';
 import { log, withTrace } from '../core/logger';
 import {
   buildDmMenuCard,
+  buildGroupSettingsCard,
   buildNewProjectDoneCard,
   buildNewProjectFormCard,
   buildProjectListCard,
   buildRmConfirmCard,
   buildSettingsCard,
   DM,
+  GS,
 } from '../card/dm-cards';
-import { getProjectByChatId, listProjects, removeProject } from '../project/registry';
+import { getProjectByChatId, listProjects, removeProject, updateProject, type Project } from '../project/registry';
 import { createProject } from '../project/lifecycle';
 import { refreshBranch } from '../project/announcement';
 import { transferOwnership } from '../project/group-ops';
@@ -85,6 +87,12 @@ export interface Orchestrator {
  *   group @bot /resume        → history picker → resume a codex thread in a new topic.
  *   group @bot, inside thread → a turn in that session (steer/queue mid-turn);
  *                               /model opens the model/effort picker for it.
+ *
+ * Group kinds (project.kind): 'multi' (default) = a topic per session, keyed by
+ * threadId (the flow above); 'single' = the whole group is one session keyed by
+ * chatId, replies quote the message (no topic, runs serialize). 免@ (noMention,
+ * default on) lets non-@ messages run too — multi only inside a topic, single
+ * whole-group (needs the im:message.group_msg scope). @bot /settings toggles it.
  */
 export function createOrchestrator(
   channel: LarkChannel,
@@ -187,7 +195,11 @@ export function createOrchestrator(
       await handleDmConsole(channel, cfg, msg);
       return;
     }
-    if (!msg.mentionedBot) return;
+
+    const project = await getProjectByChatId(msg.chatId);
+    // @门：没 @ 时只在「项目群 + 免@ 适用」才响应。免@默认开,但 multi 仅话题内、
+    // single 整群;非项目群一律不响应非 @ 消息。
+    if (!msg.mentionedBot && !(project && shouldRespondWithoutMention(project, msg))) return;
     if (!isChatAllowed(cfg, msg.chatId) || !isUserAllowed(cfg, msg.senderId)) {
       log.info('intake', 'reject', { reason: 'not_allowed', chatId: msg.chatId.slice(-6) });
       return;
@@ -196,13 +208,31 @@ export function createOrchestrator(
     const text = msg.content.trim();
     const cmd = parseCommand(text);
 
-    // Inside a topic → a turn in that session (or /model to tune it).
-    if (msg.threadId) {
+    // /settings: open the in-group settings card (群类型只读 + 免@ 开关).
+    if (cmd === 'settings') {
+      await postGroupSettings(msg, project);
+      return;
+    }
+
+    // Single-session group: the whole group is one session keyed by chatId. No
+    // topics — reply by quoting (引用回复); runs serialize per chatId (active[chatId]).
+    if ((project?.kind ?? 'multi') === 'single') {
       if (cmd === 'model') {
-        await postModelCard(msg);
+        await postModelCard(msg, msg.chatId);
         return;
       }
-      await handleThreadTurn(msg, text);
+      // /resume not supported in single (no topic list); anything else = a turn.
+      handleTurn(msg, text, msg.chatId, true, project);
+      return;
+    }
+
+    // Multi (default): inside a topic → a turn in that session (or /model to tune it).
+    if (msg.threadId) {
+      if (cmd === 'model') {
+        await postModelCard(msg, msg.threadId);
+        return;
+      }
+      handleTurn(msg, text, msg.threadId, false, project);
       return;
     }
     // Main group area: /resume opens the history picker; /model only makes
@@ -217,20 +247,58 @@ export function createOrchestrator(
         .catch(() => undefined);
       return;
     }
-    startTopicDirectly(msg, text);
+    startTopicDirectly(msg, text, project);
   };
 
-  /** Parse a leading slash command (`/resume`, `/model`); null otherwise. */
-  function parseCommand(text: string): 'resume' | 'model' | null {
+  /** Parse a leading slash command (`/resume`, `/model`, `/settings`); null otherwise. */
+  function parseCommand(text: string): 'resume' | 'model' | 'settings' | null {
     const m = /^\/(\w+)/.exec(text);
     const name = m?.[1]?.toLowerCase();
-    return name === 'resume' || name === 'model' ? name : null;
+    return name === 'resume' || name === 'model' || name === 'settings' ? name : null;
   }
 
-  async function handleThreadTurn(msg: NormalizedMessage, text: string): Promise<void> {
-    const threadId = msg.threadId!;
+  /** Whether to respond to a non-@ message in a project group (免@ default on).
+   * multi: only inside a topic (开新话题 still needs @); single: whole group. */
+  function shouldRespondWithoutMention(project: Project, msg: NormalizedMessage): boolean {
+    if (!(project.noMention ?? true)) return false;
+    if ((project.kind ?? 'multi') === 'single') return true;
+    return Boolean(msg.threadId);
+  }
+
+  /** @bot /settings in a group: post the in-group settings card (admin-gated). */
+  async function postGroupSettings(msg: NormalizedMessage, project?: Project): Promise<void> {
+    if (!isAdmin(cfg, msg.senderId)) {
+      await channel
+        .send(msg.chatId, { markdown: '仅管理员可改群设置。' }, { replyTo: msg.messageId })
+        .catch(() => undefined);
+      return;
+    }
+    if (!project) {
+      await channel
+        .send(msg.chatId, { markdown: '本群未绑定项目，请先在私聊里新建项目。' }, { replyTo: msg.messageId })
+        .catch(() => undefined);
+      return;
+    }
+    await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
+      await sendManagedCard(channel, msg.chatId, buildGroupSettingsCard(project), msg.messageId);
+      log.info('card', 'group-settings', { project: project.name });
+    });
+  }
+
+  /**
+   * A turn in a session keyed by `sessionKey` — the topic's threadId (multi) or
+   * the chatId (single, `flat`). steer/queue mid-turn; otherwise reserve + run.
+   * `flat` = reply by quoting (no reply_in_thread / topic), for single groups.
+   */
+  async function handleTurn(
+    msg: NormalizedMessage,
+    text: string,
+    sessionKey: string,
+    flat: boolean,
+    project?: Project,
+  ): Promise<void> {
     // Mid-turn: steer (引导) or queue (排队).
-    const existing = active.get(threadId);
+    const existing = active.get(sessionKey);
     if (existing) {
       if (getPendingPolicy(cfg) === 'steer' && existing.run && existing.thread) {
         const tid = existing.run.turnId();
@@ -249,26 +317,25 @@ export function createOrchestrator(
       return;
     }
 
-    // Reserve the topic synchronously (before any await) so a second message
+    // Reserve the session synchronously (before any await) so a second message
     // racing in through the SDK's per-chatId queue sees it and queues instead
     // of double-launching. Then run **detached**: onMessage must return fast or
     // it holds the chatId queue for the whole codex run, blocking sibling
     // topics and the ⏹ card-action (design: 话题=独立 session，应并行).
     const reserved: ActiveState = { queue: [], requesterOpenId: msg.senderId };
-    active.set(threadId, reserved);
+    active.set(sessionKey, reserved);
     void withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       const reaction = runReaction(msg.messageId, !sema.hasFree());
       try {
-        let thread = await resolveThread(threadId, msg.chatId);
+        let thread = await resolveThread(sessionKey, msg.chatId);
         if (!thread) {
-          // Unknown topic (created before this bridge, or store lost): treat as
+          // Unknown session (created before this bridge, or store lost): treat as
           // a fresh session bound to the resolved cwd.
-          const project = await getProjectByChatId(msg.chatId);
           const cwd = project?.cwd ?? fallbackCwd;
           thread = await backend.startThread({ cwd });
-          sessions.set(threadId, thread);
+          sessions.set(sessionKey, thread);
           await upsertSession({
-            threadId,
+            threadId: sessionKey,
             chatId: msg.chatId,
             cwd,
             codexThreadId: thread.codexThreadId,
@@ -279,15 +346,24 @@ export function createOrchestrator(
         }
         reserved.thread = thread;
         await launchRun(
-          { chatId: msg.chatId, replyTo: msg.messageId, thread, firstText: text, knownThreadId: threadId, requesterOpenId: msg.senderId },
+          {
+            chatId: msg.chatId,
+            replyTo: msg.messageId,
+            replyInThread: !flat,
+            flat,
+            thread,
+            firstText: text,
+            knownThreadId: sessionKey,
+            requesterOpenId: msg.senderId,
+          },
           reaction,
         );
       } catch (err) {
-        active.delete(threadId); // release the reservation so the topic isn't wedged
+        active.delete(sessionKey); // release the reservation so the session isn't wedged
         reaction.done();
         log.fail('intake', err);
         await channel
-          .send(msg.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: msg.messageId, replyInThread: true })
+          .send(msg.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: msg.messageId, replyInThread: !flat })
           .catch(() => undefined);
       }
     });
@@ -319,16 +395,15 @@ export function createOrchestrator(
   }
 
   /** Group @bot (no topic): create the topic + run with the default model.
-   * Detached — onMessage must return fast (see {@link handleThreadTurn}); a new
+   * Detached — onMessage must return fast (see {@link handleTurn}); a new
    * topic has a unique reply target so no same-topic reservation is needed. */
-  function startTopicDirectly(msg: NormalizedMessage, text: string): void {
+  function startTopicDirectly(msg: NormalizedMessage, text: string, project?: Project): void {
     void withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       // 🫳 Typing on receive (⏳ OneSecond if a slot isn't free) → ✅ DONE once
       // the topic is created (onTopicCreated, below). For this path the acked
       // action is "建话题", not the full reply — so DONE fires on first card,
-      // unlike an in-topic turn (see handleThreadTurn).
+      // unlike an in-topic turn (see handleTurn).
       const reaction = runReaction(msg.messageId, !sema.hasFree());
-      const project = await getProjectByChatId(msg.chatId);
       const cwd = project?.cwd ?? fallbackCwd;
       // lazy banner branch refresh (design §3.2) — best-effort, non-blocking
       if (project) void refreshBranch(channel, project).catch(() => undefined);
@@ -387,15 +462,15 @@ export function createOrchestrator(
     });
   }
 
-  /** Topic @bot /model: post the model/effort picker for the current session. */
-  async function postModelCard(msg: NormalizedMessage): Promise<void> {
+  /** @bot /model: post the model/effort picker for the session keyed by
+   * `sessionKey` (topic threadId for multi, chatId for single). */
+  async function postModelCard(msg: NormalizedMessage, sessionKey: string): Promise<void> {
     await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
-      const threadId = msg.threadId!;
-      const [models, rec] = await Promise.all([listModels(), getSession(threadId)]);
+      const [models, rec] = await Promise.all([listModels(), getSession(sessionKey)]);
       const def = pickDefault(models);
       const state: ModelCardState = {
         chatId: msg.chatId,
-        threadId,
+        threadId: sessionKey,
         requesterOpenId: msg.senderId,
         models,
         model: rec?.model ?? def.model,
@@ -405,7 +480,7 @@ export function createOrchestrator(
       const res = await sendManagedCard(channel, msg.chatId, buildModelCard(state), msg.messageId, true);
       pruneModelPending();
       modelPending.set(res.messageId, state);
-      log.info('card', 'model', { threadId, model: state.model, effort: state.effort });
+      log.info('card', 'model', { threadId: sessionKey, model: state.model, effort: state.effort });
     });
   }
 
@@ -597,11 +672,12 @@ export function createOrchestrator(
     .on(DM.newProject, ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) patch(evt, buildNewProjectFormCard());
     })
-    .on(DM.newProjectSubmit, ({ evt, formValue }) => {
+    .on(DM.newProjectSubmit, ({ evt, formValue, value }) => {
       const op = evt.operator?.openId;
       if (!dmAdmin(op)) return;
       const name = String((formValue?.name as string) ?? '').trim();
       const cwdIn = String((formValue?.cwd as string) ?? '').trim();
+      const kind: 'multi' | 'single' = value.kind === 'single' ? 'single' : 'multi';
       // A submitted form locks its card_id (its buttons — retry/返回 on an error
       // re-render — stop firing, and an in-place update no-ops). So the result
       // goes to a *fresh* card; the submitted form stays above as a 留痕. Detach
@@ -612,7 +688,7 @@ export function createOrchestrator(
         else if (!op) result = buildNewProjectFormCard({ name, cwd: cwdIn, error: '无法识别操作者身份' });
         else {
           try {
-            const p = await createProject(channel, { name, ownerOpenId: op, existingPath: cwdIn || undefined });
+            const p = await createProject(channel, { name, ownerOpenId: op, existingPath: cwdIn || undefined, kind });
             log.info('console', 'new-project', { name: p.name, blank: p.blank });
             result = buildNewProjectDoneCard(p);
           } catch (err) {
@@ -697,6 +773,20 @@ export function createOrchestrator(
     .on(DM.setConcurrency, ({ evt, value }) => {
       const n = Number(value.v);
       if (Number.isFinite(n)) applyPref(evt, (p) => (p.maxConcurrentRuns = n));
+    })
+    // In-group settings: toggle 免@ for the project bound to evt.chatId. Admin-gated.
+    .on(GS.setNoMention, ({ evt, value }) => {
+      if (!isAdmin(cfg, evt.operator?.openId ?? '')) return;
+      const on = value.v === 'on';
+      patch(evt, async () => {
+        const project = await getProjectByChatId(evt.chatId);
+        if (project) {
+          await updateProject(project.name, { noMention: on });
+          log.info('console', 'group-nomention', { project: project.name, on });
+          return buildGroupSettingsCard({ ...project, noMention: on });
+        }
+        return buildGroupSettingsCard({ name: '本群', kind: 'multi', noMention: on });
+      });
     });
 
   /**
@@ -749,6 +839,8 @@ export function createOrchestrator(
     summary?: string;
     /** who triggered this run (for ⏹/⚙️ ownership gating) */
     requesterOpenId?: string;
+    /** single-session group: reply by quoting (no reply_in_thread / topic). */
+    flat?: boolean;
   }
 
   async function launchRun(
@@ -761,7 +853,7 @@ export function createOrchestrator(
     let firstCardSent = false;
     let activeKey = opts.knownThreadId ?? `pending:${opts.replyTo}`;
     let topicThreadId = opts.knownThreadId;
-    // Reuse the reservation handleThreadTurn made for this topic (so messages
+    // Reuse the reservation handleTurn made for this session (so messages
     // queued during startup aren't lost); fall back to a fresh state otherwise.
     const state: ActiveState = active.get(activeKey) ?? { queue: [], requesterOpenId: opts.requesterOpenId };
     state.thread = opts.thread;
@@ -804,7 +896,7 @@ export function createOrchestrator(
     try {
       let turnText = opts.firstText;
       let replyTo = opts.replyTo;
-      let replyInThread = opts.replyInThread ?? Boolean(opts.knownThreadId);
+      let replyInThread = opts.flat ? false : (opts.replyInThread ?? Boolean(opts.knownThreadId));
       for (;;) {
         // per-turn model/effort: prefer latest persisted (⚙️ may have changed it)
         const rec = topicThreadId ? await getSession(topicThreadId) : undefined;
@@ -916,7 +1008,7 @@ export function createOrchestrator(
         promoteCard(finalMsgId, rc);
         if (topicThreadId) await patchSession(topicThreadId, { updatedAt: Date.now() });
         replyTo = finalMsgId;
-        replyInThread = true; // stay in the topic for queued turns
+        replyInThread = !opts.flat; // stay in the topic for queued turns (single: stay flat)
         log.info('card', 'final', { terminal: render.terminal() });
 
         // A kill (⏹ / watchdog) stops the whole run — drop any queued follow-ups
@@ -928,7 +1020,7 @@ export function createOrchestrator(
     } catch (err) {
       log.fail('intake', err);
       await channel
-        .send(opts.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: opts.replyTo, replyInThread: true })
+        .send(opts.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
         .catch(() => undefined);
     } finally {
       active.delete(activeKey);

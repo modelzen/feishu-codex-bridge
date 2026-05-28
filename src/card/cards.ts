@@ -185,10 +185,15 @@ export function form(name: string, elements: CardElement[]): CardElement {
 
 /** A button that submits its enclosing form — its click callback carries the
  * collected `form_value`. */
-export function submitButton(label: string, value: ActionValue, type: ButtonType = 'primary'): CardElement {
+export function submitButton(
+  label: string,
+  value: ActionValue,
+  type: ButtonType = 'primary',
+  name = 'submit',
+): CardElement {
   return {
     tag: 'button',
-    name: 'submit',
+    name,
     text: { tag: 'plain_text', content: label },
     type,
     form_action_type: 'submit',

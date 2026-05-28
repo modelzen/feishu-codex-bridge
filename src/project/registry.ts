@@ -15,6 +15,12 @@ export interface Project {
   createdAt: number;
   /** last branch shown in the announcement (for lazy change detection) */
   branch?: string;
+  /** group session model: 'multi' (default) = a topic per session (现状);
+   * 'single' = the whole group is one session keyed by chatId. */
+  kind?: 'multi' | 'single';
+  /** respond to non-@ messages too. Read as `noMention ?? true` (default on).
+   * multi: only inside a topic; single: whole group. Needs im:message.group_msg. */
+  noMention?: boolean;
 }
 
 interface StoreFile {
