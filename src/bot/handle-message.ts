@@ -54,6 +54,18 @@ interface ActiveState {
   queue: string[];
   /** who started this run — gates destructive ⏹ (design §5) */
   requesterOpenId?: string;
+  /** ⏹ 终止: abort the codex turn AND end the local consume loop. Set per-turn
+   * while a run is in flight; codex emits no mappable terminal on interrupt, so
+   * the loop must be stopped locally rather than waiting on the backend. */
+  interrupt?: () => void;
+}
+
+/** Message-reaction lifecycle controller (see {@link runReaction}). */
+interface RunReaction {
+  /** the run acquired a concurrency slot and is now running → Typing */
+  started: () => void;
+  /** the run ended (complete / ⏹ / timeout / error) → DONE */
+  done: () => void;
 }
 
 export interface Orchestrator {
@@ -111,9 +123,8 @@ export function createOrchestrator(
   }
 
   // Feishu gives bots no way to mark a message "已读" (read receipts are a
-  // human-client signal), so we stand in a reaction: 🫳 Typing while the run is
-  // being set up, swapped to ✅ DONE once its run card is live. Best-effort —
-  // a missing im:message.reaction:write scope just means no reaction appears.
+  // human-client signal), so a reaction stands in for one. Best-effort — a
+  // missing im:message.reaction:write scope just means no reaction appears.
   async function addReaction(messageId: string, emoji: string): Promise<string | undefined> {
     try {
       const r = await channel.rawClient.im.v1.messageReaction.create({
@@ -131,18 +142,35 @@ export function createOrchestrator(
       .delete({ path: { message_id: messageId, reaction_id: reactionId } })
       .catch((err) => log.fail('card', err, { phase: 'reaction-del' }));
   }
-  /** Mark a message "正在处理" (Typing); returns a one-shot to flip it to DONE. */
-  function ackReaction(messageId: string): () => void {
-    const typingPromise = addReaction(messageId, 'Typing');
-    let fired = false;
-    return () => {
-      if (fired) return;
-      fired = true;
-      void (async () => {
-        const id = await typingPromise;
-        if (id) removeReaction(messageId, id);
-        await addReaction(messageId, 'DONE');
-      })();
+
+  /**
+   * Reaction lifecycle on the triggering message: ⏳ OneSecond while the run
+   * waits for a free concurrency slot, 🫳 Typing while it's actually running,
+   * ✅ DONE when it ends (complete / ⏹ 终止 / timeout / error). Transitions are
+   * serialized through `chain` so each swap removes the prior emoji first.
+   */
+  function runReaction(messageId: string, queued: boolean): RunReaction {
+    let chain: Promise<string | undefined> = addReaction(messageId, queued ? 'OneSecond' : 'Typing');
+    let phase = queued ? 0 : 1; // 0 = waiting(OneSecond), 1 = running(Typing), 2 = done(DONE)
+    const swap = (emoji: string): void => {
+      chain = chain.then(async (prevId) => {
+        if (prevId) removeReaction(messageId, prevId);
+        return addReaction(messageId, emoji);
+      });
+    };
+    return {
+      started: () => {
+        if (phase < 1) {
+          phase = 1;
+          swap('Typing');
+        }
+      },
+      done: () => {
+        if (phase < 2) {
+          phase = 2;
+          swap('DONE');
+        }
+      },
     };
   }
 
@@ -229,7 +257,7 @@ export function createOrchestrator(
     const reserved: ActiveState = { queue: [], requesterOpenId: msg.senderId };
     active.set(threadId, reserved);
     void withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
-      const markDone = ackReaction(msg.messageId);
+      const reaction = runReaction(msg.messageId, !sema.hasFree());
       try {
         let thread = await resolveThread(threadId, msg.chatId);
         if (!thread) {
@@ -252,10 +280,11 @@ export function createOrchestrator(
         reserved.thread = thread;
         await launchRun(
           { chatId: msg.chatId, replyTo: msg.messageId, thread, firstText: text, knownThreadId: threadId, requesterOpenId: msg.senderId },
-          markDone,
+          reaction,
         );
       } catch (err) {
         active.delete(threadId); // release the reservation so the topic isn't wedged
+        reaction.done();
         log.fail('intake', err);
         await channel
           .send(msg.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: msg.messageId, replyInThread: true })
@@ -294,9 +323,11 @@ export function createOrchestrator(
    * topic has a unique reply target so no same-topic reservation is needed. */
   function startTopicDirectly(msg: NormalizedMessage, text: string): void {
     void withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
-      // 🫳 Typing on receive (before the slow startThread) → ✅ DONE once the
-      // topic's first run card is live.
-      const markDone = ackReaction(msg.messageId);
+      // 🫳 Typing on receive (⏳ OneSecond if a slot isn't free) → ✅ DONE once
+      // the topic is created (onTopicCreated, below). For this path the acked
+      // action is "建话题", not the full reply — so DONE fires on first card,
+      // unlike an in-topic turn (see handleThreadTurn).
+      const reaction = runReaction(msg.messageId, !sema.hasFree());
       const project = await getProjectByChatId(msg.chatId);
       const cwd = project?.cwd ?? fallbackCwd;
       // lazy banner branch refresh (design §3.2) — best-effort, non-blocking
@@ -306,6 +337,7 @@ export function createOrchestrator(
       try {
         thread = await backend.startThread({ cwd, model, effort });
       } catch (err) {
+        reaction.done();
         log.fail('card', err, { phase: 'start-topic' });
         await channel
           .send(msg.chatId, { markdown: `❌ 启动失败：${err instanceof Error ? err.message : String(err)}` }, { replyTo: msg.messageId })
@@ -327,7 +359,8 @@ export function createOrchestrator(
           summary: text.slice(0, 80) || '(空)',
           requesterOpenId: msg.senderId,
         },
-        markDone,
+        reaction,
+        () => reaction.done(), // topic created → ✅ DONE (don't wait for the reply)
       );
     }).catch((err) => log.fail('intake', err));
   }
@@ -505,17 +538,16 @@ export function createOrchestrator(
     return op === ownerOpenId || isAdmin(cfg, op);
   };
 
-  // run card buttons (design §3.3)
+  // run card buttons (design §3.3). ⏹ aborts the codex turn AND ends the local
+  // consume loop (st.interrupt) — codex emits no mappable terminal on
+  // turn/interrupt, so waiting on the backend would hang the card forever.
   dispatcher
-    .on(RC.stop, async ({ evt, value }) => {
+    .on(RC.stop, ({ evt, value }) => {
       const key = typeof value.m === 'string' ? value.m : evt.messageId;
       const st = runsByCard.get(key);
       if (!st || !runOwnerOrAdmin(evt, st.requesterOpenId)) return;
-      const tid = st.run?.turnId();
-      if (tid && st.thread) {
-        await st.thread.abort(tid).catch(() => undefined);
-        log.info('card', 'action', { actionId: 'run.stop', aborted: tid });
-      }
+      st.interrupt?.();
+      log.info('card', 'action', { actionId: 'run.stop', stopped: Boolean(st.interrupt) });
     });
 
   // DM management console buttons (design §3.1). Admin-gated; sub-views patch
@@ -719,8 +751,13 @@ export function createOrchestrator(
     requesterOpenId?: string;
   }
 
-  async function launchRun(opts: LaunchOpts, onFirstCard?: () => void): Promise<void> {
+  async function launchRun(
+    opts: LaunchOpts,
+    reaction?: RunReaction,
+    onTopicCreated?: () => void,
+  ): Promise<void> {
     const release = await sema.acquire();
+    reaction?.started(); // slot acquired → flip OneSecond → Typing
     let firstCardSent = false;
     let activeKey = opts.knownThreadId ?? `pending:${opts.replyTo}`;
     let topicThreadId = opts.knownThreadId;
@@ -811,30 +848,63 @@ export function createOrchestrator(
         runsByCard.set(cardMsgId, state);
         runStreams.set(cardMsgId, stream);
         await adoptThreadId(cardMsgId);
-        // first run card is live (topic created) → flip the ack reaction to DONE
+        // first card is live = topic created. The 群@bot 建话题 path flips its
+        // reaction to DONE here (creating the topic is the acked action), unlike
+        // an in-topic turn which holds Typing until the reply itself ends.
         if (!firstCardSent) {
           firstCardSent = true;
           try {
-            onFirstCard?.();
+            onTopicCreated?.();
           } catch {
-            /* ack reaction is best-effort */
+            /* reaction is best-effort */
           }
         }
 
+        // ⏹ 终止 / watchdog: end the consume loop locally. codex emits no
+        // mappable terminal on turn/interrupt — the event stream just hangs (see
+        // log 08:48: a stopped card never finalized) — so we must not wait on the
+        // backend. `stopSignal` ends the loop instantly (card flips to 已中断);
+        // the dead turn's process is then recycled below.
         let timedOut = false;
-        const guarded = withIdleTimeout(run.events, idleMs, () => {
-          timedOut = true;
-          const tid = run.turnId();
-          if (tid) void opts.thread.abort(tid).catch(() => undefined);
+        let interrupted = false;
+        let resolveStop!: () => void;
+        const stopSignal = new Promise<void>((res) => {
+          resolveStop = res;
         });
+        state.interrupt = () => {
+          if (interrupted) return;
+          interrupted = true;
+          resolveStop();
+        };
+        const guarded = withIdleTimeout(
+          run.events,
+          idleMs,
+          () => {
+            timedOut = true;
+          },
+          stopSignal,
+        );
         for await (const ev of guarded) {
           render.apply(ev);
           rc.rs = render.snapshot();
           await stream.streamCard(channel, buildRunCard(rc));
         }
+        state.interrupt = undefined; // turn done; nothing left to interrupt
+        const killed = interrupted || timedOut;
         if (timedOut) render.timeout(Math.max(1, Math.round(idleMs / 60_000)));
+        else if (interrupted) render.interrupt();
         else render.finalize();
         rc.rs = render.snapshot();
+
+        // A killed turn leaves codex mid-turn with a notification stream that
+        // never terminates. Recycle the process: closing it ends the stream
+        // cleanly (no orphaned reader stealing the next turn's events) and frees
+        // the turn. The topic resumes from the persisted thread on its next
+        // message (resolveThread), so the session survives the kill.
+        if (killed) {
+          void opts.thread.close().catch(() => undefined);
+          if (topicThreadId) sessions.delete(topicThreadId);
+        }
 
         const finalMsgId = cardMsgId;
         await adoptThreadId(finalMsgId);
@@ -849,6 +919,9 @@ export function createOrchestrator(
         replyInThread = true; // stay in the topic for queued turns
         log.info('card', 'final', { terminal: render.terminal() });
 
+        // A kill (⏹ / watchdog) stops the whole run — drop any queued follow-ups
+        // (they'd run on the recycled, now-closed thread).
+        if (killed) break;
         if (state.queue.length === 0) break;
         turnText = state.queue.shift()!;
       }
@@ -860,6 +933,7 @@ export function createOrchestrator(
     } finally {
       active.delete(activeKey);
       if (curCardKey) runsByCard.delete(curCardKey);
+      reaction?.done(); // run ended (complete / ⏹ / timeout / error) → ✅ DONE
       release();
     }
   }

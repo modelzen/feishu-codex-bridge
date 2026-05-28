@@ -51,6 +51,7 @@ worker 靠 `send_message` 才算"说话"，stdout 不可见。
 
 ## Known Pitfalls
 - **`onMessage`/卡片回调里禁止 `await` 整轮 codex run**：`@larksuiteoapi/node-sdk` 的 SafetyPipeline 按 **chatId** 串行排队**所有**事件（消息 + `card.action.trigger` 共用一条 FIFO，`queueEnabled` 默认 true）。一个话题群 = 一个 chatId，所以 handler 一旦 await 长 run，就占住整条队列 → 同群其他话题不响应、⏹ 终止按钮排在队尾点了没反应。必须 **detach**（`void withTrace(async …)` 后台跑，handler 立即返回）。同话题双启动用同步预占 `active[threadId]` 防护。
+- **⏹ 终止不能只发 `turn/interrupt` 干等**：codex app-server 收到 `turn/interrupt` 后**不发**能 map 成 `done`/`error` 的终止通知，`runStreamed` 的 `for await` 永远挂着 → 卡片永不收尾，表现"点了没终止"（log 08:48 实证：abort 已发，那张卡再无 `card.final`）。正解 = **本地结束消费循环**：`stopSignal` 一 resolve 就退出 `withIdleTimeout`（卡片立即转"已中断"），随后 `thread.close()` 回收进程（每 session 一独立 app-server 进程+独立 notifications 队列，杀掉即干净结束流，绝不会有孤儿 reader 偷下一轮事件）+ `sessions.delete(tid)`，话题下条消息靠 `resolveThread` 自动 resume。watchdog 超时同理走这条 kill 路径。
 
 ## Style Decisions
 (空 — 用户表达 taste 偏好时记)

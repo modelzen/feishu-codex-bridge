@@ -117,4 +117,53 @@ describe('withIdleTimeout', () => {
     expect(values).toEqual(['a']);
     expect(onTimeout).not.toHaveBeenCalled();
   });
+
+  it('ends the generator when the stop signal resolves (⏹), without firing onTimeout', async () => {
+    const onTimeout = vi.fn();
+    let resolveStop!: () => void;
+    const stop = new Promise<void>((res) => {
+      resolveStop = res;
+    });
+    const out: string[] = [];
+    const iter = withIdleTimeout(neverEnding('first'), 0, onTimeout, stop)[Symbol.asyncIterator]();
+
+    await expect(iter.next()).resolves.toEqual({ done: false, value: 'first' });
+    const second = iter.next();
+    resolveStop();
+
+    await expect(second).resolves.toEqual({ done: true, value: undefined });
+    expect(onTimeout).not.toHaveBeenCalled();
+  });
+
+  it('still passes through values when a stop signal is provided but unresolved', async () => {
+    const onTimeout = vi.fn();
+    const stop = new Promise<void>(() => {}); // never resolves
+    const out: string[] = [];
+
+    for await (const value of withIdleTimeout(
+      delayedValues([
+        { delayMs: 1, value: 'a' },
+        { delayMs: 1, value: 'b' },
+      ]),
+      0,
+      onTimeout,
+      stop,
+    )) {
+      out.push(value);
+    }
+
+    expect(out).toEqual(['a', 'b']);
+    expect(onTimeout).not.toHaveBeenCalled();
+  });
+});
+
+describe('Semaphore.hasFree', () => {
+  it('reports free slots until max is reached, then again after release', async () => {
+    const sem = new Semaphore(1);
+    expect(sem.hasFree()).toBe(true);
+    const release = await sem.acquire();
+    expect(sem.hasFree()).toBe(false);
+    release();
+    expect(sem.hasFree()).toBe(true);
+  });
 });
