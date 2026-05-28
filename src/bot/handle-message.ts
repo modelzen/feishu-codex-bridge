@@ -154,12 +154,13 @@ export function createOrchestrator(
   /**
    * Reaction lifecycle on the triggering message: ⏳ OneSecond while the run
    * waits for a free concurrency slot, 🫳 Typing while it's actually running,
-   * ✅ DONE when it ends (complete / ⏹ 终止 / timeout / error). Transitions are
-   * serialized through `chain` so each swap removes the prior emoji first.
+   * then the emoji is removed entirely when it ends (complete / ⏹ 终止 /
+   * timeout / error) — no "done" emoji. Transitions are serialized through
+   * `chain` so each step removes the prior emoji first.
    */
   function runReaction(messageId: string, queued: boolean): RunReaction {
     let chain: Promise<string | undefined> = addReaction(messageId, queued ? 'OneSecond' : 'Typing');
-    let phase = queued ? 0 : 1; // 0 = waiting(OneSecond), 1 = running(Typing), 2 = done(DONE)
+    let phase = queued ? 0 : 1; // 0 = waiting(OneSecond), 1 = running(Typing), 2 = done(cleared)
     const swap = (emoji: string): void => {
       chain = chain.then(async (prevId) => {
         if (prevId) removeReaction(messageId, prevId);
@@ -176,7 +177,10 @@ export function createOrchestrator(
       done: () => {
         if (phase < 2) {
           phase = 2;
-          swap('DONE');
+          chain = chain.then((prevId) => {
+            if (prevId) removeReaction(messageId, prevId);
+            return undefined;
+          });
         }
       },
     };
