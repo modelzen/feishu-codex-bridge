@@ -1,5 +1,5 @@
 import type { ModelInfo, ReasoningEffort, ThreadSummary } from '../agent/types';
-import { actions, button, card, hr, md, note, selectStatic, type CardObject } from './cards';
+import { actions, button, card, hr, linkButton, md, note, selectStatic, type CardElement, type CardObject } from './cards';
 
 /** Action ids for the `/model` card. */
 export const MC = {
@@ -132,4 +132,89 @@ export function relativeTime(unixSeconds: number): string {
   const day = Math.floor(hr / 24);
   if (day < 30) return `${day} 天前`;
   return new Date(ms).toLocaleDateString('zh-CN');
+}
+
+// ── /help & 建群欢迎卡 ────────────────────────────────────────────────────────
+
+/** Where the user is when they ask for help — drives which commands we list. */
+export type HelpScope = 'main' | 'topic' | 'single';
+
+/** The `/help` card: commands available **right here** (this exact scope). */
+export function buildHelpCard(scope: HelpScope): CardObject {
+  const elements: CardElement[] = [];
+  if (scope === 'single') {
+    elements.push(
+      md('💬 **单会话群** — 整群就是一个会话，上下文连续。'),
+      hr(),
+      md(
+        '· 直接发消息（免@）→ 交给我处理\n' +
+          '· `/model` → 切换模型 / 推理强度\n' +
+          '· `/settings` → 群设置（免@ 开关）\n' +
+          '· `/help` → 这张速查卡',
+      ),
+    );
+  } else if (scope === 'topic') {
+    elements.push(
+      md('🧵 **话题内** — 每个话题是一个独立会话。'),
+      hr(),
+      md(
+        '· 直接发消息（免@）→ 继续当前会话\n' +
+          '· `/model` → 切换模型 / 推理强度\n' +
+          '· `/help` → 这张速查卡',
+      ),
+      note('开新话题：回到主群区 @我 + 内容。'),
+    );
+  } else {
+    elements.push(
+      md('👥 **主群区** — @我开话题，每个话题是独立会话。'),
+      hr(),
+      md(
+        '· **@我 + 内容** → 开一个新话题并开始\n' +
+          '· `/resume` → 恢复历史会话\n' +
+          '· `/settings` → 群设置（免@ 开关）\n' +
+          '· `/model` → 需要在话题里用\n' +
+          '· `/help` → 这张速查卡',
+      ),
+    );
+  }
+  return card(elements, { header: { title: '🤖 可用命令', template: 'blue' }, summary: '可用命令' });
+}
+
+/**
+ * Welcome card posted (and Pin'd) when a project group is created — a full
+ * overview of every command this group supports, keyed off its session kind.
+ * Adds a "查看完整手册" link button when a doc URL is configured.
+ */
+export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string): CardObject {
+  const elements: CardElement[] = [
+    md('👋 **欢迎使用 Codex Bridge** — 本群已绑定一个项目目录，在群里就能驱动本机 Codex 干活。'),
+    hr(),
+  ];
+  if (kind === 'single') {
+    elements.push(
+      md('💬 **单会话群**（整群一个会话，上下文连续）'),
+      md(
+        '· 直接发消息（免@）→ 交给我处理\n' +
+          '· `/model` → 切换模型 / 推理强度\n' +
+          '· `/settings` → 群设置（免@ 开关）\n' +
+          '· `/help` → 命令速查卡',
+      ),
+    );
+  } else {
+    elements.push(
+      md('👥 **主群区**'),
+      md(
+        '· **@我 + 内容** → 开一个新话题并开始（每话题独立会话）\n' +
+          '· `/resume` → 恢复历史会话\n' +
+          '· `/settings` → 群设置（免@ 开关）',
+      ),
+      md('🧵 **话题内**'),
+      md('· 直接发消息（免@）→ 继续当前会话\n· `/model` → 切换模型 / 推理强度'),
+      note('任意场景发 `/help` 看当前可用命令。'),
+    );
+  }
+  if (docUrl) {
+    elements.push(hr(), actions([linkButton('📖 查看完整使用手册', docUrl, 'primary')]));
+  }
+  return card(elements, { header: { title: '🤖 本群使用说明', template: 'turquoise' }, summary: '本群使用说明' });
 }

@@ -18,12 +18,14 @@ import { CardDispatcher } from '../card/dispatcher';
 import { sendManagedCard, updateManagedCard } from '../card/managed';
 import { RunRender } from '../card/run-render';
 import {
+  buildHelpCard,
   buildModelCard,
   buildResumeCard,
   buildResumeErrorCard,
   buildResumeLaunchingCard,
   MC,
   RES,
+  type HelpScope,
   type ModelCardState,
   type ResumeCardState,
 } from '../card/command-cards';
@@ -212,26 +214,34 @@ export function createOrchestrator(
     const text = msg.content.trim();
     const cmd = parseCommand(text);
 
-    // /settings: open the in-group settings card (群类型只读 + 免@ 开关).
-    if (cmd === 'settings') {
-      await postGroupSettings(msg, project);
-      return;
-    }
-
     // Single-session group: the whole group is one session keyed by chatId. No
     // topics — reply by quoting (引用回复); runs serialize per chatId (active[chatId]).
+    // Commands: /settings (群设置) + /model. /resume has no topic list here.
     if ((project?.kind ?? 'multi') === 'single') {
+      if (cmd === 'help') {
+        await postHelpCard(msg, 'single');
+        return;
+      }
+      if (cmd === 'settings') {
+        await postGroupSettings(msg, project);
+        return;
+      }
       if (cmd === 'model') {
         await postModelCard(msg, msg.chatId);
         return;
       }
-      // /resume not supported in single (no topic list); anything else = a turn.
       handleTurn(msg, text, msg.chatId, true, project);
       return;
     }
 
-    // Multi (default): inside a topic → a turn in that session (or /model to tune it).
+    // Multi (default): inside a topic → a turn in that session. Only /model is a
+    // command here; /settings + /resume aren't topic-scoped, so they fall through
+    // as a normal turn (告诉 codex 的普通文本).
     if (msg.threadId) {
+      if (cmd === 'help') {
+        await postHelpCard(msg, 'topic', true);
+        return;
+      }
       if (cmd === 'model') {
         await postModelCard(msg, msg.threadId);
         return;
@@ -239,10 +249,19 @@ export function createOrchestrator(
       handleTurn(msg, text, msg.threadId, false, project);
       return;
     }
-    // Main group area: /resume opens the history picker; /model only makes
-    // sense inside a topic; anything else directly creates a topic + runs.
+    // Main group area: /resume opens the history picker; /settings opens the
+    // group-settings card; /model only makes sense inside a topic; anything else
+    // directly creates a topic + runs.
+    if (cmd === 'help') {
+      await postHelpCard(msg, 'main');
+      return;
+    }
     if (cmd === 'resume') {
       await postResumeCard(msg);
+      return;
+    }
+    if (cmd === 'settings') {
+      await postGroupSettings(msg, project);
       return;
     }
     if (cmd === 'model') {
@@ -255,18 +274,21 @@ export function createOrchestrator(
   };
 
   /** Parse a leading slash command (`/resume`, `/model`, `/settings`); null otherwise. */
-  function parseCommand(text: string): 'resume' | 'model' | 'settings' | null {
+  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | null {
     const m = /^\/(\w+)/.exec(text);
     const name = m?.[1]?.toLowerCase();
-    return name === 'resume' || name === 'model' || name === 'settings' ? name : null;
+    return name === 'resume' || name === 'model' || name === 'settings' || name === 'help' ? name : null;
   }
 
   /** Whether to respond to a non-@ message in a project group (免@ default on).
-   * multi: only inside a topic (开新话题 still needs @); single: whole group. */
+   * single: whole group. multi: inside a topic, OR a slash command in the main
+   * area — plain chatter in the main area still needs @ (开新话题 是明确意图，
+   * 不能让随便一句话就开话题)，but explicit commands (/help /resume /settings
+   * /model) respond without @ since they're unambiguous intent. */
   function shouldRespondWithoutMention(project: Project, msg: NormalizedMessage): boolean {
     if (!(project.noMention ?? true)) return false;
     if ((project.kind ?? 'multi') === 'single') return true;
-    return Boolean(msg.threadId);
+    return Boolean(msg.threadId) || parseCommand(msg.content.trim()) !== null;
   }
 
   /** @bot /settings in a group: post the in-group settings card (admin-gated). */
@@ -485,6 +507,16 @@ export function createOrchestrator(
       pruneModelPending();
       modelPending.set(res.messageId, state);
       log.info('card', 'model', { threadId: sessionKey, model: state.model, effort: state.effort });
+    });
+  }
+
+  /** `/help`: post the command cheat-sheet for the caller's current scope. */
+  async function postHelpCard(msg: NormalizedMessage, scope: HelpScope, inThread = false): Promise<void> {
+    await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
+      await sendManagedCard(channel, msg.chatId, buildHelpCard(scope), msg.messageId, inThread).catch((err) =>
+        log.fail('card', err, { cmd: 'help', scope }),
+      );
+      log.info('card', 'help', { scope });
     });
   }
 
