@@ -122,6 +122,36 @@ export function collapsiblePanel(opts: {
 }
 
 /**
+ * Like {@link collapsiblePanel} but the body is an arbitrary element list
+ * instead of one markdown string — so a panel can hold nested panels
+ * (`collapsible_panel.elements` is itself a CardElement[]). Used by the resume
+ * history card to drill "一层层": a per-turn panel whose body folds again into
+ * the turn's reasoning / tool detail.
+ */
+export function collapsiblePanelEl(opts: {
+  title: string;
+  expanded: boolean;
+  border: PanelBorder;
+  elements: CardElement[];
+}): CardElement {
+  return {
+    tag: 'collapsible_panel',
+    expanded: opts.expanded,
+    header: {
+      title: { tag: 'markdown', content: opts.title },
+      vertical_align: 'center',
+      icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', size: '16px 16px' },
+      icon_position: 'follow_text',
+      icon_expanded_angle: -180,
+    },
+    border: { color: opts.border, corner_radius: '5px' },
+    vertical_spacing: '8px',
+    padding: '8px 8px 8px 8px',
+    elements: opts.elements,
+  };
+}
+
+/**
  * A row of interactive controls (buttons / selects). Schema 2.0 has no
  * `tag:'action'` container — multiple controls share a row via a flow
  * `column_set`, one control per auto-width column.

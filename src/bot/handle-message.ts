@@ -21,6 +21,7 @@ import {
   buildHelpCard,
   buildModelCard,
   buildResumeCard,
+  buildResumeDoneCard,
   buildResumeErrorCard,
   buildResumeLaunchingCard,
   MC,
@@ -29,6 +30,7 @@ import {
   type ModelCardState,
   type ResumeCardState,
 } from '../card/command-cards';
+import { buildHistoryCard, type HistoryCardState } from '../card/history-card';
 import { buildRunCard, buildRunCardPlain, RC, type RunCardState } from '../card/run-card';
 import { RunCardStream } from '../card/run-card-stream';
 import { log, withTrace } from '../core/logger';
@@ -829,36 +831,71 @@ export function createOrchestrator(
     });
 
   /**
-   * From a /resume card: resume the codex thread, then create the topic + run.
-   * Detached — never holds the card-action callback for the whole resume + run.
-   * On failure the card flips to a (non-retryable) error and pending clears.
+   * From a /resume card: read the past thread's transcript, post a collapsible
+   * history card as reply_in_thread (which creates the topic) and bind the codex
+   * thread to that topic. No filler turn — the session resumes lazily on the
+   * topic's first message via {@link resolveThread}, so the user just continues.
+   * Detached — never holds the card-action callback for the whole flow. On
+   * failure the picker card flips to a (non-retryable) error and pending clears.
    */
   async function resumeFromCard(evt: CardActionEvent, state: ResumeCardState, codexThreadId: string): Promise<void> {
-    let thread: AgentThread | undefined;
     try {
-      const { model, effort } = pickDefault(await listModels());
-      thread = await backend.resumeThread({ cwd: state.cwd, codexThreadId, model, effort });
+      // thread/read: fetch the transcript without starting a turn or holding the
+      // session live (model/effort left to the thread's own remembered config).
+      // Never throws — empty history just yields a minimal card.
+      const history = await backend.readHistory(state.cwd, codexThreadId);
       resumePending.delete(evt.messageId);
-      log.info('card', 'resume-launch', { codexThreadId });
+
+      let bound = false;
       await withTrace({ chatId: state.chatId, msgId: state.originalMsgId }, async () => {
-        await launchRun({
-          chatId: state.chatId,
-          replyTo: state.originalMsgId,
-          replyInThread: true,
-          thread: thread!,
-          firstText: '继续之前的会话。',
-          model,
-          effort,
-          cwd: state.cwd,
-          summary: '(恢复会话)',
-          requesterOpenId: state.requesterOpenId,
-        });
+        const cardState: HistoryCardState = { cwd: state.cwd, projectName: state.projectName, history };
+        // reply_in_thread on the /resume message turns it into the topic; the
+        // history card is that topic's first message.
+        const sent = await sendManagedCard(channel, state.chatId, buildHistoryCard(cardState), state.originalMsgId, true);
+        // Binding the codex thread to the topic hinges entirely on resolving the
+        // topic thread_id (no live thread to fall back on, unlike the run path) —
+        // a miss would make the next message start a FRESH empty session. The
+        // reply response omits thread_id and the raw lookup can lag right after
+        // the reply, so retry a few times before giving up.
+        let tid: string | undefined;
+        for (let attempt = 0; attempt < 4 && !tid; attempt++) {
+          if (attempt > 0) await new Promise((r) => setTimeout(r, 500));
+          tid = await getThreadId(channel, sent.messageId);
+        }
+        if (tid) {
+          const now = Date.now();
+          await upsertSession({
+            threadId: tid,
+            chatId: state.chatId,
+            cwd: state.cwd,
+            codexThreadId,
+            summary: history.name || history.preview || '(恢复会话)',
+            createdAt: now,
+            updatedAt: now,
+          });
+          bound = true;
+        } else {
+          log.warn('card', 'resume-no-threadid', { messageId: sent.messageId });
+        }
+        log.info('card', 'resume-done', { codexThreadId, threadId: tid ?? null, bound, turns: history.totalTurns });
       });
+
+      // Only promise continuity once the thread is actually bound — else the
+      // next message silently starts a fresh session, so say so instead of
+      // claiming success. settleUpdate keeps this ordered after the launching
+      // card the RES.pick handler settle-pushed (normally the done push runs
+      // last; a 200810 retry on the launching push could in theory reorder, but
+      // the 500ms settle window avoids that in practice).
+      settleUpdate(
+        evt.messageId,
+        bound
+          ? buildResumeDoneCard(state)
+          : buildResumeErrorCard(state, '已建话题但未能绑定会话，请重新 /resume'),
+      );
     } catch (err) {
       state.launching = false;
       log.fail('card', err, { phase: 'resume-launch' });
-      if (thread) void thread.close().catch(() => undefined);
-      void updateManagedCard(channel, evt.messageId, buildResumeErrorCard(state, err instanceof Error ? err.message : String(err)));
+      settleUpdate(evt.messageId, buildResumeErrorCard(state, err instanceof Error ? err.message : String(err)));
     }
   }
 

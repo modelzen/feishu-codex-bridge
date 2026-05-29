@@ -81,18 +81,26 @@ export interface ResumeCardState {
   launching?: boolean;
 }
 
-/** The `/resume` card: recent codex threads under this cwd, pick one to resume. */
+/** Max length of the session title shown inside a picker button. */
+const RESUME_TITLE_MAX = 30;
+
+/**
+ * The `/resume` card: recent codex threads under this cwd. Each thread is ONE
+ * button labeled `↩️ <time> · <title>` (time first, title truncated to one line)
+ * — modeled on codex's own `resume` TUI — so it's unambiguous which button
+ * resumes which session even when titles are long, messy, or repeated. Same-
+ * title sessions are told apart by the minute-precise timestamp.
+ */
 export function buildResumeCard(state: ResumeCardState): CardObject {
   const elements = [md('🕘 **恢复历史会话**'), note(metaNote(state)), hr()];
   if (state.threads.length === 0) {
     elements.push(md('_该目录下还没有历史会话。直接 @我 即可新建。_'));
   } else {
+    elements.push(note('点一条即恢复 —— 在新话题里打开历史、可直接继续。'));
     for (const t of state.threads) {
-      const title = t.name?.trim() || t.preview.trim() || '(无摘要)';
-      elements.push(md(`**${truncate(title, 80)}**`));
-      elements.push(
-        actions([button(`↩️ 恢复 · ${relativeTime(t.updatedAt || t.createdAt)}`, { a: RES.pick, t: t.codexThreadId })]),
-      );
+      const title = (t.name?.trim() || t.preview.trim() || '(无摘要)').replace(/\s+/g, ' ');
+      const label = `↩️ ${pickerTime(t.updatedAt || t.createdAt)} · ${truncate(title, RESUME_TITLE_MAX)}`;
+      elements.push(actions([button(label, { a: RES.pick, t: t.codexThreadId })]));
     }
   }
   return card(elements, { summary: '恢复历史会话' });
@@ -101,6 +109,11 @@ export function buildResumeCard(state: ResumeCardState): CardObject {
 /** Transient "resuming…" card — interactive controls removed (anti double-click). */
 export function buildResumeLaunchingCard(state: ResumeCardState): CardObject {
   return card([md('⏳ 正在恢复历史会话…'), note(metaNote(state))], { summary: '恢复中' });
+}
+
+/** Terminal success card — the resumed session opened as a new topic below. */
+export function buildResumeDoneCard(state: ResumeCardState): CardObject {
+  return card([md('✅ 已恢复 —— 已在下方新话题打开，可直接继续。'), note(metaNote(state))], { summary: '已恢复' });
 }
 
 /** Failure card after a failed resume launch. */
@@ -132,6 +145,27 @@ export function relativeTime(unixSeconds: number): string {
   const day = Math.floor(hr / 24);
   if (day < 30) return `${day} 天前`;
   return new Date(ms).toLocaleDateString('zh-CN');
+}
+
+/**
+ * Timestamp for the resume picker buttons: friendly for recent sessions,
+ * minute-precise (absolute) for older ones so same-title sessions stay
+ * distinguishable (coarse "20 天前" would collide on duplicates).
+ */
+export function pickerTime(unixSeconds: number): string {
+  if (!unixSeconds) return '未知时间';
+  const ms = unixSeconds < 1e12 ? unixSeconds * 1000 : unixSeconds;
+  const min = Math.floor((Date.now() - ms) / 60_000);
+  if (min < 1) return '刚刚';
+  if (min < 60) return `${min}分钟前`;
+  const d = new Date(ms);
+  const now = new Date();
+  const p2 = (n: number): string => String(n).padStart(2, '0');
+  const hm = `${p2(d.getHours())}:${p2(d.getMinutes())}`;
+  const sameDay = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  if (sameDay) return `今天 ${hm}`;
+  const md = `${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+  return d.getFullYear() === now.getFullYear() ? `${md} ${hm}` : `${d.getFullYear()}-${md} ${hm}`;
 }
 
 // ── /help & 建群欢迎卡 ────────────────────────────────────────────────────────

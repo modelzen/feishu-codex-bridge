@@ -35,6 +35,51 @@ export interface ThreadSummary {
   name?: string;
 }
 
+/** One past tool/command/file/web call in a resumed session's transcript. */
+export interface HistoryTool {
+  /** short header — the shell command, or a label like '编辑文件' / '联网搜索' */
+  title: string;
+  /** aggregated stdout/stderr, if any (renderer truncates) */
+  output?: string;
+  /** process exit code for command executions */
+  exitCode?: number | null;
+  /** the call errored / was declined */
+  failed?: boolean;
+}
+
+/** One user→assistant exchange in a resumed session (a codex Turn). */
+export interface HistoryTurn {
+  /** the user's prompt for this turn ('' for a tool-only / boilerplate turn) */
+  userText: string;
+  /** the assistant's reply (agent messages concatenated) */
+  assistantText: string;
+  /** the assistant's reasoning, if surfaced ('' if none) */
+  reasoning: string;
+  /** tool/command/file/web calls in this turn, in arrival order */
+  tools: HistoryTool[];
+  /** unix seconds when the turn started, if known */
+  startedAt?: number;
+}
+
+/**
+ * A resumed codex thread's transcript, for the "恢复历史会话" history card —
+ * normalized off the app-server `thread/read` (includeTurns) turns so the card
+ * layer never touches codex protocol shapes.
+ */
+export interface ThreadHistory {
+  /** turns kept for display, oldest→newest (the most recent `turns.length`) */
+  turns: HistoryTurn[];
+  /** total non-empty turns in the thread before truncation (>= turns.length) */
+  totalTurns: number;
+  /** user-facing thread title, if set */
+  name?: string;
+  /** first user message preview */
+  preview?: string;
+  /** unix seconds */
+  createdAt?: number;
+  updatedAt?: number;
+}
+
 /** Normalized stream events, mapped from app-server notifications. */
 export type AgentEvent =
   | { type: 'system'; threadId: string }
@@ -90,6 +135,12 @@ export interface AgentBackend {
   listModels(): Promise<ModelInfo[]>;
   /** recent codex threads under `cwd`, newest first (for resume picker) */
   listThreads(cwd: string, limit?: number): Promise<ThreadSummary[]>;
+  /**
+   * A past thread's transcript for the resume history card — reads it via
+   * `thread/read` (includeTurns) WITHOUT starting a turn or holding the session
+   * live. Keeps the last `maxTurns` turns; never throws (returns empty on fail).
+   */
+  readHistory(cwd: string, codexThreadId: string, maxTurns?: number): Promise<ThreadHistory>;
   startThread(opts: StartThreadOptions): Promise<AgentThread>;
   resumeThread(opts: ResumeThreadOptions): Promise<AgentThread>;
 }

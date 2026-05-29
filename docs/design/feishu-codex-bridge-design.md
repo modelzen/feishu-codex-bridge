@@ -70,7 +70,11 @@
   `模型 ▾`（动态 model/list）`effort ▾` + `[✅ 创建新会话]` `[🔁 恢复历史会话]`
   （注：codex 无 `fast` 参数，effort 即速度/质量杆，故去掉 fast 下拉，见 .plans/decisions.md 2026-05-26）
   - 创建 → `reply_in_thread` 把这条消息变成话题、开跑
-  - 恢复 → `thread/list`（按 cwd 过滤，codex 自己的会话库）列最近会话（`preview` 首条消息 + 相对时间）→ 选一条 `thread/resume` 到新话题
+  - 恢复 → `thread/list`（按 cwd 过滤，codex 自己的会话库）列最近会话（`preview` 首条消息 + 相对时间）→ 选一条后：
+    - `thread/read`（`includeTurns:true`）拉该会话的历史 turns（**不**开 turn、**不**驻留进程；含已解密思考），归一化成 `ThreadHistory`；
+    - `reply_in_thread` 发一张**折叠历史卡**（`buildHistoryCard`，schema 2.0 `collapsible_panel` 嵌套：每轮收拢，展开见 👤提问/🤖回答，再下一层折叠思考+工具明细；卡底「📍上次停在」预览；长历史只显示最近 N 轮并注明）——这张卡同时就是新话题的根消息；
+    - `getThreadId` 回取话题 thread_id → `upsertSession` 把 `codexThreadId` 绑到该话题（model/effort 留空，沿用该 codex thread 自己记忆的配置）。
+    - **不发任何填充轮**：会话靠话题下一条消息经 `resolveThread`（`getSession`→`thread/resume`）惰性续上——用户直接接着聊即可。
   - **resume 只在新建会话时可选；话题中途不允许恢复**
 
 ### 3.3 话题（thread，= 一个 session）
