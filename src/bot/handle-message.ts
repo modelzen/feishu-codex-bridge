@@ -284,9 +284,12 @@ export function createOrchestrator(
    * single: whole group. multi: inside a topic, OR a slash command in the main
    * area — plain chatter in the main area still needs @ (开新话题 是明确意图，
    * 不能让随便一句话就开话题)，but explicit commands (/help /resume /settings
-   * /model) respond without @ since they're unambiguous intent. */
+   * /model) respond without @ since they're unambiguous intent.
+   * 即使开了免@，若消息 @了所有人 或 @了具体的(非机器人)用户,说明是定向给别人的,
+   * bot 不插话。(此函数仅在 !mentionedBot 时调用,故 @到 bot 的情况已被排除。) */
   function shouldRespondWithoutMention(project: Project, msg: NormalizedMessage): boolean {
     if (!(project.noMention ?? true)) return false;
+    if (msg.mentionAll || msg.mentions.some((m) => !m.isBot)) return false;
     if ((project.kind ?? 'multi') === 'single') return true;
     return Boolean(msg.threadId) || parseCommand(msg.content.trim()) !== null;
   }
