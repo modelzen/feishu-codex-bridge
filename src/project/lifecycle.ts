@@ -6,6 +6,7 @@ import { paths } from '../config/paths';
 import { log } from '../core/logger';
 import { addProject, getProjectByName, type Project } from './registry';
 import { setAnnouncement } from './announcement';
+import { onboardGroup } from './onboarding';
 
 export interface CreateProjectInput {
   name: string;
@@ -54,7 +55,9 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
   await addProject(project);
   log.info('project', 'create', { name, chatId, cwd, blank });
 
-  // 4. group announcement (best-effort)
+  // 4. group announcement (top banner) + onboarding (welcome card / Pin / tab),
+  //    both best-effort — a group is usable even if these fail.
   await setAnnouncement(channel, project).catch((err) => log.fail('project', err, { phase: 'announcement' }));
+  await onboardGroup(channel, project).catch((err) => log.fail('project', err, { phase: 'onboard' }));
   return project;
 }

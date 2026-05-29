@@ -28,6 +28,8 @@ export const REQUIRED_SCOPES = [
   'im:chat.announcement:read', // read group announcement blocks (list)
   'im:chat.announcement:write_only', // write group announcement blocks (create/delete)
   'im:chat.top_notice:write_only', // pin the announcement to the top banner
+  'im:chat.tabs:write_only', // add the "👈 查看可使用的命令" chat tab on group create
+  // Pin'ing the welcome message reuses im:message:send_as_bot (no extra scope).
   'cardkit:card:write', // interactive button cards (CardKit entities)
 ] as const;
 
