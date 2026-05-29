@@ -84,17 +84,17 @@ export function buildNewProjectFormCard(opts: { name?: string; cwd?: string; err
   return card(elements, { header: { title: '➕ 新建项目', template: 'turquoise' } });
 }
 
-/** Shown after a project is created — a terminal "留痕" record, no nav button.
- * (Re-open the console any time by messaging the bot.) */
+/** Shown after a project is created — a terminal "留痕" record with a
+ * jump-to-group button so the admin can hop straight into the new group and
+ * start working. (Re-open the console any time by messaging the bot.) */
 export function buildNewProjectDoneCard(p: Project): CardObject {
-  return card(
-    [
-      md(`✅ 已创建项目 **${p.name}**${p.blank ? ' _(空白项目)_' : ''}`),
-      note(`📂 \`${p.cwd}\`   ·   ${kindLabel(p.kind)}`),
-      md(p.chatId ? '群已建好 👉 去项目群里 **@我** 干活。' : '发我任意消息可再次打开管理台。'),
-    ],
-    { header: { title: '➕ 新建项目', template: 'green' } },
-  );
+  const elements: CardElement[] = [
+    md(`✅ 已创建项目 **${p.name}**${p.blank ? ' _(空白项目)_' : ''}`),
+    note(`📂 \`${p.cwd}\`   ·   ${kindLabel(p.kind)}`),
+    md(p.chatId ? '群已建好 👉 去项目群里 **@我** 干活。' : '发我任意消息可再次打开管理台。'),
+  ];
+  if (p.chatId) elements.push(actions([linkButton('💬 打开群聊', openChatUrl(p.chatId), 'primary')]));
+  return card(elements, { header: { title: '➕ 新建项目', template: 'green' } });
 }
 
 /** Project list: each project shows its bound group + a jump-to-group link,
