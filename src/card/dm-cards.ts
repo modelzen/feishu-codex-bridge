@@ -91,7 +91,7 @@ export function buildNewProjectDoneCard(p: Project): CardObject {
     [
       md(`✅ 已创建项目 **${p.name}**${p.blank ? ' _(空白项目)_' : ''}`),
       note(`📂 \`${p.cwd}\`   ·   ${kindLabel(p.kind)}`),
-      md(p.chatId ? '群已建好 👉 去项目群里 **@我** 干活。' : '发我 `/menu` 可再次打开管理台。'),
+      md(p.chatId ? '群已建好 👉 去项目群里 **@我** 干活。' : '发我任意消息可再次打开管理台。'),
     ],
     { header: { title: '➕ 新建项目', template: 'green' } },
   );
