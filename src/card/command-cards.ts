@@ -111,9 +111,9 @@ export function buildResumeLaunchingCard(state: ResumeCardState): CardObject {
   return card([md('⏳ 正在恢复历史会话…'), note(metaNote(state))], { summary: '恢复中' });
 }
 
-/** Terminal success card — the resumed session opened as a new topic below. */
+/** Terminal success card — the resumed session opened as a new topic above. */
 export function buildResumeDoneCard(state: ResumeCardState): CardObject {
-  return card([md('✅ 已恢复 —— 已在下方新话题打开，可直接继续。'), note(metaNote(state))], { summary: '已恢复' });
+  return card([md('✅ 已恢复 —— 已在上方新话题打开，可直接继续。'), note(metaNote(state))], { summary: '已恢复' });
 }
 
 /** Failure card after a failed resume launch. */
