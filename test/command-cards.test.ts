@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildResumeCard, type ResumeCardState } from '../src/card/command-cards';
+import { buildHelpCard, buildResumeCard, buildWelcomeCard, type ResumeCardState } from '../src/card/command-cards';
 import type { ThreadSummary } from '../src/agent/types';
 
 function buttons(node: unknown, acc: any[] = []): any[] {
@@ -49,5 +49,14 @@ describe('buildResumeCard', () => {
     const card = buildResumeCard(state([]));
     expect(buttons(card).length).toBe(0);
     expect(JSON.stringify(card)).toContain('还没有历史会话');
+  });
+});
+
+describe('help cards', () => {
+  it('documents the /effort shortcut in session scopes', () => {
+    expect(JSON.stringify(buildHelpCard('single'))).toContain('/effort high');
+    expect(JSON.stringify(buildHelpCard('topic'))).toContain('/effort high');
+    expect(JSON.stringify(buildWelcomeCard('single'))).toContain('/effort high');
+    expect(JSON.stringify(buildWelcomeCard('multi'))).toContain('/effort high');
   });
 });
