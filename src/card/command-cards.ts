@@ -12,7 +12,7 @@ export const RES = {
   pick: 'resume.pick',
 } as const;
 
-const EFFORT_LABEL: Record<ReasoningEffort, string> = {
+export const EFFORT_LABEL: Record<ReasoningEffort, string> = {
   none: '无',
   minimal: '极简',
   low: '低',
@@ -193,6 +193,7 @@ export function buildHelpCard(scope: HelpScope, noMention = true): CardObject {
       md(
         `${talkLine(noMention, '交给我处理')}\n` +
           '· `/model` → 切换模型 / 推理强度\n' +
+          '· `/effort high` → 快速切换推理强度\n' +
           '· `/settings` → 群设置（免@ 开关）\n' +
           '· `/help` → 这张速查卡',
       ),
@@ -204,6 +205,7 @@ export function buildHelpCard(scope: HelpScope, noMention = true): CardObject {
       md(
         `${talkLine(noMention, '继续当前会话')}\n` +
           '· `/model` → 切换模型 / 推理强度\n' +
+          '· `/effort high` → 快速切换推理强度\n' +
           '· `/help` → 这张速查卡',
       ),
       note('开新话题：回到主群区 @我 + 内容。'),
@@ -217,6 +219,7 @@ export function buildHelpCard(scope: HelpScope, noMention = true): CardObject {
           '· `/resume` → 恢复历史会话\n' +
           '· `/settings` → 群设置（免@ 开关）\n' +
           '· `/model` → 需要在话题里用\n' +
+          '· `/effort high` → 需要在话题里用\n' +
           '· `/help` → 这张速查卡',
       ),
     );
@@ -242,6 +245,7 @@ export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string, noMe
       md(
         `${talkLine(noMention, '交给我处理')}\n` +
           '· `/model` → 切换模型 / 推理强度\n' +
+          '· `/effort high` → 快速切换推理强度\n' +
           '· `/settings` → 群设置（免@ 开关）\n' +
           '· `/help` → 命令速查卡',
       ),
@@ -255,7 +259,7 @@ export function buildWelcomeCard(kind: 'multi' | 'single', docUrl?: string, noMe
           '· `/settings` → 群设置（免@ 开关）',
       ),
       md('🧵 **话题内**'),
-      md('· 直接发消息（免@）→ 继续当前会话\n· `/model` → 切换模型 / 推理强度'),
+      md('· 直接发消息（免@）→ 继续当前会话\n· `/model` → 切换模型 / 推理强度\n· `/effort high` → 快速切换推理强度'),
       note('任意场景发 `/help` 看当前可用命令。'),
     );
   }

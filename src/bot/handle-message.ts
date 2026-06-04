@@ -26,6 +26,7 @@ import {
   buildResumeDoneCard,
   buildResumeErrorCard,
   buildResumeLaunchingCard,
+  EFFORT_LABEL,
   MC,
   RES,
   type HelpScope,
@@ -117,6 +118,11 @@ interface RunReaction {
   done: () => void;
 }
 
+type SlashCommand = 'resume' | 'model' | 'effort' | 'settings' | 'help';
+
+const FALLBACK_EFFORTS: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh'];
+const ALL_EFFORTS: ReasoningEffort[] = ['none', 'minimal', ...FALLBACK_EFFORTS];
+
 export interface Orchestrator {
   onMessage: (msg: NormalizedMessage) => Promise<void>;
   /** `comment` event handler: @bot in a cloud-doc comment → reply in-thread. */
@@ -188,6 +194,24 @@ export function createOrchestrator(
   function pickDefault(models: ModelInfo[]): { model: string; effort: ReasoningEffort } {
     const def = models.find((m) => m.isDefault && !m.hidden) ?? models.find((m) => !m.hidden) ?? models[0];
     return { model: def?.id ?? 'gpt-5.5', effort: def?.defaultEffort ?? 'medium' };
+  }
+
+  function effortOptionsForModel(models: ModelInfo[], modelId: string): ReasoningEffort[] {
+    const model = models.find((m) => m.id === modelId);
+    return model?.supportedEfforts.length ? model.supportedEfforts : FALLBACK_EFFORTS;
+  }
+
+  function formatEfforts(efforts: ReasoningEffort[]): string {
+    return efforts.map((e) => `\`${e}\`${EFFORT_LABEL[e] ? `（${EFFORT_LABEL[e]}）` : ''}`).join(' / ');
+  }
+
+  function parseEffortArg(text: string): string | undefined {
+    return /^\/effort(?:\s+(\S+))?/i.exec(text.trim())?.[1]?.toLowerCase();
+  }
+
+  function normalizeEffort(raw: string | undefined): ReasoningEffort | undefined {
+    if (!raw) return undefined;
+    return ALL_EFFORTS.includes(raw as ReasoningEffort) ? (raw as ReasoningEffort) : undefined;
   }
 
   // Feishu gives bots no way to mark a message "已读" (read receipts are a
@@ -305,6 +329,10 @@ export function createOrchestrator(
         await postModelCard(msg, msg.chatId);
         return;
       }
+      if (cmd === 'effort') {
+        await postEffortCommand(msg, msg.chatId, false);
+        return;
+      }
       handleTurn(msg, text, msg.chatId, true, project);
       return;
     }
@@ -319,6 +347,10 @@ export function createOrchestrator(
       }
       if (cmd === 'model') {
         await postModelCard(msg, msg.threadId);
+        return;
+      }
+      if (cmd === 'effort') {
+        await postEffortCommand(msg, msg.threadId, true);
         return;
       }
       handleTurn(msg, text, msg.threadId, false, project);
@@ -345,14 +377,22 @@ export function createOrchestrator(
         .catch(() => undefined);
       return;
     }
+    if (cmd === 'effort') {
+      await channel
+        .send(msg.chatId, { markdown: '`/effort` 需要在话题里使用（先 @我 开个话题）。' }, { replyTo: msg.messageId })
+        .catch(() => undefined);
+      return;
+    }
     startTopicDirectly(msg, text, project);
   };
 
-  /** Parse a leading slash command (`/resume`, `/model`, `/settings`); null otherwise. */
-  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | null {
+  /** Parse a leading slash command (`/resume`, `/model`, `/effort`, `/settings`); null otherwise. */
+  function parseCommand(text: string): SlashCommand | null {
     const m = /^\/(\w+)/.exec(text);
     const name = m?.[1]?.toLowerCase();
-    return name === 'resume' || name === 'model' || name === 'settings' || name === 'help' ? name : null;
+    return name === 'resume' || name === 'model' || name === 'effort' || name === 'settings' || name === 'help'
+      ? name
+      : null;
   }
 
   /** Whether to respond to a non-@ message in a project group (免@ default on).
@@ -629,6 +669,51 @@ export function createOrchestrator(
       pruneModelPending();
       modelPending.set(res.messageId, state);
       log.info('card', 'model', { threadId: sessionKey, model: state.model, effort: state.effort });
+    });
+  }
+
+  /** `/effort [level]`: text shortcut for changing only the current session's reasoning effort. */
+  async function postEffortCommand(msg: NormalizedMessage, sessionKey: string, inThread: boolean): Promise<void> {
+    await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
+      const [models, rec] = await Promise.all([listModels(), getSession(sessionKey)]);
+      const def = pickDefault(models);
+      const model = rec?.model ?? def.model;
+      const current = rec?.effort ?? def.effort;
+      const supported = effortOptionsForModel(models, model);
+      const raw = parseEffortArg(msg.content);
+      const reply = (markdown: string): Promise<void> =>
+        channel
+          .send(msg.chatId, { markdown }, { replyTo: msg.messageId, replyInThread: inThread })
+          .then(() => undefined)
+          .catch(() => undefined);
+
+      if (!raw) {
+        await reply(
+          `当前模型：\`${model}\`\n` +
+            `当前 effort：\`${current}\`${EFFORT_LABEL[current] ? `（${EFFORT_LABEL[current]}）` : ''}\n` +
+            `可用：${formatEfforts(supported)}\n` +
+            '用法：`/effort high`',
+        );
+        return;
+      }
+
+      const requested = raw === 'default' || raw === 'reset' ? def.effort : normalizeEffort(raw);
+      if (!requested) {
+        await reply(`未知 effort：\`${raw}\`。\n可用：${formatEfforts(supported)}`);
+        return;
+      }
+      if (!supported.includes(requested)) {
+        await reply(`当前模型 \`${model}\` 不支持 effort \`${requested}\`。\n可用：${formatEfforts(supported)}`);
+        return;
+      }
+      if (!rec) {
+        await reply('当前会话还没有完成初始化；请先让会话完成第一轮回复，再设置 `/effort`。');
+        return;
+      }
+
+      await patchSession(sessionKey, { effort: requested });
+      await reply(`✅ 已设置 effort：\`${requested}\`${EFFORT_LABEL[requested] ? `（${EFFORT_LABEL[requested]}）` : ''}，下一轮生效。`);
+      log.info('card', 'effort', { threadId: sessionKey, effort: requested });
     });
   }
 
