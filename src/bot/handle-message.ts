@@ -33,6 +33,8 @@ import {
   RUN_IDLE_TIMEOUT_MAX_SEC,
   RUN_IDLE_TIMEOUT_MIN_SEC,
   secretKeyForApp,
+  canEnableCliBridge,
+  getCliBridgePreferences,
   type AppAccess,
   type AppConfig,
   type AppPreferences,
@@ -103,6 +105,10 @@ import {
   type BackendProbeRow,
   type DoctorInfo,
 } from '../card/dm-cards';
+import { cliBridgeSettingsSection, CLI } from '../cli-bridge/cards';
+import { inspectCliBridgeHooks, installCliBridgeHooks, resolveBridgeHookCommand } from '../cli-bridge/hooks';
+import type { CliBridgeRuntimeHooks } from '../cli-bridge/service';
+export type { CliBridgeRuntimeHooks };
 import {
   currentVersion,
   daemonRunning,
@@ -493,6 +499,7 @@ export function createOrchestrator(
   channel: LarkChannel,
   cfg: AppConfig,
   fallbackCwd: string,
+  cliBridge?: CliBridgeRuntimeHooks,
 ): Orchestrator {
   /** Lazily-constructed backends by id — one instance per backend for the whole
    * bridge (mirrors the old single-instance shape; codex stays the default). */
@@ -660,6 +667,15 @@ export function createOrchestrator(
     });
 
     if (msg.chatType === 'p2p') {
+      // 本地 CLI Stop 续聊：owner 在私聊里回复任务完成卡 → 把文本喂回本地 agent。
+      // 必须抢在 handleDmConsole（任意 p2p 消息都会弹菜单卡）之前；命中即不再下传。
+      if (cliBridge?.onMessage({
+        parentId: msg.replyToMessageId,
+        rootId: msg.threadId,
+        text: msg.content,
+      })) {
+        return;
+      }
       await handleDmConsole(channel, cfg, msg);
       return;
     }
@@ -1611,6 +1627,7 @@ export function createOrchestrator(
 
   // ── card actions ──────────────────────────────────────────────────
   const dispatcher = new CardDispatcher(channel, cfg);
+  cliBridge?.register(dispatcher);
   const PENDING_TTL_MS = 30 * 60_000; // abandoned config cards expire after 30 min
   // Goal runs have NO total wall-clock cap (a healthy goal may legitimately run
   // for days — matching codex's native behavior). The only automatic backstop is
@@ -1879,14 +1896,34 @@ export function createOrchestrator(
     return m;
   };
 
-  function applyPref(evt: CardActionEvent, mut: (p: AppPreferences) => void): void {
+  // Pass { render: false } when the caller does async start/stop/repair work
+  // before refreshing the unified settings card itself.
+  function applyPref(
+    evt: CardActionEvent,
+    mut: (p: AppPreferences) => void,
+    opts?: { render?: boolean },
+  ): void {
     if (!dmAdmin(evt.operator?.openId)) return;
     const prefs: AppPreferences = { ...(cfg.preferences ?? {}) };
     mut(prefs);
     cfg.preferences = prefs;
     // persist in the background; the card only needs the in-memory cfg
     void saveConfig(cfg).catch((err) => log.fail('console', err, { phase: 'save-config' }));
-    patch(evt, buildSettingsCard(cfg));
+    if (opts?.render !== false) void patch(evt, renderSettings);
+  }
+
+  // 全局设置卡现在把「本地 agent」直接内联进来（不再是子页面）。hook 安装状态要读
+  // ~/.claude、~/.codex 三个文件，按需缓存：只有「打开设置」「修复 hooks」才刷新，
+  // 其余无关设置（并发、假死超时…）的 re-render 复用上次结果，免每次都 3 次 fs 读。
+  let cliHookStatuses: Awaited<ReturnType<typeof inspectCliBridgeHooks>> | undefined;
+  async function renderSettings(refreshHooks = false): Promise<object> {
+    if (refreshHooks || !cliHookStatuses) cliHookStatuses = await inspectCliBridgeHooks();
+    const localAgents = cliBridgeSettingsSection({
+      enabled: getCliBridgePreferences(cfg).enabled,
+      statuses: cliHookStatuses,
+      canEnable: canEnableCliBridge(cfg),
+    });
+    return buildSettingsCard(cfg, localAgents);
   }
 
   // Back-to-menu: the settings card is button-only (never locks) and the
@@ -2069,7 +2106,46 @@ export function createOrchestrator(
       patch(evt, renderProjectList);
     })
     .on(DM.settings, async ({ evt }) => {
-      if (dmAdmin(evt.operator?.openId)) await patch(evt, buildSettingsCard(cfg));
+      // Opening 设置 is the moment to re-read hook install status from disk.
+      if (dmAdmin(evt.operator?.openId)) await patch(evt, () => renderSettings(true));
+    })
+    .on(CLI.toggleEnabled, async ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const enabled = value.v === 'on';
+      if (enabled && !canEnableCliBridge(cfg).ok) return;
+      try {
+        if (enabled) {
+          await cliBridge?.start?.();
+          applyPref(evt, (p) => {
+            p.cliBridge = { ...(p.cliBridge ?? {}), enabled: true };
+          }, { render: false });
+        } else {
+          applyPref(evt, (p) => {
+            p.cliBridge = { ...(p.cliBridge ?? {}), enabled: false };
+          }, { render: false });
+          await cliBridge?.shutdown?.();
+        }
+      } catch (err) {
+        log.fail('cli-bridge', err, { phase: enabled ? 'enable' : 'disable' });
+      }
+      void patch(evt, renderSettings);
+    })
+    .on(CLI.repairHooks, async ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      // installCliBridgeHooks does raw fs writes (~/.claude, ~/.codex) that can
+      // throw (EACCES/ENOSPC); keep it inside the awaited handler so the
+      // dispatcher's try/catch covers it — there is no global rejection net
+      // (see cli-bridge/ipc.ts). Still refresh the card on failure.
+      try {
+        await installCliBridgeHooks({
+          agents: { claude: true, codex: true },
+          command: resolveBridgeHookCommand(cfg.accounts.app.id),
+        });
+      } catch (err) {
+        log.fail('cli-bridge', err, { phase: 'repair-hooks' });
+      }
+      // Just wrote the hook files — force a fresh inspect so the status reflects it.
+      await patch(evt, () => renderSettings(true));
     })
     .on(DM.doctor, async ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;

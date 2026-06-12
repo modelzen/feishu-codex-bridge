@@ -85,6 +85,8 @@ export interface AppPreferences {
   access?: AppAccess;
   /** SIGTERM→SIGKILL grace (ms) for the app-server child. Default 5000. */
   agentStopGraceMs?: number;
+  /** local Claude Code / Codex CLI bridge — see {@link CliBridgePreferences}. */
+  cliBridge?: CliBridgePreferences;
 }
 
 export interface AppConfig {
@@ -219,4 +221,134 @@ export function isUserAllowedInProject(
   const list = project?.allowedUsers;
   if (!list || list.length === 0) return true;
   return list.includes(senderId);
+}
+
+// ── local CLI agent bridge (Claude Code / Codex) ─────────────────────────────
+
+export type CliBridgeDelivery = 'always' | 'away_only';
+export type CliBridgeAgentKey = 'claude' | 'codex';
+
+/** Raw (partial) CLI bridge preferences as stored in config.json. */
+export interface CliBridgePreferences {
+  /** 总开关：是否把本地 CLI agent（Claude Code / Codex）的 hook 事件转发到飞书。默认 false。 */
+  enabled?: boolean;
+  /** 历史兼容字段；用户侧不再暴露配置，运行时固定为 away_only。 */
+  delivery?: CliBridgeDelivery;
+  /** 调试用：是否也转发由本 bridge 自己发起的会话（FEISHU_CODEX_BRIDGE=1）。默认 false，避免自我转发回环。 */
+  includeBridgeOwnedSessionsForDebugging?: boolean;
+  /** 按 agent 分别启停转发（claude / codex）。缺省时两者均为 true。 */
+  agents?: Partial<Record<CliBridgeAgentKey, boolean>>;
+  /** 权限审批（PermissionRequest）转发配置。 */
+  approval?: {
+    /** 是否转发权限审批请求。默认 true；为 false 时审批回落到本地终端处理。 */
+    enabled?: boolean;
+    /** 等待飞书审批的超时（秒），超时后回落本地。默认 86400（24 小时）。 */
+    timeoutSeconds?: number;
+  };
+  /** 任务完成 / Stop 通知配置。 */
+  taskCompletion?: {
+    /** 是否转发任务完成 / Stop 通知卡。默认 true。 */
+    enabled?: boolean;
+    /** 是否允许在飞书回复完成卡以续聊（Stop 续聊）。默认 true。 */
+    replyEnabled?: boolean;
+    /** 等待续聊回复的超时（秒），其间可被本机回归打断。默认 600（10 分钟）。 */
+    replyTimeoutSeconds?: number;
+  };
+  /** “本会话放行”（Allow this session）缓存配置。 */
+  allowCache?: {
+    /** 是否启用会话级放行缓存。默认 true。 */
+    enabled?: boolean;
+    /** 缓存粒度，目前仅支持 'session'（整个会话）。 */
+    scope?: 'session';
+  };
+  /** 本机在场检测，用于 away_only 模式判定是否“离开”。 */
+  presence?: {
+    /** 是否启用在场检测。默认 true；为 false 时 away_only 下不转发。 */
+    enabled?: boolean;
+    /** 检测平台：'auto' 自动 / 'macos' 强制走 macOS（ioreg HIDIdleTime）。默认 auto。 */
+    platform?: 'auto' | 'macos';
+    /** 判定“离开”的空闲阈值（秒）：空闲超过该值视为离开。默认 120。 */
+    idleThresholdSeconds?: number;
+  };
+}
+
+/** Fully-resolved CLI bridge preferences (every field present, normalized). */
+export interface ResolvedCliBridgePreferences {
+  enabled: boolean;
+  delivery: CliBridgeDelivery;
+  includeBridgeOwnedSessionsForDebugging: boolean;
+  agents: Record<CliBridgeAgentKey, boolean>;
+  approval: {
+    enabled: boolean;
+    timeoutSeconds: number;
+  };
+  taskCompletion: {
+    enabled: boolean;
+    replyEnabled: boolean;
+    replyTimeoutSeconds: number;
+  };
+  allowCache: {
+    enabled: boolean;
+    scope: 'session';
+  };
+  presence: {
+    enabled: boolean;
+    platform: 'auto' | 'macos';
+    idleThresholdSeconds: number;
+  };
+}
+
+function boolOr(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function secondsOr(value: unknown, fallback: number, min: number, max: number): number {
+  // 0/负数是无效配置 → 回落默认值;正数但越界才 clamp 到 [min,max]。
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(value)));
+}
+
+/** Normalize stored CLI bridge prefs into a fully-resolved, safe-defaulted shape. */
+export function getCliBridgePreferences(cfg: AppConfig): ResolvedCliBridgePreferences {
+  const raw = cfg.preferences?.cliBridge;
+  return {
+    enabled: boolOr(raw?.enabled, false),
+    delivery: 'away_only',
+    includeBridgeOwnedSessionsForDebugging: boolOr(raw?.includeBridgeOwnedSessionsForDebugging, false),
+    agents: {
+      claude: boolOr(raw?.agents?.claude, true),
+      codex: boolOr(raw?.agents?.codex, true),
+    },
+    approval: {
+      enabled: boolOr(raw?.approval?.enabled, true),
+      timeoutSeconds: secondsOr(raw?.approval?.timeoutSeconds, 86400, 1, 86400),
+    },
+    taskCompletion: {
+      enabled: boolOr(raw?.taskCompletion?.enabled, true),
+      replyEnabled: boolOr(raw?.taskCompletion?.replyEnabled, true),
+      replyTimeoutSeconds: secondsOr(raw?.taskCompletion?.replyTimeoutSeconds, 600, 1, 86400),
+    },
+    allowCache: {
+      enabled: boolOr(raw?.allowCache?.enabled, true),
+      scope: 'session',
+    },
+    presence: {
+      enabled: boolOr(raw?.presence?.enabled, true),
+      platform: raw?.presence?.platform === 'macos' ? 'macos' : 'auto',
+      idleThresholdSeconds: secondsOr(raw?.presence?.idleThresholdSeconds, 120, 10, 3600),
+    },
+  };
+}
+
+/** The owner DM target for local CLI notifications, or undefined if no owner. */
+export function resolveCliBridgeTarget(
+  cfg: AppConfig,
+): { receiveIdType: 'open_id'; receiveId: string } | undefined {
+  const owner = resolveOwner(cfg);
+  return owner ? { receiveIdType: 'open_id', receiveId: owner } : undefined;
+}
+
+/** Whether the CLI bridge master switch can be enabled (needs a bot owner). */
+export function canEnableCliBridge(cfg: AppConfig): { ok: true } | { ok: false; reason: 'missing_owner' } {
+  return resolveCliBridgeTarget(cfg) ? { ok: true } : { ok: false, reason: 'missing_owner' };
 }

@@ -1,4 +1,5 @@
 import { getSecret, setSecret, removeSecret, listSecretIds } from '../../config/keystore';
+import { readStdin } from '../../core/stdin';
 
 /**
  * `secrets get` — exec-provider endpoint. Reads a JSON-RPC-ish request from
@@ -51,17 +52,4 @@ export async function secretsList(): Promise<void> {
 export async function secretsRemove(id: string): Promise<void> {
   const ok = await removeSecret(id);
   console.log(ok ? `✓ 已删除: ${id}` : `未找到: ${id}`);
-}
-
-function readStdin(): Promise<string> {
-  return new Promise((resolve) => {
-    let data = '';
-    if (process.stdin.isTTY) {
-      resolve('');
-      return;
-    }
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (c) => (data += c));
-    process.stdin.on('end', () => resolve(data));
-  });
 }

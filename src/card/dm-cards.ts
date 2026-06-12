@@ -780,7 +780,7 @@ function settingItem(
  * *every* button on it (including ⬅️ 菜单) stops firing. Buttons never lock, so
  * this card stays fully interactive and updates in place.
  */
-export function buildSettingsCard(cfg: AppConfig): CardObject {
+export function buildSettingsCard(cfg: AppConfig, localAgents: CardElement[] = []): CardObject {
   const watchdogSec = cfg.preferences?.runIdleTimeoutSeconds ?? 120;
   return card(
     [
@@ -838,6 +838,7 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
           { label: '20', value: '20' },
         ],
       ),
+      ...localAgents,
       hr(),
       actions([button('👮 管理员', { a: DM.admins }), button('⬅️ 菜单', { a: DM.menu })]),
     ],

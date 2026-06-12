@@ -149,6 +149,15 @@ secrets
     await secretsRemove(id);
   });
 
+program
+  .command('hook', { hidden: true })
+  .requiredOption('--agent <agent>', 'claude or codex')
+  .option('--bot <nameOrAppId>', 'target bot name or appId')
+  .action(async (options: { agent: string; bot?: string }) => {
+    const { runHookCommand } = await import('../cli-bridge');
+    await runHookCommand(options.agent, options.bot);
+  });
+
 program.parseAsync(process.argv).catch((err) => {
   console.error(err instanceof Error ? err.message : String(err));
   process.exit(1);

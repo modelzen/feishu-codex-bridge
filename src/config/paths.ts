@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -67,6 +68,21 @@ export const paths = {
   /** 在跑的 start 进程注册中心（同 App 冲突检测；当前 bot） */
   get processesFile(): string {
     return join(currentBotDir, 'processes.json');
+  },
+  /**
+   * Local CLI hook IPC endpoint for the current bot. macOS/Linux use a Unix
+   * domain socket file; Windows has none, so Node maps a `\\.\pipe\…` path to a
+   * named pipe. The pipe name is hashed from the per-bot dir so the daemon and
+   * the hook subprocess (both pointed at the same bot) derive the same name,
+   * while distinct bots/users on one machine can't collide in the global pipe
+   * namespace.
+   */
+  get cliBridgeSocket(): string {
+    if (process.platform === 'win32') {
+      const tag = createHash('sha1').update(currentBotDir).digest('hex').slice(0, 16);
+      return `\\\\.\\pipe\\feishu-cli-bridge-${tag}`;
+    }
+    return join(currentBotDir, 'cli-bridge.sock');
   },
   secretsFile: join(appDir, 'secrets.enc'),
   keystoreSaltFile: join(appDir, '.keystore.salt'),

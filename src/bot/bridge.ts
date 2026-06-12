@@ -3,6 +3,8 @@ import type { AdminWriteOp } from '../admin/ops';
 import type { AppConfig } from '../config/schema';
 import { log } from '../core/logger';
 import { createOrchestrator } from './handle-message';
+import { paths } from '../config/paths';
+import { createCliBridgeService, shouldStartCliBridge } from '../cli-bridge';
 
 export interface BridgeOptions {
   cfg: AppConfig;
@@ -54,7 +56,11 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
     safety: { batch: { text: { delayMs: 0 } } },
   });
 
-  const orchestrator = createOrchestrator(channel, opts.cfg, opts.fallbackCwd);
+  // Local CLI agent bridge (Claude Code / Codex hooks → owner DM). Always create
+  // the runtime object so card actions are registered even when disabled at
+  // boot; start the IPC listener only when config says it should be live.
+  const cliBridge = createCliBridgeService({ cfg: opts.cfg, channel, socketPath: paths.cliBridgeSocket });
+  const orchestrator = createOrchestrator(channel, opts.cfg, opts.fallbackCwd, cliBridge);
   channel.on('message', orchestrator.onMessage);
   channel.on('cardAction', orchestrator.dispatcher.handle);
   // Cloud-doc comments: @bot in a doc comment (drive.notice.comment_add_v1) →
@@ -115,6 +121,11 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
   channel.on('reconnected', () => log.info('ws', 'reconnected'));
 
   await channel.connect();
+  // Never let an optional local-agent IPC bind failure (EADDRINUSE/EACCES) tear
+  // down an already-connected bot — log and stay up, mirroring shutdown's catch.
+  if (shouldStartCliBridge(opts.cfg)) {
+    await cliBridge.start().catch((err) => log.fail('cli-bridge', err, { phase: 'start' }));
+  }
   log.info('ws', 'connected', { appId: app.id, fallbackCwd: opts.fallbackCwd });
 
   let closed = false;
@@ -122,6 +133,7 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
     if (closed) return;
     closed = true;
     await orchestrator.shutdown();
+    await cliBridge.shutdown().catch((err) => log.fail('cli-bridge', err, { phase: 'shutdown' }));
     await channel.disconnect().catch((err) => log.fail('ws', err, { phase: 'disconnect' }));
   };
   return { channel, adminExecute: orchestrator.adminExecute, shutdown };

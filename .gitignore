@@ -27,6 +27,9 @@ skills-lock.json
 CLAUDE.md
 AGENTS.md
 
+# local-only smoke-test runbook (dev scratch, never published)
+docs/testing/local-agent-smoke-test.md
+
 # throwaway prototypes / protocol probes (superseded by src/)
 prototype/
 
