@@ -21,11 +21,29 @@ describe('cli bridge config helpers', () => {
       delivery: 'away_only',
       includeBridgeOwnedSessionsForDebugging: false,
       agents: { claude: true, codex: true },
+      notifyScope: 'all',
+      keepAwake: { enabled: true },
       approval: { enabled: true, timeoutSeconds: 86400 },
       taskCompletion: { enabled: true, replyEnabled: true, replyTimeoutSeconds: 600 },
       allowCache: { enabled: true, scope: 'session' },
       presence: { enabled: true, platform: 'auto', idleThresholdSeconds: 120 },
     });
+  });
+
+  it('parses notify scope and keep-awake, defaulting unknown scope to all', () => {
+    const valid = getCliBridgePreferences(cfg({
+      cliBridge: { notifyScope: 'bound_projects', keepAwake: { enabled: false } },
+    }));
+    expect(valid.notifyScope).toBe('bound_projects');
+    expect(valid.keepAwake.enabled).toBe(false);
+
+    const none = getCliBridgePreferences(cfg({ cliBridge: { notifyScope: 'none' } }));
+    expect(none.notifyScope).toBe('none');
+
+    const bogus = getCliBridgePreferences(cfg({ cliBridge: { notifyScope: 'sometimes' as never } }));
+    expect(bogus.notifyScope).toBe('all');
+    // keep-awake defaults on when omitted
+    expect(bogus.keepAwake.enabled).toBe(true);
   });
 
   it('normalizes invalid values back to defaults', () => {

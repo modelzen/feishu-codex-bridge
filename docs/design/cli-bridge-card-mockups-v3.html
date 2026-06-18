@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vonvon Bridge 卡片 · 10 方案 v3</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;background:#0b0d10;color:#e6edf3;
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",Roboto,sans-serif}
+  .head{max-width:1500px;margin:0 auto;padding:24px 22px 4px}
+  .head h1{margin:0 0 6px;font-size:21px}
+  .head p{margin:3px 0;color:#8b949e;font-size:13.5px;line-height:1.65}
+  .head code{background:#1b212a;padding:1px 6px;border-radius:5px;color:#adbac7;font-size:12px}
+  .grid{max-width:1500px;margin:0 auto;padding:14px;display:grid;
+    grid-template-columns:repeat(auto-fill,minmax(372px,1fr));gap:18px}
+  .tile{background:#11151b;border:1px solid #1f2630;border-radius:16px;overflow:hidden}
+  .label{padding:12px 15px 10px;border-bottom:1px solid #1f2630}
+  .label h3{margin:0;font-size:15.5px}
+  .label .vibe{color:#9aa4b0;font-size:12px;margin-top:3px}
+  .label .copy{color:#6e7681;font-size:11.5px;margin-top:4px;font-style:italic}
+  .chatbg{background:#ededf0;padding:14px 12px;display:flex;flex-direction:column;gap:11px}
+
+  /* ---- base Feishu-card anatomy (light only, all renderable) ---- */
+  .fcard{background:#fff;border-radius:13px;box-shadow:0 1px 2px rgba(0,0,0,.07);color:#1f2329;font-size:13.5px;overflow:hidden}
+  .pad{padding:13px 15px;display:flex;flex-direction:column;gap:9px}
+  .ttl{font-weight:700;font-size:15px;line-height:1.4}
+  .meta{display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-size:12.5px}
+  .chip{display:inline-flex;align-items:center;gap:4px;background:#f2f3f5;color:#41464c;border-radius:6px;padding:2px 9px;font-size:12px}
+  .div{height:1px;background:#eceef1;margin:2px 0}
+  .body{font-size:13.5px;line-height:1.65;color:#41464c}
+  .q{font-size:14px;font-weight:600;color:#1f2329;line-height:1.55}
+  .cwd{font-size:12.5px;color:#8a8f99}
+  .ol{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:4px;font-size:13px;color:#41464c}
+  .ol b{color:#1f2329}
+  .ol .d{color:#9aa4b0;font-size:12px}
+  .dd{border:1px solid #e5e6eb;border-radius:9px;padding:10px 12px;color:#8a8f99;font-size:13px;display:flex;justify-content:space-between;background:#fbfbfc}
+  .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:1px}
+  .btn{padding:8px 15px;border-radius:9px;font-size:13px;font-weight:600;border:1px solid #e5e6eb;background:#fff;color:#41464c}
+  .btn.pri{background:#3370ff;border-color:#3370ff;color:#fff}
+  .btn.ok{color:#1aa260;border-color:#bfe6cf}
+  .btn.danger{color:#f54a45;border-color:#ffcecc}
+  .foot{display:flex;gap:8px;align-items:flex-start;padding:9px 15px;border-top:1px solid #f0f1f3;background:#fafbfc;font-size:12px;color:#8a8f99;line-height:1.55}
+  .foot .m{font-size:15px;flex:0 0 auto}
+  .tag{margin-left:auto;font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;background:#eaf1ff;color:#3370ff}
+  .band{padding:11px 15px;font-weight:700;font-size:14.5px;color:#fff;display:flex;align-items:center;gap:6px}
+  .ttlrow{display:flex;align-items:center;gap:7px}
+
+  /* ===== V1 文字头·留白蓝 ===== */
+  .v1 .ttl{color:#1f2329}.v1 .btn.pri{background:#3370ff;border-color:#3370ff}
+  /* ===== V2 蓝色带 ===== */
+  .v2 .fcard{padding:0}.v2 .band{background:#3370ff}.v2 .tag{background:rgba(255,255,255,.22);color:#fff}
+  /* ===== V3 状态变色带 ===== */
+  .v3 .fcard{padding:0}.v3 .band.away{background:#5b9bd5}.v3 .band.sel{background:#14b8a6}
+  .v3 .tag{background:rgba(255,255,255,.22);color:#fff}.v3 .btn.pri{background:#14b8a6;border-color:#14b8a6}
+  /* ===== V4 下拉·靛蓝 ===== */
+  .v4 .ttl{color:#4338ca}.v4 .btn.pri{background:#4f46e5;border-color:#4f46e5}.v4 .chip{background:#eef0fb;color:#4338ca}
+  /* ===== V5 chip强化·翡翠 ===== */
+  .v5 .ttl{color:#0f9b8e}.v5 .btn.pri{background:#0f9b8e;border-color:#0f9b8e}
+  .v5 .chip{background:#e7f7f4;color:#0c7d72;font-weight:600;padding:3px 11px;border-radius:7px}
+  .v5 .foot{background:#f1fbf9}
+  /* ===== V6 极简graphite ===== */
+  .v6 .ttl{color:#1f2329;font-weight:800;letter-spacing:.2px}.v6 .pad{gap:12px}
+  .v6 .btn.pri{background:#374151;border-color:#374151}.v6 .btn.ok{color:#374151;border-color:#cfd4db}
+  .v6 .chip{background:#f2f3f5;color:#374151;border-radius:4px}.v6 .div{background:#374151;opacity:.13}
+  .v6 .tag{background:#374151;color:#fff}
+  /* ===== V7 暖陪伴·teal ===== */
+  .v7 .ttl{color:#0d8f80}.v7 .btn.pri{background:#12a594;border-color:#12a594}
+  .v7 .chip{background:#e6f7f4;color:#0d8f80;border-radius:20px}.v7 .foot{background:#f0fbf9}
+  .v7 .btn{border-radius:11px}.v7 .fcard{border-radius:16px}
+  /* ===== V8 珊瑚胶囊 ===== */
+  .v8 .fcard{border-radius:18px}.v8 .ttl{color:#1f2329}
+  .v8 .btn{border-radius:22px;border-color:#eceef1}.v8 .btn.pri{background:#ff5a5f;border-color:#ff5a5f}
+  .v8 .chip{background:#fff0f0;color:#e03e43;border-radius:20px}.v8 .dd{border-radius:22px}.v8 .tag{background:#fff0f0;color:#e03e43}
+  /* ===== V9 沉稳·靛蓝色带 pro ===== */
+  .v9 .fcard{padding:0}.v9 .band{background:#4f46e5}.v9 .tag{background:rgba(255,255,255,.22);color:#fff}.v9 .btn.pri{background:#4f46e5;border-color:#4f46e5}
+  /* ===== V10 极轻·sky ===== */
+  .v10 .ttl{color:#0284c7}.v10 .pad{gap:7px}.v10 .btn.pri{background:#0ea5e9;border-color:#0ea5e9}.v10 .chip{background:#e8f4fb;color:#0369a1}
+</style>
+</head>
+<body>
+<div class="head">
+  <h1>🌉 Vonvon Bridge · 卡片 10 方案(v3 · 全浅色 · 飞书可渲染 · 文案重写)</h1>
+  <p>固定:品牌前缀 <code>🌉 Vonvon Bridge</code>;字段 = <code>💬 会话名</code> + <code>🤖 Claude Code(无 "Agent:" key)</code>;<b>去掉载体</b>;<b>cwd 只在「离开提示卡」出现一次</b>,其余卡不带。</p>
+  <p>每格渲染【离开提示卡(带 cwd)+ 选择卡(不带 cwd)】;权限卡/完成卡同皮。挑一个或混搭。</p>
+</div>
+
+<div class="grid">
+
+  <!-- V1 -->
+  <div class="tile v1">
+    <div class="label"><h3>V1 · 文字头 · 留白蓝</h3><div class="vibe">无色带 · 大留白 · 经典蓝 · 友好克制</div><div class="copy">"我把桥架好了" / "桥那头卡了个选择"</div></div>
+    <div class="chatbg">
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 你离开了,我来接力</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="body">本地正在跑活儿 —— 接下来要审批 / 提问 / 收尾,我都从这座桥递给你。</div>
+        <div class="cwd">📂 当前项目 · ~/…/mutual-activity</div>
+      </div><div class="foot"><span class="m">🌉</span><span>回到电脑(解锁 / 动键鼠)我就把桥收了,绝不打扰。</span></div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 桥那头卡了个选择</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="div"></div>
+        <div class="q">这次改动部署到哪个环境?</div>
+        <ul class="ol"><li><b>预发 staging</b> <span class="d">— 先上预发验证</span></li><li><b>生产 production</b> <span class="d">— 直接上线</span></li></ul>
+        <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">✍️ 自定义</div></div>
+      </div></div>
+    </div>
+  </div>
+
+  <!-- V2 -->
+  <div class="tile v2">
+    <div class="label"><h3>V2 · 蓝色带 · 状态 tag</h3><div class="vibe">飞书原生头部色带 + 右上状态 · 最"官方"</div><div class="copy">简洁专业:"已接管" / "需要你做个选择"</div></div>
+    <div class="chatbg">
+      <div class="fcard">
+        <div class="band">🌉 Vonvon Bridge<span class="tag">已接管</span></div>
+        <div class="pad">
+          <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+          <div class="body">你离开期间,本地 Claude Code 的审批 / 提问 / 完成都转发到这里。</div>
+          <div class="cwd">📂 当前项目 · ~/…/mutual-activity</div>
+          <div class="body" style="color:#8a8f99;font-size:12px">回到电脑自动停止转发。</div>
+        </div>
+      </div>
+      <div class="fcard">
+        <div class="band">🌉 Vonvon Bridge<span class="tag">等待选择</span></div>
+        <div class="pad">
+          <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+          <div class="q">这次改动部署到哪个环境?</div>
+          <ul class="ol"><li><b>预发 staging</b> <span class="d">— 先上预发验证</span></li><li><b>生产 production</b> <span class="d">— 直接上线</span></li></ul>
+          <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">自定义…</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- V3 -->
+  <div class="tile v3">
+    <div class="label"><h3>V3 · 状态变色带</h3><div class="vibe">色带按语义变色:离开=浅蓝 / 选择=青 / 审批=蓝 / 完成=绿</div><div class="copy">一眼看出"什么事":颜色即状态</div></div>
+    <div class="chatbg">
+      <div class="fcard">
+        <div class="band away">🌉 Vonvon Bridge · 已接管<span class="tag">离开中</span></div>
+        <div class="pad">
+          <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+          <div class="body">检测到你离开。本地的审批 / 提问 / 完成,我都帮你递到这儿。</div>
+          <div class="cwd">📂 当前项目 · ~/…/mutual-activity</div>
+        </div>
+      </div>
+      <div class="fcard">
+        <div class="band sel">🌉 Vonvon Bridge · 选择<span class="tag">等待选择</span></div>
+        <div class="pad">
+          <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+          <div class="q">这次改动部署到哪个环境?</div>
+          <ul class="ol"><li><b>预发 staging</b> <span class="d">— 先上预发验证</span></li><li><b>生产 production</b> <span class="d">— 直接上线</span></li></ul>
+          <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">自定义…</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- V4 -->
+  <div class="tile v4">
+    <div class="label"><h3>V4 · 下拉式 · 靛蓝</h3><div class="vibe">用原生下拉做选择(最像参考图)· 提交/取消</div><div class="copy">⚠ 下拉一交互会锁卡(只一次提交可接受)</div></div>
+    <div class="chatbg">
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 已接管,你离开啦</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="body">本地任务进行中,要紧的节点我都从桥这头递给你。</div>
+        <div class="cwd">📂 当前项目 · ~/…/mutual-activity</div>
+      </div><div class="foot"><span class="m">🌉</span><span>回到电脑即自动收桥。</span></div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 需要你定一下</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="div"></div>
+        <div class="q">这次改动部署到哪个环境?</div>
+        <div class="dd"><span>请选择…</span><span>⌄</span></div>
+        <div class="btns"><div class="btn pri">提交</div><div class="btn">取消</div></div>
+      </div></div>
+    </div>
+  </div>
+
+  <!-- V5 -->
+  <div class="tile v5">
+    <div class="label"><h3>V5 · chip 强化 · 翡翠</h3><div class="vibe">会话/Agent 做成醒目 chip · 翡翠绿 · 信息一眼到位</div><div class="copy">"桥这头帮你接住了一个选择"</div></div>
+    <div class="chatbg">
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 你离开了,桥已接上</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="body">本地还在干活,接下来需要你的地方,我都递过来。</div>
+        <div class="cwd">📂 当前项目 · ~/…/mutual-activity</div>
+      </div><div class="foot"><span class="m">🌉</span><span>你一回来,我就把桥撤了。</span></div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 帮你接住一个选择</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="div"></div>
+        <div class="q">这次改动部署到哪个环境?</div>
+        <ul class="ol"><li><b>预发 staging</b> <span class="d">— 先上预发验证</span></li><li><b>生产 production</b> <span class="d">— 直接上线</span></li></ul>
+        <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">✍️ 自定义</div></div>
+      </div></div>
+    </div>
+  </div>
+
+  <!-- V6 -->
+  <div class="tile v6">
+    <div class="label"><h3>V6 · 极简 graphite</h3><div class="vibe">墨灰 · 强排版 · 大留白 · 无吉祥物语 · 工具感</div><div class="copy">极简:"已接管" / "选择 · 部署环境"</div></div>
+    <div class="chatbg">
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 已接管</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="body">你离开期间,本地的审批 / 提问 / 完成转发到此。</div>
+        <div class="cwd">📂 ~/…/mutual-activity</div>
+      </div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 选择</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="div"></div>
+        <div class="q">这次改动部署到哪个环境?</div>
+        <ul class="ol"><li><b>预发 staging</b> <span class="d">— 先上预发验证</span></li><li><b>生产 production</b> <span class="d">— 直接上线</span></li></ul>
+        <div class="btns"><div class="btn pri">预发</div><div class="btn ok">生产</div><div class="btn ok">自定义…</div></div>
+      </div></div>
+    </div>
+  </div>
+
+  <!-- V7 -->
+  <div class="tile v7">
+    <div class="label"><h3>V7 · 暖陪伴 · teal</h3><div class="vibe">暖青 · 大圆角 · 吉祥物语温柔 · 陪伴感最强</div><div class="copy">"你忙你的,桥这头我盯着"</div></div>
+    <div class="chatbg">
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 你走开啦,我守着桥</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="body">本地还在跑,等下要你拍板的事,我都好好递到你手上。</div>
+        <div class="cwd">📂 当前项目 · ~/…/mutual-activity</div>
+      </div><div class="foot"><span class="m">🌉</span><span>你忙你的~ 回到电脑我立刻收桥,半点不打扰。</span></div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 有个选择等你</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="div"></div>
+        <div class="q">这次改动部署到哪个环境?</div>
+        <ul class="ol"><li><b>预发 staging</b> <span class="d">— 先上预发验证</span></li><li><b>生产 production</b> <span class="d">— 直接上线</span></li></ul>
+        <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">✍️ 自定义</div></div>
+      </div><div class="foot"><span class="m">🌉</span><span>选好就行,剩下的交给我~</span></div></div>
+    </div>
+  </div>
+
+  <!-- V8 -->
+  <div class="tile v8">
+    <div class="label"><h3>V8 · 珊瑚胶囊</h3><div class="vibe">珊瑚红点缀 · 全胶囊圆角 · 现代 SaaS 感</div><div class="copy">轻快:"桥接好了" / "选一个吧"</div></div>
+    <div class="chatbg">
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 桥接好了</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="body">你离开后,本地需要你的地方都从这里找你。</div>
+        <div class="cwd">📂 当前项目 · ~/…/mutual-activity</div>
+      </div><div class="foot"><span class="m">🌉</span><span>回到电脑自动断开,不打扰。</span></div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 选一个吧</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="div"></div>
+        <div class="q">这次改动部署到哪个环境?</div>
+        <ul class="ol"><li><b>预发 staging</b> <span class="d">— 先上预发验证</span></li><li><b>生产 production</b> <span class="d">— 直接上线</span></li></ul>
+        <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">自定义…</div></div>
+      </div></div>
+    </div>
+  </div>
+
+  <!-- V9 -->
+  <div class="tile v9">
+    <div class="label"><h3>V9 · 沉稳 · 靛蓝色带 pro</h3><div class="vibe">靛蓝头部色带 · 简洁专业 · 不卖萌</div><div class="copy">克制:"已接管你的本地 agent"</div></div>
+    <div class="chatbg">
+      <div class="fcard">
+        <div class="band">🌉 Vonvon Bridge<span class="tag">已接管</span></div>
+        <div class="pad">
+          <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+          <div class="body">检测到你离开,已接管本地 agent。审批 / 提问 / 完成转发到此。</div>
+          <div class="cwd">📂 当前项目 · ~/…/mutual-activity</div>
+        </div>
+      </div>
+      <div class="fcard">
+        <div class="band">🌉 Vonvon Bridge<span class="tag">等待选择</span></div>
+        <div class="pad">
+          <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+          <div class="q">这次改动部署到哪个环境?</div>
+          <ul class="ol"><li><b>预发 staging</b> <span class="d">— 先上预发验证</span></li><li><b>生产 production</b> <span class="d">— 直接上线</span></li></ul>
+          <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">自定义…</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- V10 -->
+  <div class="tile v10">
+    <div class="label"><h3>V10 · 极轻 · sky</h3><div class="vibe">最轻 · 无分割线/吉祥物语 · 天蓝 · 一眼看完</div><div class="copy">极短:"接力中" / "选哪个?"</div></div>
+    <div class="chatbg">
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 接力中</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="body">你离开了,本地的事我帮你接到这儿。📂 ~/…/mutual-activity</div>
+      </div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ttl">🌉 Vonvon Bridge · 选哪个?</div>
+        <div class="meta"><span class="chip">🤖 Claude Code</span><span class="chip">💬 temp_ftw</span></div>
+        <div class="q">这次改动部署到哪个环境?</div>
+        <ul class="ol"><li><b>预发 staging</b> <span class="d">— 先上预发验证</span></li><li><b>生产 production</b> <span class="d">— 直接上线</span></li></ul>
+        <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">✍️ 自定义</div></div>
+      </div></div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,4 +1,4 @@
-import type { CliBridgeAgent, CliHookMessage, CliHookMessageType } from './types';
+import type { CliBridgeAgent, CliHookMessage, CliHookMessageType, CliQuestionItem } from './types';
 
 function normalizeEventName(eventName?: string): string | undefined {
   if (!eventName) return eventName;
@@ -70,36 +70,43 @@ export function parseHookPayload(
 }
 
 export interface CliAskUserQuestion {
-  question: string;
-  header?: string;
-  options: { label: string; description?: string; preview?: string }[];
+  questions: CliQuestionItem[];
 }
 
+/** Parse an AskUserQuestion / ask_user_question tool_input into 1-4 validated
+ *  questions. Single- and multi-select are both accepted (the old single-question,
+ *  single-select-only restriction is gone — the card now renders a multi-question
+ *  form). Returns undefined (→ fall back to the local terminal) if the shape is
+ *  unrecognized or any one question is malformed, so we never half-render garbage. */
 export function extractAskUserQuestion(toolInput: Record<string, unknown>): CliAskUserQuestion | undefined {
-  const questions = toolInput.questions;
-  if (!Array.isArray(questions) || questions.length !== 1) return undefined;
-  const q = questions[0];
-  if (!q || typeof q !== 'object' || Array.isArray(q)) return undefined;
-  const obj = q as Record<string, unknown>;
-  if (obj.multiSelect === true) return undefined;
-  const question = typeof obj.question === 'string' ? obj.question.trim() : '';
-  if (!question) return undefined;
-  const rawOptions = obj.options;
-  if (!Array.isArray(rawOptions) || rawOptions.length < 2) return undefined;
-  const options = rawOptions.flatMap((option) => {
-    if (!option || typeof option !== 'object' || Array.isArray(option)) return [];
-    const o = option as Record<string, unknown>;
-    if (typeof o.label !== 'string' || !o.label.trim()) return [];
+  const rawQuestions = toolInput.questions;
+  if (!Array.isArray(rawQuestions) || rawQuestions.length < 1 || rawQuestions.length > 4) return undefined;
+  const questions = rawQuestions.flatMap((raw): CliQuestionItem[] => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
+    const obj = raw as Record<string, unknown>;
+    const question = typeof obj.question === 'string' ? obj.question.trim() : '';
+    if (!question) return [];
+    const rawOptions = obj.options;
+    if (!Array.isArray(rawOptions) || rawOptions.length < 2) return [];
+    const options = rawOptions.flatMap((option) => {
+      if (!option || typeof option !== 'object' || Array.isArray(option)) return [];
+      const o = option as Record<string, unknown>;
+      if (typeof o.label !== 'string' || !o.label.trim()) return [];
+      return [{
+        label: o.label.trim(),
+        description: typeof o.description === 'string' && o.description.trim() ? o.description.trim() : undefined,
+        preview: typeof o.preview === 'string' && o.preview.trim() ? o.preview.trim() : undefined,
+      }];
+    });
+    if (options.length !== rawOptions.length) return [];
     return [{
-      label: o.label.trim(),
-      description: typeof o.description === 'string' && o.description.trim() ? o.description.trim() : undefined,
-      preview: typeof o.preview === 'string' && o.preview.trim() ? o.preview.trim() : undefined,
+      question,
+      header: typeof obj.header === 'string' && obj.header.trim() ? obj.header.trim() : undefined,
+      multiSelect: obj.multiSelect === true,
+      options,
     }];
   });
-  if (options.length !== rawOptions.length) return undefined;
-  return {
-    question,
-    header: typeof obj.header === 'string' && obj.header.trim() ? obj.header.trim() : undefined,
-    options,
-  };
+  // Any one question failing validation drops the whole ask → local fallback.
+  if (questions.length !== rawQuestions.length) return undefined;
+  return { questions };
 }

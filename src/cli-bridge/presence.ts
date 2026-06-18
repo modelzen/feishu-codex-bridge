@@ -48,6 +48,27 @@ async function readMacIdleSeconds(): Promise<number> {
   return seconds;
 }
 
+// Lock = an explicit "I left" signal, so we treat it as away instantly rather
+// than waiting out the idle threshold (you might lock and walk off before
+// HIDIdleTime crosses the bar). The login-session dict exposed under the
+// IORegistry root's IOConsoleUsers carries CGSSessionScreenIsLocked = Yes while
+// the screen is locked (absent / No otherwise) — no extra dep, sudo-free, same
+// ioreg shell-out style as the idle read. Lid-closed sleep is out of scope.
+export function parseScreenLocked(ioregStdout: string): boolean {
+  return /CGSSessionScreenIsLocked"?\s*=\s*Yes/.test(ioregStdout);
+}
+
+let lockCache: { locked: boolean; at: number } | undefined;
+
+async function readMacScreenLocked(): Promise<boolean> {
+  const now = Date.now();
+  if (lockCache && now - lockCache.at < IDLE_READ_TTL_MS) return lockCache.locked;
+  const { stdout } = await execFileAsync('/usr/sbin/ioreg', ['-n', 'Root', '-d1', '-k', 'IOConsoleUsers']);
+  const locked = parseScreenLocked(stdout);
+  lockCache = { locked, at: now };
+  return locked;
+}
+
 // Windows analogue of HIDIdleTime: GetLastInputInfo (user32) returns ms since the
 // last keyboard/mouse input. Called via PowerShell + inline C# — no native dep,
 // mirroring the ioreg shell-out; -EncodedCommand sidesteps quoting/newline issues.
@@ -86,12 +107,19 @@ export async function resolveCliLocalActivity(prefs: ResolvedCliBridgePreference
   // platform:'macos' forces the ioreg reader regardless of the host (the documented
   // "强制走 macOS"); 'auto' picks by process.platform. Forcing it off a Mac just makes
   // the ioreg exec throw → caught below as presence_failed (fail-closed on Unix).
+  const useMacReaders =
+    prefs.presence.platform === 'macos' || (prefs.presence.platform === 'auto' && process.platform === 'darwin');
   const readIdleSeconds =
-    prefs.presence.platform === 'macos' ? readMacIdleSeconds
-      : process.platform === 'darwin' ? readMacIdleSeconds
-        : process.platform === 'win32' ? readWindowsIdleSeconds
-          : undefined;
+    useMacReaders ? readMacIdleSeconds
+      : process.platform === 'win32' ? readWindowsIdleSeconds
+        : undefined;
   if (!readIdleSeconds) return { localActive: false, reason: 'presence_failed' };
+  // 锁屏 = 明确的“我走了”，立刻判离开（不必等空闲阈值）。锁屏读取失败只是落回下面的
+  // 空闲判定，绝不阻断空闲路径。Windows 的锁屏已由 readWindowsIdleSeconds 的 LogonUI
+  // 分支折成超大空闲值覆盖，无需在此另判。
+  if (useMacReaders && (await readMacScreenLocked().catch(() => false))) {
+    return { localActive: false, reason: 'away' };
+  }
   try {
     const idleSeconds = await readIdleSeconds();
     return idleSeconds >= prefs.presence.idleThresholdSeconds

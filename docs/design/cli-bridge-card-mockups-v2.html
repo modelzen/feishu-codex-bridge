@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>桥接卡片 · 10 个风格方向 v2</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;background:#0b0d10;color:#e6edf3;
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",Roboto,sans-serif}
+  .head{max-width:1500px;margin:0 auto;padding:26px 22px 6px}
+  .head h1{margin:0 0 6px;font-size:21px}
+  .head p{margin:3px 0;color:#8b949e;font-size:13.5px;line-height:1.6}
+  .grid{max-width:1500px;margin:0 auto;padding:16px;display:grid;
+    grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:18px}
+  .tile{background:#11151b;border:1px solid #1f2630;border-radius:16px;overflow:hidden}
+  .label{padding:12px 15px 10px;border-bottom:1px solid #1f2630}
+  .label h3{margin:0;font-size:16px;display:flex;align-items:center;gap:8px}
+  .label .vibe{color:#9aa4b0;font-size:12px;margin-top:3px}
+  .label .feas{font-size:11px;color:#6e7681;margin-top:5px}
+  .label .feas b{color:#7ee787}
+  .label .feas b.warn{color:#e3b341}
+  .chatbg{background:#ededf0;padding:14px 12px;display:flex;flex-direction:column;gap:11px}
+
+  /* ---------- shared Feishu-card anatomy (modeled on the reference) ---------- */
+  .fcard{background:#fff;border-radius:13px;box-shadow:0 1px 2px rgba(0,0,0,.07);
+    color:#1f2329;font-size:13.5px;overflow:hidden}
+  .pad{padding:13px 15px;display:flex;flex-direction:column;gap:10px}
+  .ftitle{font-weight:700;font-size:15.5px;line-height:1.4;display:flex;gap:7px;align-items:flex-start}
+  .fmeta{font-size:13px;color:#646a73}
+  .fmeta .v{color:#1f2329}
+  .fchips{font-size:12.5px;color:#8a8f99;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .chip{display:inline-block;background:#f2f3f5;color:#41464c;border-radius:6px;padding:2px 9px;font-size:12px}
+  .fdiv{height:1px;background:#eceef1;margin:3px 0}
+  .fq{font-size:14px;color:#1f2329;line-height:1.6;font-weight:500}
+  .code{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:12.5px;background:#f5f6f7;
+    border-radius:8px;padding:9px 11px;white-space:pre-wrap;word-break:break-all}
+  .dd{border:1px solid #e5e6eb;border-radius:9px;padding:10px 12px;color:#8a8f99;font-size:13px;
+    display:flex;justify-content:space-between;align-items:center;background:#fbfbfc}
+  .opt{border:1px solid #eceef1;border-radius:9px;padding:8px 11px}
+  .opt b{font-size:13px}.opt span{display:block;color:#8a8f99;font-size:11.5px;margin-top:1px}
+  .opts{display:flex;flex-direction:column;gap:6px}
+  .btns{display:flex;gap:9px;flex-wrap:wrap}
+  .btn{padding:8px 16px;border-radius:9px;font-size:13px;font-weight:600;border:1px solid #e5e6eb;background:#fff;color:#41464c}
+  .btn.pri{background:#3370ff;border-color:#3370ff;color:#fff}
+  .btn.ok{color:#1aa260;border-color:#bfe6cf}
+  .btn.danger{color:#f54a45;border-color:#ffcecc}
+  .ffoot{display:flex;gap:8px;align-items:flex-start;padding:10px 15px;border-top:1px solid #f0f1f3;
+    background:#fafbfc;font-size:12px;color:#8a8f99;line-height:1.55}
+  .ffoot .m{font-size:16px;flex:0 0 auto;line-height:1.2}
+  .stat{margin-left:auto;font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;background:#eaf1ff;color:#3370ff}
+
+  /* ============ 1 · 猫屿 (teal cat island) ============ */
+  .t1 .ftitle{color:#0f7e85}
+  .t1 .btn.pri{background:#18a0a8;border-color:#18a0a8}
+  .t1 .chip{background:#e9f6f6;color:#0f7e85}
+  .t1 .ffoot{background:#f2fbfb}
+  .t1 .stat{background:#e9f6f6;color:#0f7e85}
+
+  /* ============ 2 · 守夜猫头鹰 (indigo nocturne) ============ */
+  .t2 .fcard{background:#fbfbff}
+  .t2 .ftitle{color:#4351c9}
+  .t2 .btn.pri{background:#5b6ee1;border-color:#5b6ee1}
+  .t2 .chip{background:#eceffb;color:#4351c9}
+  .t2 .ffoot{background:#f4f5fe}
+  .t2 .stat{background:#eceffb;color:#4351c9}
+
+  /* ============ 3 · 信鸽驿 (kraft amber post) ============ */
+  .t3 .fcard{background:#fffdf8}
+  .t3 .ftitle{color:#a86d22}
+  .t3 .btn.pri{background:#c4882f;border-color:#c4882f}
+  .t3 .chip{background:#f6ecd8;color:#8a611f}
+  .t3 .code{background:#f7f1e4}
+  .t3 .ffoot{background:#fbf5e9}
+  .t3 .stat{background:#f6ecd8;color:#8a611f}
+  .t3 .fcard{border:1px solid #efe4cf}
+
+  /* ============ 4 · 墨 Mono (editorial ink) ============ */
+  .t4 .ftitle{color:#1f2329;font-weight:800;letter-spacing:.3px}
+  .t4 .pad{gap:12px}
+  .t4 .btn.pri{background:#1f2329;border-color:#1f2329}
+  .t4 .btn.ok{color:#1f2329;border-color:#c9ccd1}
+  .t4 .chip{background:#f2f3f5;color:#1f2329;border-radius:3px}
+  .t4 .fdiv{background:#1f2329;opacity:.12}
+  .t4 .stat{background:#1f2329;color:#fff}
+
+  /* ============ 5 · tty 终端 (green dev) ============ */
+  .t5 .fcard{background:#0d1117;color:#c9d1d9;border:1px solid #21262d}
+  .t5 .ftitle{color:#7ee787;font-family:"SF Mono",monospace;font-size:14px}
+  .t5 .fmeta{color:#8b949e}.t5 .fmeta .v{color:#c9d1d9}
+  .t5 .fq{color:#c9d1d9}
+  .t5 .chip{background:#161b22;color:#8b949e;border:1px solid #21262d;font-family:"SF Mono",monospace}
+  .t5 .code{background:#010409;color:#7ee787;border:1px solid #21262d}
+  .t5 .fdiv{background:#21262d}
+  .t5 .opt{border-color:#21262d}.t5 .opt span{color:#8b949e}
+  .t5 .btn{background:#161b22;color:#c9d1d9;border-color:#30363d;font-family:"SF Mono",monospace}
+  .t5 .btn.pri{background:#238636;border-color:#238636;color:#fff}
+  .t5 .btn.ok{color:#7ee787;border-color:#238636}
+  .t5 .btn.danger{color:#ff7b72;border-color:#5a2422}
+  .t5 .dd{background:#010409;border-color:#21262d;color:#6e7681}
+  .t5 .ffoot{background:#0d1117;border-top:1px solid #21262d;color:#8b949e}
+  .t5 .stat{background:#1f2a44;color:#79c0ff}
+
+  /* ============ 6 · 水豚 (cozy capybara sand) ============ */
+  .t6 .fcard{background:#fffdfa;border:1px solid #efe7da}
+  .t6 .ftitle{color:#9a6b3f}
+  .t6 .pad{gap:11px}
+  .t6 .btn.pri{background:#c98a52;border-color:#c98a52}
+  .t6 .chip{background:#f3ebe0;color:#8a6238;border-radius:20px}
+  .t6 .opt{border-radius:14px;border-color:#efe7da}
+  .t6 .btn{border-radius:20px}
+  .t6 .ffoot{background:#faf4ec}
+  .t6 .stat{background:#f3ebe0;color:#8a6238}
+
+  /* ============ 7 · 哨 Sentinel (steel/security) ============ */
+  .t7 .ftitle{color:#1b54c0}
+  .t7 .btn.pri{background:#2f6feb;border-color:#2f6feb}
+  .t7 .chip{background:#eaf1fe;color:#1b54c0;border-radius:4px;border:1px solid #d4e2fb}
+  .t7 .stat{background:#eaf1fe;color:#1b54c0;border:1px solid #d4e2fb}
+  .t7 .opt{border-color:#dde6f5}
+
+  /* ============ 8 · 像素 Pixel (retro violet, square) ============ */
+  .t8 .fcard{border-radius:4px;border:2px solid #2a2140}
+  .t8 .ftitle{color:#6d28d9}
+  .t8 .pad{gap:10px}
+  .t8 .btn{border-radius:3px;border:2px solid #d9cffa;color:#5b21b6}
+  .t8 .btn.pri{background:#7c3aed;border-color:#5b21b6;color:#fff}
+  .t8 .chip{background:#efe7fd;color:#6d28d9;border-radius:3px}
+  .t8 .code{border-radius:3px;background:#f3eeff}
+  .t8 .opt{border-radius:3px;border:2px solid #ece5fb}
+  .t8 .dd{border-radius:3px}
+  .t8 .ffoot{background:#f7f3ff}
+  .t8 .stat{background:#efe7fd;color:#6d28d9;border-radius:3px}
+
+  /* ============ 9 · 胶囊 Capsule (modern SaaS, coral, pill) ============ */
+  .t9 .fcard{border-radius:18px}
+  .t9 .ftitle{color:#1f2329;font-weight:700}
+  .t9 .btn{border-radius:22px;border-color:#eceef1}
+  .t9 .btn.pri{background:#ff5a5f;border-color:#ff5a5f}
+  .t9 .chip{background:#fff0f0;color:#e03e43;border-radius:20px}
+  .t9 .opt{border-radius:16px}
+  .t9 .dd{border-radius:22px}
+  .t9 .stat{background:#fff0f0;color:#e03e43}
+
+  /* ============ 10 · 原生 Pro (Feishu header band) ============ */
+  .t10 .fcard{padding:0}
+  .t10 .band{padding:11px 15px;font-weight:700;font-size:15px;color:#fff;display:flex;align-items:center;gap:7px}
+  .t10 .band.blue{background:#3370ff}
+  .t10 .band.green{background:#34c759}
+  .t10 .band .stat{background:rgba(255,255,255,.25);color:#fff}
+  .t10 .chip{background:#f2f3f5}
+  .t10 .btn.pri{background:#3370ff;border-color:#3370ff}
+</style>
+</head>
+<body>
+<div class="head">
+  <h1>桥接卡片 · 10 个风格方向(v2,学参考图的"好骨架")</h1>
+  <p>统一骨架(借鉴你给的参考图):<b>品牌前缀标题 · 会话/Agent chip · 轻分割线 · 单一强调色 · 底部吉祥物语</b>;换 10 种人格的皮。每格渲染同样内容的【选择卡 + 审批卡】,只比风格。</p>
+  <p>每个标了「飞书可行性」。挑一个,或混搭(如"3 的骨架 + 1 的猫")。定了我出全套终稿 + 落到 cards.ts。</p>
+</div>
+
+<div class="grid">
+
+  <!-- 1 猫屿 -->
+  <div class="tile t1">
+    <div class="label"><h3>🐱🏝️ 1 · 猫屿</h3><div class="vibe">暖 teal · 猫吉祥物 · 友好陪伴(最贴你说的"小猫")</div><div class="feas">飞书可行性:<b>✓ 全可</b>(吉祥物用 emoji 或上传猫图)</div></div>
+    <div class="chatbg">
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>🐱</span><span>猫屿 · 有个选择题找你</span></div>
+        <div class="fmeta">💬 会话 <span class="v">temp_ftw</span></div>
+        <div class="fchips">Agent<span class="chip">Claude Code</span>载体<span class="chip">Cmux</span></div>
+        <div class="fdiv"></div>
+        <div class="fq">这次改动部署到哪个环境?</div>
+        <div class="opts"><div class="opt"><b>预发 staging</b><span>先上预发验证</span></div><div class="opt"><b>生产 production</b><span>直接上线</span></div></div>
+        <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">✍️ 自定义</div></div>
+      </div><div class="ffoot"><span class="m">🐱</span><span>喵~ 你不在,我帮你把问题叼过来了,选一个就行。</span></div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>🐱</span><span>猫屿 · 想动手,等你点头</span><span class="stat">等待审批</span></div>
+        <div class="fchips">Agent<span class="chip">Claude Code</span>工具<span class="chip">Bash</span></div>
+        <div class="code">echo hello-from-bridge-test</div>
+        <div class="btns"><div class="btn ok">✅ 允许</div><div class="btn">🔁 始终</div><div class="btn danger">⛔ 拒绝</div></div>
+      </div><div class="ffoot"><span class="m">🐱</span><span>盯着呢,不会让电脑睡过去~</span></div></div>
+    </div>
+  </div>
+
+  <!-- 2 守夜 -->
+  <div class="tile t2">
+    <div class="label"><h3>🦉 2 · 守夜猫头鹰</h3><div class="vibe">靛蓝夜色 · 沉稳守护 · "夜里替你盯着"</div><div class="feas">飞书可行性:<b>✓ 全可</b></div></div>
+    <div class="chatbg">
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>🦉</span><span>守夜 · 一个选择交给你</span></div>
+        <div class="fmeta">💬 会话 <span class="v">temp_ftw</span></div>
+        <div class="fchips">Agent<span class="chip">Claude Code</span>载体<span class="chip">Cmux</span></div>
+        <div class="fdiv"></div>
+        <div class="fq">这次改动部署到哪个环境?</div>
+        <div class="dd"><span>请选择…</span><span>⌄</span></div>
+        <div class="btns"><div class="btn pri">提交</div><div class="btn">取消</div></div>
+      </div><div class="ffoot"><span class="m">🦉</span><span>你离开期间我在替你守夜,回来即收工。</span></div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>🦉</span><span>守夜 · 权限请求</span><span class="stat">等待审批</span></div>
+        <div class="fchips">Agent<span class="chip">Claude Code</span>工具<span class="chip">Bash</span></div>
+        <div class="code">echo hello-from-bridge-test</div>
+        <div class="btns"><div class="btn pri">允许</div><div class="btn">始终允许</div><div class="btn danger">拒绝</div></div>
+      </div><div class="ffoot"><span class="m">🦉</span><span>夜深了也别担心,我都给你拦着。</span></div></div>
+    </div>
+  </div>
+
+  <!-- 3 信鸽 -->
+  <div class="tile t3">
+    <div class="label"><h3>🕊️ 3 · 信鸽驿</h3><div class="vibe">牛皮纸暖琥珀 · 邮差/信使 · "帮你叼消息"</div><div class="feas">飞书可行性:<b>✓ 可</b>(纸纹做不了,只能靠暖色)</div></div>
+    <div class="chatbg">
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>🕊️</span><span>信鸽驿 · 捎来一个问题</span></div>
+        <div class="fmeta">💬 会话 <span class="v">temp_ftw</span></div>
+        <div class="fchips">Agent<span class="chip">Claude Code</span>载体<span class="chip">Cmux</span></div>
+        <div class="fdiv"></div>
+        <div class="fq">这次改动部署到哪个环境?</div>
+        <div class="opts"><div class="opt"><b>预发 staging</b><span>先上预发验证</span></div><div class="opt"><b>生产 production</b><span>直接上线</span></div></div>
+        <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">✍️ 自定义</div></div>
+      </div><div class="ffoot"><span class="m">🕊️</span><span>你不在桌前,这封"问询"我先帮你送到。</span></div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>🕊️</span><span>信鸽驿 · 一份待批</span><span class="stat">等待审批</span></div>
+        <div class="fchips">Agent<span class="chip">Claude Code</span>工具<span class="chip">Bash</span></div>
+        <div class="code">echo hello-from-bridge-test</div>
+        <div class="btns"><div class="btn ok">✅ 允许</div><div class="btn">🔁 始终</div><div class="btn danger">⛔ 拒绝</div></div>
+      </div><div class="ffoot"><span class="m">🕊️</span><span>批了我立刻飞回去传话。</span></div></div>
+    </div>
+  </div>
+
+  <!-- 4 墨 -->
+  <div class="tile t4">
+    <div class="label"><h3>▪ 4 · 墨 Mono</h3><div class="vibe">黑白 · 无吉祥物 · 强排版/大留白 · 编辑感</div><div class="feas">飞书可行性:<b>✓ 全可</b>(最稳)</div></div>
+    <div class="chatbg">
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>选择 · 部署环境</span></div>
+        <div class="fchips">Claude Code<span class="chip">temp_ftw</span><span class="chip">Cmux</span></div>
+        <div class="fdiv"></div>
+        <div class="fq">这次改动部署到哪个环境?</div>
+        <div class="opts"><div class="opt"><b>预发 staging</b><span>先上预发验证</span></div><div class="opt"><b>生产 production</b><span>直接上线</span></div></div>
+        <div class="btns"><div class="btn pri">预发</div><div class="btn ok">生产</div><div class="btn ok">自定义…</div></div>
+      </div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>权限 · Bash</span><span class="stat">PENDING</span></div>
+        <div class="fchips"><span class="chip">PermissionRequest</span><span class="chip">21:27</span></div>
+        <div class="code">echo hello-from-bridge-test</div>
+        <div class="btns"><div class="btn pri">允许</div><div class="btn ok">始终允许</div><div class="btn danger">拒绝</div></div>
+      </div></div>
+    </div>
+  </div>
+
+  <!-- 5 tty -->
+  <div class="tile t5">
+    <div class="label"><h3>▮ 5 · tty 终端</h3><div class="vibe">深色 + 等宽绿 · 开发者身份感 · 命令像终端</div><div class="feas">飞书可行性:<b class="warn">⚠ 受限</b>(正文深色需用户开深色模式)</div></div>
+    <div class="chatbg" style="background:#010409">
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>● prompt — choose</span></div>
+        <div class="fmeta">session <span class="v">temp_ftw</span></div>
+        <div class="fchips">agent<span class="chip">claude-code</span>tty<span class="chip">cmux</span></div>
+        <div class="fdiv"></div>
+        <div class="fq">deploy target?</div>
+        <div class="opts"><div class="opt"><b>[1] staging</b><span>先上预发验证</span></div><div class="opt"><b>[2] production</b><span>直接上线</span></div></div>
+        <div class="btns"><div class="btn ok">[1] staging</div><div class="btn">[2] prod</div><div class="btn">✍ custom</div></div>
+      </div><div class="ffoot"><span class="m">👾</span><span>away detected · stdin piped to 飞书 · 回键盘即 detach</span></div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>● permission — Bash</span><span class="stat">PENDING</span></div>
+        <div class="code">$ echo hello-from-bridge-test</div>
+        <div class="btns"><div class="btn ok">allow ✓</div><div class="btn">always ⟳</div><div class="btn danger">deny ✕</div></div>
+      </div></div>
+    </div>
+  </div>
+
+  <!-- 6 水豚 -->
+  <div class="tile t6">
+    <div class="label"><h3>🦫 6 · 水豚汤</h3><div class="vibe">沙暖色 · 大圆角 · 治愈躺平 · "别急,慢慢来"</div><div class="feas">飞书可行性:<b>✓ 全可</b></div></div>
+    <div class="chatbg" style="background:#efe7da">
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>🦫</span><span>水豚 · 帮你问一句</span></div>
+        <div class="fmeta">💬 会话 <span class="v">temp_ftw</span></div>
+        <div class="fchips">Agent<span class="chip">Claude Code</span>载体<span class="chip">Cmux</span></div>
+        <div class="fdiv"></div>
+        <div class="fq">这次改动部署到哪个环境?</div>
+        <div class="opts"><div class="opt"><b>预发 staging</b><span>先上预发验证</span></div><div class="opt"><b>生产 production</b><span>直接上线</span></div></div>
+        <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">✍️ 自定义</div></div>
+      </div><div class="ffoot"><span class="m">🦫</span><span>别急,你忙你的,我泡在这儿帮你盯着~</span></div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>🦫</span><span>水豚 · 等你点个头</span><span class="stat">等待审批</span></div>
+        <div class="code">echo hello-from-bridge-test</div>
+        <div class="btns"><div class="btn ok">✅ 允许</div><div class="btn">🔁 始终</div><div class="btn danger">⛔ 拒绝</div></div>
+      </div><div class="ffoot"><span class="m">🦫</span><span>慢慢来,电脑我替你撑着不睡。</span></div></div>
+    </div>
+  </div>
+
+  <!-- 7 哨 -->
+  <div class="tile t7">
+    <div class="label"><h3>🛡️ 7 · 哨 Sentinel</h3><div class="vibe">钢蓝 · 安全可信 · 徽章式状态 · 适合"审批"语义</div><div class="feas">飞书可行性:<b>✓ 全可</b></div></div>
+    <div class="chatbg">
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>🛡️</span><span>哨岗 · 待你决断</span></div>
+        <div class="fmeta">💬 会话 <span class="v">temp_ftw</span></div>
+        <div class="fchips">Agent<span class="chip">Claude Code</span>载体<span class="chip">Cmux</span></div>
+        <div class="fdiv"></div>
+        <div class="fq">这次改动部署到哪个环境?</div>
+        <div class="dd"><span>请选择…</span><span>⌄</span></div>
+        <div class="btns"><div class="btn pri">提交</div><div class="btn">取消</div></div>
+      </div><div class="ffoot"><span class="m">🛡️</span><span>你离岗期间,关卡由我把守。</span></div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>🛡️</span><span>哨岗 · 权限请求</span><span class="stat">待审批</span></div>
+        <div class="fchips">工具<span class="chip">Bash</span>来源<span class="chip">PermissionRequest</span></div>
+        <div class="code">echo hello-from-bridge-test</div>
+        <div class="btns"><div class="btn pri">允许</div><div class="btn">始终允许</div><div class="btn danger">拒绝</div></div>
+      </div><div class="ffoot"><span class="m">🛡️</span><span>未经你许可,绝不放行。</span></div></div>
+    </div>
+  </div>
+
+  <!-- 8 像素 -->
+  <div class="tile t8">
+    <div class="label"><h3>👾 8 · 像素 Pixel</h3><div class="vibe">复古紫 · 直角描边 · 8-bit 顽皮</div><div class="feas">飞书可行性:<b class="warn">⚠ 部分</b>(像素字体做不了,靠直角+紫+emoji)</div></div>
+    <div class="chatbg" style="background:#e7e1f5">
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>👾</span><span>PIXEL · 选个分支</span></div>
+        <div class="fmeta">💬 会话 <span class="v">temp_ftw</span></div>
+        <div class="fchips">Agent<span class="chip">Claude Code</span>载体<span class="chip">Cmux</span></div>
+        <div class="fdiv"></div>
+        <div class="fq">这次改动部署到哪个环境?</div>
+        <div class="opts"><div class="opt"><b>▶ 预发 staging</b><span>先上预发验证</span></div><div class="opt"><b>▶ 生产 production</b><span>直接上线</span></div></div>
+        <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">✍️ 自定义</div></div>
+      </div><div class="ffoot"><span class="m">👾</span><span>PLAYER AWAY — 我先帮你接管这关!</span></div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>👾</span><span>PIXEL · 权限</span><span class="stat">PENDING</span></div>
+        <div class="code">echo hello-from-bridge-test</div>
+        <div class="btns"><div class="btn pri">允许</div><div class="btn">始终</div><div class="btn danger">拒绝</div></div>
+      </div><div class="ffoot"><span class="m">👾</span><span>按 A 允许,按 B 拒绝(其实是点一下啦)。</span></div></div>
+    </div>
+  </div>
+
+  <!-- 9 胶囊 -->
+  <div class="tile t9">
+    <div class="label"><h3>● 9 · 胶囊 Capsule</h3><div class="vibe">现代 SaaS · 珊瑚色单点缀 · 全胶囊圆角 · Linear 感</div><div class="feas">飞书可行性:<b>✓ 大可</b>(大圆角可调)</div></div>
+    <div class="chatbg">
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>选择部署环境</span></div>
+        <div class="fchips">Claude Code<span class="chip">temp_ftw</span><span class="chip">Cmux</span></div>
+        <div class="fdiv"></div>
+        <div class="fq">这次改动部署到哪个环境?</div>
+        <div class="opts"><div class="opt"><b>预发 staging</b><span>先上预发验证</span></div><div class="opt"><b>生产 production</b><span>直接上线</span></div></div>
+        <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">自定义…</div></div>
+      </div></div>
+      <div class="fcard"><div class="pad">
+        <div class="ftitle"><span>权限请求</span><span class="stat">待审批</span></div>
+        <div class="fchips"><span class="chip">Bash</span><span class="chip">21:27</span></div>
+        <div class="code">echo hello-from-bridge-test</div>
+        <div class="btns"><div class="btn pri">允许</div><div class="btn">始终允许</div><div class="btn danger">拒绝</div></div>
+      </div></div>
+    </div>
+  </div>
+
+  <!-- 10 原生 Pro -->
+  <div class="tile t10">
+    <div class="label"><h3>🟦 10 · 原生 Pro</h3><div class="vibe">飞书原生头部色带 + 状态 tag · 无人格 · 最"官方好看"</div><div class="feas">飞书可行性:<b>✓✓ 原生最佳</b>(就是飞书自己的设计语言)</div></div>
+    <div class="chatbg">
+      <div class="fcard">
+        <div class="band blue">🧭 Claude Code 想问你<span class="stat">等待选择</span></div>
+        <div class="pad">
+          <div class="fmeta">💬 会话 <span class="v">temp_ftw</span></div>
+          <div class="fchips">Agent<span class="chip">Claude Code</span>载体<span class="chip">Cmux</span></div>
+          <div class="fdiv"></div>
+          <div class="fq">这次改动部署到哪个环境?</div>
+          <div class="opts"><div class="opt"><b>预发 staging</b><span>先上预发验证</span></div><div class="opt"><b>生产 production</b><span>直接上线</span></div></div>
+          <div class="btns"><div class="btn pri">预发</div><div class="btn">生产</div><div class="btn">自定义…</div></div>
+        </div>
+      </div>
+      <div class="fcard">
+        <div class="band" style="background:#ff8800">🔐 Claude Code 权限请求<span class="stat">等待审批</span></div>
+        <div class="pad">
+          <div class="fchips">工具<span class="chip">Bash</span>来源<span class="chip">PermissionRequest</span></div>
+          <div class="code">echo hello-from-bridge-test</div>
+          <div class="btns"><div class="btn pri">允许</div><div class="btn">始终允许</div><div class="btn danger">拒绝</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

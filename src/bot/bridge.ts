@@ -2,9 +2,26 @@ import { createLarkChannel, Domain, type LarkChannel } from '@larksuiteoapi/node
 import type { AdminWriteOp } from '../admin/ops';
 import type { AppConfig } from '../config/schema';
 import { log } from '../core/logger';
+import { sep } from 'node:path';
 import { createOrchestrator } from './handle-message';
 import { paths } from '../config/paths';
+import { listProjects } from '../project/registry';
 import { createCliBridgeService, shouldStartCliBridge } from '../cli-bridge';
+
+/** True when `cwd` is a registered project's working dir (or a subdir of one) —
+ *  drives the 'bound_projects' notify scope. Trailing slashes normalized so
+ *  `/a/b` and `/a/b/` compare equal; a subdir match requires a path-separator
+ *  boundary so `/a/bc` never counts as inside `/a/b`. */
+async function cwdIsBoundProject(cwd: string): Promise<boolean> {
+  if (!cwd) return false;
+  const strip = (p: string): string => p.replace(/[/\\]+$/, '');
+  const target = strip(cwd);
+  const projects = await listProjects().catch(() => []);
+  return projects.some((project) => {
+    const root = strip(project.cwd);
+    return root.length > 0 && (target === root || target.startsWith(root + sep));
+  });
+}
 
 export interface BridgeOptions {
   cfg: AppConfig;
@@ -59,7 +76,12 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
   // Local CLI agent bridge (Claude Code / Codex hooks → owner DM). Always create
   // the runtime object so card actions are registered even when disabled at
   // boot; start the IPC listener only when config says it should be live.
-  const cliBridge = createCliBridgeService({ cfg: opts.cfg, channel, socketPath: paths.cliBridgeSocket });
+  const cliBridge = createCliBridgeService({
+    cfg: opts.cfg,
+    channel,
+    socketPath: paths.cliBridgeSocket,
+    isBoundProject: cwdIsBoundProject,
+  });
   const orchestrator = createOrchestrator(channel, opts.cfg, opts.fallbackCwd, cliBridge);
   channel.on('message', orchestrator.onMessage);
   channel.on('cardAction', orchestrator.dispatcher.handle);

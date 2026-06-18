@@ -29,6 +29,16 @@ export interface CliHookResponse {
   interrupt?: boolean;
 }
 
+/** One question in an AskUserQuestion / ask_user_question call. Claude Code sends
+ *  1-4 of these (Codex 1-3) per tool call; each is single- or multi-select with
+ *  2-4 labelled options. `multiSelect` picks the dropdown kind and answer join. */
+export interface CliQuestionItem {
+  question: string;
+  header?: string;
+  multiSelect: boolean;
+  options: { label: string; description?: string; preview?: string }[];
+}
+
 export type CliHookInstallStatus = 'installed' | 'not_installed' | 'needs_repair' | 'conflict_agent2lark';
 
 export interface CliHookStatus {

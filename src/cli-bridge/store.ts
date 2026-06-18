@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { CliBridgeAgent, CliHookResponse } from './types';
+import type { CliBridgeAgent, CliHookResponse, CliQuestionItem } from './types';
 
 export type PendingCliKind = 'permission' | 'question' | 'task_completion';
 
@@ -15,6 +15,8 @@ export interface PendingCliInteraction {
   hookEventName?: string;
   options?: { label: string; description?: string; preview?: string }[];
   header?: string;
+  /** AskUserQuestion: the full 1-4 question set rendered as one multi-question form. */
+  questions?: CliQuestionItem[];
   taskStatus?: 'completed' | 'failed';
   summary?: string;
   replyExpiresAt?: number;

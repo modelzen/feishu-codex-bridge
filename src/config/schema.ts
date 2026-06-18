@@ -226,6 +226,8 @@ export function isUserAllowedInProject(
 // ── local CLI agent bridge (Claude Code / Codex) ─────────────────────────────
 
 export type CliBridgeDelivery = 'always' | 'away_only';
+/** 离开时转发哪些会话：all=全部 / bound_projects=仅 cwd 命中已绑定项目 / none=不通知。 */
+export type CliBridgeNotifyScope = 'all' | 'bound_projects' | 'none';
 export type CliBridgeAgentKey = 'claude' | 'codex';
 
 /** Raw (partial) CLI bridge preferences as stored in config.json. */
@@ -238,6 +240,14 @@ export interface CliBridgePreferences {
   includeBridgeOwnedSessionsForDebugging?: boolean;
   /** 按 agent 分别启停转发（claude / codex）。缺省时两者均为 true。 */
   agents?: Partial<Record<CliBridgeAgentKey, boolean>>;
+  /** 离开时把哪些会话推到飞书：all=全部 / bound_projects=仅 cwd 命中已绑定项目的会话 / none=不通知。默认 all。 */
+  notifyScope?: CliBridgeNotifyScope;
+  /** 离开保活：离开且有未决交互（卡在飞书审批 / 问答 / 续聊）时，用 caffeinate 顶住系统休眠
+   *  （屏幕仍可正常熄灭），回到本机 / 解锁即释放。仅 macOS 生效。 */
+  keepAwake?: {
+    /** 是否启用离开保活。默认 true。 */
+    enabled?: boolean;
+  };
   /** 权限审批（PermissionRequest）转发配置。 */
   approval?: {
     /** 是否转发权限审批请求。默认 true；为 false 时审批回落到本地终端处理。 */
@@ -278,6 +288,10 @@ export interface ResolvedCliBridgePreferences {
   delivery: CliBridgeDelivery;
   includeBridgeOwnedSessionsForDebugging: boolean;
   agents: Record<CliBridgeAgentKey, boolean>;
+  notifyScope: CliBridgeNotifyScope;
+  keepAwake: {
+    enabled: boolean;
+  };
   approval: {
     enabled: boolean;
     timeoutSeconds: number;
@@ -318,6 +332,10 @@ export function getCliBridgePreferences(cfg: AppConfig): ResolvedCliBridgePrefer
     agents: {
       claude: boolOr(raw?.agents?.claude, true),
       codex: boolOr(raw?.agents?.codex, true),
+    },
+    notifyScope: raw?.notifyScope === 'bound_projects' || raw?.notifyScope === 'none' ? raw.notifyScope : 'all',
+    keepAwake: {
+      enabled: boolOr(raw?.keepAwake?.enabled, true),
     },
     approval: {
       enabled: boolOr(raw?.approval?.enabled, true),

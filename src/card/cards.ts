@@ -390,3 +390,20 @@ export function selectMenu(opts: {
     options: opts.options.map((o) => ({ text: { tag: 'plain_text', content: o.label }, value: o.value })),
   };
 }
+
+/** A multi-select dropdown (schema 2.0 `multi_select_static`) for use **inside a
+ *  form** — like {@link selectMenu} it carries no callback (won't lock the card);
+ *  on submit `form_value[name]` is the **array** of picked option values. Requires
+ *  Feishu client ≥ 7.4. Used for AskUserQuestion's `multiSelect: true` questions. */
+export function multiSelectMenu(opts: {
+  name: string;
+  placeholder: string;
+  options: SelectOption[];
+}): CardElement {
+  return {
+    tag: 'multi_select_static',
+    name: opts.name,
+    placeholder: { tag: 'plain_text', content: opts.placeholder },
+    options: opts.options.map((o) => ({ text: { tag: 'plain_text', content: o.label }, value: o.value })),
+  };
+}

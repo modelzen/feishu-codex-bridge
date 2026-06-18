@@ -673,6 +673,7 @@ export function createOrchestrator(
         parentId: msg.replyToMessageId,
         rootId: msg.threadId,
         text: msg.content,
+        messageId: msg.messageId,
       })) {
         return;
       }
@@ -1918,10 +1919,14 @@ export function createOrchestrator(
   let cliHookStatuses: Awaited<ReturnType<typeof inspectCliBridgeHooks>> | undefined;
   async function renderSettings(refreshHooks = false): Promise<object> {
     if (refreshHooks || !cliHookStatuses) cliHookStatuses = await inspectCliBridgeHooks();
+    const cliPrefs = getCliBridgePreferences(cfg);
     const localAgents = cliBridgeSettingsSection({
-      enabled: getCliBridgePreferences(cfg).enabled,
+      enabled: cliPrefs.enabled,
       statuses: cliHookStatuses,
       canEnable: canEnableCliBridge(cfg),
+      notifyScope: cliPrefs.notifyScope,
+      agents: cliPrefs.agents,
+      keepAwake: cliPrefs.keepAwake.enabled,
     });
     return buildSettingsCard(cfg, localAgents);
   }
@@ -2146,6 +2151,30 @@ export function createOrchestrator(
       }
       // Just wrote the hook files — force a fresh inspect so the status reflects it.
       await patch(evt, () => renderSettings(true));
+    })
+    .on(CLI.setNotifyScope, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const scope = value.v === 'bound_projects' || value.v === 'none' ? value.v : 'all';
+      applyPref(evt, (p) => {
+        p.cliBridge = { ...(p.cliBridge ?? {}), notifyScope: scope };
+      });
+    })
+    .on(CLI.toggleAgent, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const agent = value.agent === 'codex' ? 'codex' : 'claude';
+      const on = value.v === 'on';
+      applyPref(evt, (p) => {
+        const cur = p.cliBridge ?? {};
+        p.cliBridge = { ...cur, agents: { ...(cur.agents ?? {}), [agent]: on } };
+      });
+    })
+    .on(CLI.toggleKeepAwake, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const on = value.v === 'on';
+      applyPref(evt, (p) => {
+        const cur = p.cliBridge ?? {};
+        p.cliBridge = { ...cur, keepAwake: { ...(cur.keepAwake ?? {}), enabled: on } };
+      });
     })
     .on(DM.doctor, async ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;

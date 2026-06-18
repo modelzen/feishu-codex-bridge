@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>本地 Agent 桥接 · 卡片重设计方案</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --ink:#e6edf3; --muted:#8b949e;
+    --fs-card:#ffffff; --fs-chat:#ededf0; --fs-ink:#1f2329; --fs-sub:#646a73; --fs-line:#e5e6eb;
+    --fs-blue:#3370ff; --fs-green:#34c759; --fs-red:#f54a45; --fs-code:#f4f5f7;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",Roboto,sans-serif;}
+  header.top{padding:28px 24px 8px;max-width:1400px;margin:0 auto}
+  header.top h1{margin:0 0 6px;font-size:22px}
+  header.top p{margin:4px 0;color:var(--muted);font-size:14px;line-height:1.6}
+  .stage{display:flex;gap:28px;flex-wrap:wrap;justify-content:center;padding:18px 16px 60px;max-width:1400px;margin:0 auto;align-items:flex-start}
+  .col{width:392px}
+  .col .meta{padding:0 6px 12px}
+  .col .meta h2{margin:0 0 4px;font-size:18px}
+  .col .meta .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:20px;background:#21262d;color:#9da7b3;margin-right:6px}
+  .col .meta p{margin:8px 0 0;color:var(--muted);font-size:12.5px;line-height:1.6}
+
+  /* ---- phone frame ---- */
+  .phone{background:#000;border-radius:44px;padding:10px;box-shadow:0 24px 60px rgba(0,0,0,.5)}
+  .screen{background:var(--fs-chat);border-radius:36px;overflow:hidden;position:relative}
+  .statusbar{height:44px;display:flex;align-items:center;justify-content:space-between;padding:0 26px;font-size:13px;font-weight:600;color:#1f2329}
+  .navbar{height:42px;display:flex;align-items:center;justify-content:center;gap:6px;background:rgba(255,255,255,.7);
+    border-bottom:1px solid var(--fs-line);font-size:15px;font-weight:600;color:#1f2329;backdrop-filter:blur(8px)}
+  .navbar .agent{font-size:10px;color:#8a5cf6;background:#f0e9ff;border-radius:5px;padding:1px 5px;font-weight:600}
+  .chat{padding:14px 12px 18px;display:flex;flex-direction:column;gap:14px;height:1180px;overflow:hidden}
+  .ts{align-self:center;font-size:11px;color:#a8abb2;margin:2px 0}
+  .row{display:flex;gap:8px;align-items:flex-start}
+  .avatar{width:34px;height:34px;border-radius:9px;flex:0 0 34px;display:flex;align-items:center;justify-content:center;font-size:19px;background:#dfe3ea}
+
+  /* ---- generic Feishu-ish card ---- */
+  .card{flex:1;background:var(--fs-card);border-radius:13px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06);color:var(--fs-ink);font-size:14px}
+  .hd{padding:11px 14px;font-weight:700;font-size:15px;display:flex;align-items:center;gap:7px}
+  .bd{padding:12px 14px;display:flex;flex-direction:column;gap:9px}
+  .bd .k{font-weight:600}
+  .sub{color:var(--fs-sub);font-size:12.5px;line-height:1.55}
+  .line{height:1px;background:var(--fs-line);margin:2px 0}
+  .code{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:12.5px;background:var(--fs-code);
+    border-radius:8px;padding:9px 11px;color:#1f2329;white-space:pre-wrap;word-break:break-all}
+  .meta2{display:flex;gap:10px}.meta2>div{flex:1}
+  .chip{display:inline-flex;align-items:center;gap:4px;font-size:12px;padding:3px 9px;border-radius:7px;background:#eef0f3;color:#41464c;margin-right:6px}
+  .pill{font-size:11px;font-weight:600;padding:2px 9px;border-radius:20px}
+  .opts{display:flex;flex-direction:column;gap:7px}
+  .opt{border:1px solid var(--fs-line);border-radius:9px;padding:9px 11px}
+  .opt b{font-size:13.5px}.opt span{display:block;color:var(--fs-sub);font-size:12px;margin-top:2px}
+  .btns{display:flex;gap:9px;flex-wrap:wrap;margin-top:2px}
+  .btn{flex:1;min-width:84px;text-align:center;padding:9px 8px;border-radius:9px;font-size:13.5px;font-weight:600;border:1px solid var(--fs-line);background:#fff}
+  .btn.pri{background:var(--fs-blue);color:#fff;border-color:var(--fs-blue)}
+  .btn.ok{color:var(--fs-blue);border-color:#bcd0ff}
+  .btn.danger{color:var(--fs-red);border-color:#ffc9c7}
+  .btn.gray{color:#41464c}
+  .input{border:1px solid var(--fs-line);border-radius:9px;padding:10px 11px;color:#a8abb2;font-size:13px;background:#fbfbfc}
+  .foot{display:flex;gap:7px;align-items:flex-start;padding:9px 13px;background:#fafbfc;border-top:1px solid var(--fs-line);font-size:12px;color:var(--fs-sub);line-height:1.55}
+  .foot .m{font-size:15px;flex:0 0 auto}
+
+  /* =========== THEME A · 猫岛 (warm mascot) =========== */
+  .A .hd{color:#1f2329}
+  .A .hd.away{background:#e3f3ff}.A .hd.perm{background:#e9f0ff}.A .hd.ask{background:#fff1e6}.A .hd.done{background:#e7f8ee}
+  .A .card{border-radius:16px}
+  .A .btn{border-radius:11px}
+  .A .chip{background:#fff0f4;color:#d6457f;border-radius:20px}
+  .A .pill.wait{background:#e9f0ff;color:#3370ff}.A .pill.done{background:#e7f8ee;color:#1aa260}
+  .A .foot{background:#fff7fa}
+
+  /* =========== THEME B · 极简 (clean minimal) =========== */
+  .B .card{border:1px solid #eceef1;box-shadow:none}
+  .B .hd{font-size:14.5px;padding:13px 15px 6px;background:#fff;color:#1f2329;border-bottom:none}
+  .B .hd .dot{width:7px;height:7px;border-radius:50%}
+  .B .hd.away .dot{background:#3370ff}.B .hd.perm .dot{background:#3370ff}.B .hd.ask .dot{background:#ff8800}.B .hd.done .dot{background:#34c759}
+  .B .bd{padding-top:4px}
+  .B .chip{background:#f5f6f7;color:#646a73;border-radius:5px;font-size:11.5px}
+  .B .pill{background:#f2f3f5;color:#646a73;font-weight:600}
+  .B .btn{border-radius:7px;background:#fff}
+  .B .btn.pri{background:#1f2329;border-color:#1f2329}
+  .B .btn.ok{color:#1f2329;border-color:#d4d7dc}
+  .B .opt{border-radius:7px}
+
+  /* =========== THEME C · 终端 (dev/terminal) =========== */
+  .C .card{background:#0d1117;color:#c9d1d9}
+  .C .hd{background:#161b22;color:#e6edf3;font-family:"SF Mono",monospace;font-size:13.5px;border-bottom:1px solid #21262d}
+  .C .hd.away{color:#7ee787}.C .hd.perm{color:#ffa657}.C .hd.ask{color:#79c0ff}.C .hd.done{color:#7ee787}
+  .C .sub{color:#8b949e}
+  .C .line{background:#21262d}
+  .C .code{background:#010409;color:#7ee787;border:1px solid #21262d}
+  .C .chip{background:#161b22;color:#8b949e;border:1px solid #21262d;font-family:"SF Mono",monospace;border-radius:5px}
+  .C .pill.wait{background:#1f2a44;color:#79c0ff}.C .pill.done{background:#14301f;color:#7ee787}
+  .C .opt{border-color:#21262d;background:#0d1117}.C .opt span{color:#8b949e}
+  .C .btn{background:#161b22;color:#c9d1d9;border-color:#30363d;font-family:"SF Mono",monospace}
+  .C .btn.pri{background:#238636;border-color:#238636;color:#fff}
+  .C .btn.ok{color:#7ee787;border-color:#238636}
+  .C .btn.danger{color:#ff7b72;border-color:#5a2422}
+  .C .input{background:#010409;border-color:#21262d;color:#6e7681}
+  .C .foot{background:#0d1117;border-top:1px solid #21262d;color:#8b949e}
+  .C .navbar,.C .screen{ }
+  .note-impl{font-size:11.5px;color:#7d8590;background:#161b22;border:1px solid #21262d;border-radius:8px;padding:8px 10px;margin:10px 6px 0;line-height:1.6}
+  .note-impl b{color:#adbac7}
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>🐱 本地 Agent 桥接 · 卡片重设计 — 3 个方向供你选</h1>
+  <p>同一套卡片(离开提示 / 权限审批 / 选择提问含自定义输入 / 任务完成),三种风格。都在<b>飞书卡片 schema 2.0 能渲染</b>的范围内设计(头部色带、emoji、标签 chip、状态 pill、按钮、分割线、输入框、底部吉祥物语)。</p>
+  <p>挑一个整体方向,或告诉我"用 A 的吉祥物 + B 的留白"这样混搭也行。</p>
+</header>
+
+<div class="stage">
+
+  <!-- ============ COLUMN A · 猫岛 ============ -->
+  <div class="col A">
+    <div class="meta">
+      <h2>方案 A · 猫岛 🐱</h2>
+      <span class="tag">暖色</span><span class="tag">吉祥物</span><span class="tag">友好</span>
+      <p>柔和色带头部 + 一只小猫吉祥物在底部说人话。圆角更大、配色温暖。像参考图那样有"陪伴感",但用我们自己的猫设定,不照抄章鱼岛。</p>
+    </div>
+    <div class="phone"><div class="screen">
+      <div class="statusbar"><span>21:28</span><span>● ● ● &nbsp; 📶 &nbsp; 🔋</span></div>
+      <div class="navbar">codex-bridge <span class="agent">智能体</span></div>
+      <div class="chat">
+        <div class="ts">今天 21:28</div>
+        <!-- away -->
+        <div class="row"><div class="avatar">🐱</div><div class="card">
+          <div class="hd away">🐾 喵呜~ 你离开啦,我来盯着</div>
+          <div class="bd">
+            <div>本地 <b>Claude Code</b> 还在跑活儿,等下要审批 / 提问 / 收尾,我都帮你叼到这儿来 🐟</div>
+            <div class="sub">📁 ~/.superset/worktrees/…/mutual-activity</div>
+          </div>
+          <div class="foot"><span class="m">🐱</span><span>你一回电脑(解锁 / 动键鼠),我立刻收手,不再打扰~</span></div>
+        </div></div>
+        <!-- permission -->
+        <div class="row"><div class="avatar">🐱</div><div class="card">
+          <div class="hd perm">🔐 想动手,等你点头</div>
+          <div class="bd">
+            <div class="meta2">
+              <div><span class="pill wait">等待审批</span><div class="sub" style="margin-top:5px">🛠️ 工具 Bash</div></div>
+              <div class="sub">🔗 PermissionRequest<br>🕒 06/18 21:27</div>
+            </div>
+            <div class="code">echo hello-from-bridge-test</div>
+            <div class="sub">📁 …/mutual-activity</div>
+            <div class="btns">
+              <div class="btn ok">✅ 允许</div><div class="btn gray">🔁 始终</div><div class="btn danger">⛔ 拒绝</div>
+            </div>
+          </div>
+          <div class="foot"><span class="m">🐱</span><span>点一下就好,我盯着别让电脑睡过去~</span></div>
+        </div></div>
+        <!-- ask -->
+        <div class="row"><div class="avatar">🐱</div><div class="card">
+          <div class="hd ask">🧭 有个选择题找你</div>
+          <div class="bd">
+            <div class="chip">选择部署环境</div>
+            <div><b>这次改动部署到哪个环境?</b></div>
+            <div class="opts">
+              <div class="opt"><b>① 预发 staging</b><span>先上预发验证</span></div>
+              <div class="opt"><b>② 生产 production</b><span>直接上线</span></div>
+            </div>
+            <div class="btns">
+              <div class="btn ok">预发</div><div class="btn ok">生产</div><div class="btn gray">✍️ 自定义</div>
+            </div>
+          </div>
+        </div></div>
+        <!-- ask custom -->
+        <div class="row"><div class="avatar">🐱</div><div class="card">
+          <div class="hd ask">✍️ 自己写一个答案</div>
+          <div class="bd">
+            <div class="sub">👇 <b>就在下面这个框里打字</b>,写完点「提交」。(不用去聊天框发消息)</div>
+            <div class="input">输入你的回答,比如"先在 staging 跑冒烟"…</div>
+            <div class="btns"><div class="btn pri">提交回答</div><div class="btn gray">返回选项</div></div>
+          </div>
+        </div></div>
+        <!-- done -->
+        <div class="row"><div class="avatar">🐱</div><div class="card">
+          <div class="hd done">🏁 干完啦!等你一句话</div>
+          <div class="bd">
+            <div><span class="pill done">等待确认</span></div>
+            <div class="code" style="font-family:inherit;background:#f7fdf9">我已实现完功能并跑通全部测试(828 通过),等你确认或继续指示。</div>
+            <div class="sub">📁 …/mutual-activity</div>
+            <div class="btns"><div class="btn pri" style="flex:0 0 auto">⏳ 等待确认</div></div>
+            <div class="sub">💬 <b>直接回复这条消息</b>就能接着支使我干活;或点「等待确认」让我收工。</div>
+          </div>
+          <div class="foot"><span class="m">🐱</span><span>喵~ 回复我一句,我马上接着跑。</span></div>
+        </div></div>
+      </div>
+    </div></div>
+    <div class="note-impl"><b>可行性:</b>头部柔色带 = 飞书 template(wathet/turquoise/green/orange);小猫 = emoji 或上传一张吉祥物图当头像;chip/pill = markdown 背景块或 column。<b>全部可实现</b>(吉祥物图需上传一次)。</div>
+  </div>
+
+  <!-- ============ COLUMN B · 极简 ============ -->
+  <div class="col B">
+    <div class="meta">
+      <h2>方案 B · 极简 ◻︎</h2>
+      <span class="tag">克制</span><span class="tag">专业</span><span class="tag">信息密度高</span>
+      <p>不用吉祥物。一条细色点标状态,大量留白,等宽字体放命令。看起来"干净、不啰嗦、像工具",适合不想被卖萌打扰的人。</p>
+    </div>
+    <div class="phone"><div class="screen">
+      <div class="statusbar"><span>21:28</span><span>● ● ● &nbsp; 📶 &nbsp; 🔋</span></div>
+      <div class="navbar">codex-bridge <span class="agent">智能体</span></div>
+      <div class="chat">
+        <div class="ts">今天 21:28</div>
+        <div class="row"><div class="avatar">⚙️</div><div class="card">
+          <div class="hd away"><span class="dot"></span>已接管 · 检测到离开</div>
+          <div class="bd">
+            <div class="sub">本地 Claude Code 运行中。审批 / 提问 / 完成将转发到此。</div>
+            <div class="sub">📁 …/mutual-activity</div>
+            <div class="sub">回到电脑自动停止转发。</div>
+          </div>
+        </div></div>
+        <div class="row"><div class="avatar">⚙️</div><div class="card">
+          <div class="hd perm"><span class="dot"></span>权限请求 · Bash</div>
+          <div class="bd">
+            <div><span class="pill">PermissionRequest · 21:27</span></div>
+            <div class="code">echo hello-from-bridge-test</div>
+            <div class="sub">📁 …/mutual-activity</div>
+            <div class="btns"><div class="btn pri">允许</div><div class="btn ok">始终允许</div><div class="btn danger">拒绝</div></div>
+          </div>
+        </div></div>
+        <div class="row"><div class="avatar">⚙️</div><div class="card">
+          <div class="hd ask"><span class="dot"></span>选择 · 部署环境</div>
+          <div class="bd">
+            <div><b>这次改动部署到哪个环境?</b></div>
+            <div class="opts">
+              <div class="opt"><b>预发 staging</b><span>先上预发验证</span></div>
+              <div class="opt"><b>生产 production</b><span>直接上线</span></div>
+            </div>
+            <div class="btns"><div class="btn pri">预发</div><div class="btn ok">生产</div><div class="btn ok">自定义…</div></div>
+          </div>
+        </div></div>
+        <div class="row"><div class="avatar">⚙️</div><div class="card">
+          <div class="hd ask"><span class="dot"></span>选择 · 自定义回答</div>
+          <div class="bd">
+            <div class="sub">在下框输入后点提交。</div>
+            <div class="input">自定义回答…</div>
+            <div class="btns"><div class="btn pri">提交</div><div class="btn ok">返回</div></div>
+          </div>
+        </div></div>
+        <div class="row"><div class="avatar">⚙️</div><div class="card">
+          <div class="hd done"><span class="dot"></span>任务完成 · Stop</div>
+          <div class="bd">
+            <div><span class="pill">等待确认</span></div>
+            <div class="sub" style="border-left:2px solid #e5e6eb;padding-left:9px">我已实现完功能并跑通全部测试(828 通过),等你确认或继续指示。</div>
+            <div class="sub">📁 …/mutual-activity</div>
+            <div class="btns"><div class="btn pri" style="flex:0 0 auto">等待确认</div></div>
+            <div class="sub">回复此消息可继续执行。</div>
+          </div>
+        </div></div>
+      </div>
+    </div></div>
+    <div class="note-impl"><b>可行性:</b>纯飞书原生组件,<b>零额外资源</b>。色点用 emoji(🔵🟠🟢)或省略;状态用 pill。最稳、最快落地。</div>
+  </div>
+
+  <!-- ============ COLUMN C · 终端 ============ -->
+  <div class="col C">
+    <div class="meta">
+      <h2>方案 C · 终端 ▮</h2>
+      <span class="tag">开发者</span><span class="tag">等宽</span><span class="tag">深色</span>
+      <p>把"这是个 CLI 工具"的身份感拉满:等宽字体、命令像在终端里、绿/橙强调色、一只小机器人。注:飞书卡片正文底色跟随客户端主题,<b>真·深色需用户开深色模式</b>(头部最深只能到 grey template)。</p>
+    </div>
+    <div class="phone"><div class="screen" style="background:#010409">
+      <div class="statusbar" style="color:#c9d1d9"><span>21:28</span><span>● ● ● &nbsp; 📶 &nbsp; 🔋</span></div>
+      <div class="navbar" style="background:#0d1117;color:#e6edf3;border-color:#21262d">codex-bridge <span class="agent" style="background:#1f2a44;color:#79c0ff">智能体</span></div>
+      <div class="chat">
+        <div class="ts" style="color:#6e7681">今天 21:28</div>
+        <div class="row"><div class="avatar" style="background:#161b22">👾</div><div class="card">
+          <div class="hd away">● away — bridge attached</div>
+          <div class="bd">
+            <div>检测到你离开。<span style="color:#7ee787">stdin → 飞书</span> 已接管。</div>
+            <div class="sub">cwd: ~/…/mutual-activity</div>
+            <div class="foot" style="margin:-2px -14px -12px;border-radius:0">👾 回到键盘即 detach,自动收手。</div>
+          </div>
+        </div></div>
+        <div class="row"><div class="avatar" style="background:#161b22">👾</div><div class="card">
+          <div class="hd perm">● permission — Bash</div>
+          <div class="bd">
+            <div><span class="pill wait">PENDING</span> <span class="sub">PermissionRequest · 21:27</span></div>
+            <div class="code">$ echo hello-from-bridge-test</div>
+            <div class="sub">cwd: ~/…/mutual-activity</div>
+            <div class="btns"><div class="btn ok">allow ✓</div><div class="btn">always ⟳</div><div class="btn danger">deny ✕</div></div>
+          </div>
+        </div></div>
+        <div class="row"><div class="avatar" style="background:#161b22">👾</div><div class="card">
+          <div class="hd ask">● prompt — choose</div>
+          <div class="bd">
+            <div class="chip">deploy target</div>
+            <div>这次改动部署到哪个环境?</div>
+            <div class="opts">
+              <div class="opt"><b>[1] staging</b><span>先上预发验证</span></div>
+              <div class="opt"><b>[2] production</b><span>直接上线</span></div>
+            </div>
+            <div class="btns"><div class="btn ok">[1] staging</div><div class="btn ok">[2] prod</div><div class="btn">✍ custom</div></div>
+          </div>
+        </div></div>
+        <div class="row"><div class="avatar" style="background:#161b22">👾</div><div class="card">
+          <div class="hd ask">● prompt — custom input</div>
+          <div class="bd">
+            <div class="sub">↓ 在此输入,然后 submit(无需回聊天框)</div>
+            <div class="input">type your answer…</div>
+            <div class="btns"><div class="btn pri">submit ⏎</div><div class="btn">back</div></div>
+          </div>
+        </div></div>
+        <div class="row"><div class="avatar" style="background:#161b22">👾</div><div class="card">
+          <div class="hd done">● done — Stop</div>
+          <div class="bd">
+            <div><span class="pill done">AWAITING ACK</span></div>
+            <div class="code" style="color:#c9d1d9">我已实现完功能并跑通全部测试(828 通过),等你确认或继续指示。</div>
+            <div class="sub">cwd: ~/…/mutual-activity</div>
+            <div class="btns"><div class="btn pri" style="flex:0 0 auto">⏳ ack</div></div>
+            <div class="sub">↩ reply 此消息 = 继续喂给 agent。</div>
+          </div>
+        </div></div>
+      </div>
+    </div></div>
+    <div class="note-impl"><b>可行性:</b>等宽字体 = 飞书 `代码块`/行内 code;绿/橙强调 = text_color;<b>深色正文受限</b>(跟随客户端主题)。建议落地时用 grey header + 代码块承载终端感,深色作为"锦上添花"。</div>
+  </div>
+
+</div>
+</body>
+</html>
