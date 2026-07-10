@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { buildPlist } from '../src/service/launchd';
 import { buildUnit, SYSTEMD_UNIT_NAME } from '../src/service/systemd';
 import { buildLauncherCmd, buildLauncherVbs } from '../src/service/win-startup';
 
@@ -28,6 +29,22 @@ describe('systemd unit (buildUnit)', () => {
   it('unit name is a .service', () => {
     expect(SYSTEMD_UNIT_NAME).toMatch(/\.service$/);
   });
+
+  it('preserves an explicit CODEX_BIN override for the background service', () => {
+    withCodexBin('/opt/codex/bin/codex', () => {
+      expect(buildUnit()).toContain('Environment="CODEX_BIN=/opt/codex/bin/codex"');
+    });
+  });
+});
+
+describe('launchd plist (buildPlist)', () => {
+  it('preserves an explicit CODEX_BIN override for the background service', () => {
+    withCodexBin('/Applications/Codex & Friends.app/Contents/Resources/codex', () => {
+      const plist = buildPlist();
+      expect(plist).toContain('<key>CODEX_BIN</key>');
+      expect(plist).toContain('/Applications/Codex &amp; Friends.app/Contents/Resources/codex');
+    });
+  });
 });
 
 describe('Windows hidden launcher (.cmd)', () => {
@@ -45,6 +62,12 @@ describe('Windows hidden launcher (.cmd)', () => {
     expect(cmd).toContain('>> "');
     expect(cmd).toContain('2>> "');
   });
+
+  it('preserves an explicit CODEX_BIN override for the background service', () => {
+    withCodexBin('C:\\Tools\\codex.exe', () => {
+      expect(buildLauncherCmd()).toContain('set "CODEX_BIN=C:\\Tools\\codex.exe"');
+    });
+  });
 });
 
 describe('Windows hidden launcher (.vbs)', () => {
@@ -55,3 +78,14 @@ describe('Windows hidden launcher (.vbs)', () => {
     expect(vbs).toMatch(/sh\.Run "cmd \/c "".+\.cmd""", 0, False/);
   });
 });
+
+function withCodexBin(value: string, fn: () => void): void {
+  const prev = process.env.CODEX_BIN;
+  process.env.CODEX_BIN = value;
+  try {
+    fn();
+  } finally {
+    if (prev === undefined) delete process.env.CODEX_BIN;
+    else process.env.CODEX_BIN = prev;
+  }
+}

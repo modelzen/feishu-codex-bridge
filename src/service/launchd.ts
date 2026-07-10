@@ -66,7 +66,9 @@ export function buildPlist(): string {
   <dict>
     <key>PATH</key>
     <string>${escapeXml(pathEnv)}</string>
-  </dict>
+${process.env.CODEX_BIN ? `    <key>CODEX_BIN</key>
+    <string>${escapeXml(process.env.CODEX_BIN)}</string>
+` : ''}  </dict>
 </dict>
 </plist>
 `;
