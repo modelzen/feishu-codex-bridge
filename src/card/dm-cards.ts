@@ -5,11 +5,16 @@ import {
   getMaxConcurrentRuns,
   getModelDisplay,
   getPendingPolicy,
+  getSessionTitleConfig,
+  getSessionTitleEfforts,
   getShowToolCalls,
   resolveOwner,
   RUN_IDLE_TIMEOUT_MAX_SEC,
   RUN_IDLE_TIMEOUT_MIN_SEC,
+  summarizeSessionTitleConfig,
+  summarizeSessionTitles,
   type AppConfig,
+  type SessionTitleAiConfig,
 } from '../config/schema';
 import { defaultNoMention, effectiveGuestMode, effectiveMode, type Project } from '../project/registry';
 import {
@@ -112,6 +117,11 @@ export const DM = {
   commentEditPrompt: 'dm.comment.editPrompt',
   commentPromptSubmit: 'dm.comment.promptSubmit',
   commentResetPrompt: 'dm.comment.resetPrompt',
+  // 🏷️ Bridge 新建会话的原生 resume 标题：按后端独立选模型 + Effort。
+  sessionTitleSettings: 'dm.sessionTitle.settings',
+  sessionTitleSetBackend: 'dm.sessionTitle.setBackend',
+  sessionTitleSubmit: 'dm.sessionTitle.submit',
+  sessionTitleDisable: 'dm.sessionTitle.disable',
 } as const;
 
 /** Action ids for the in-group settings card (@bot /settings). */
@@ -964,6 +974,13 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
       note('去倒杯咖啡的工夫，我替你盯着本机的 Claude Code / Codex——它要审批、要问你、或跑完了，都推到这个私聊。含通知范围、转发后端、离开保活、hooks 修复。'),
       actions([button('设置咖啡一下 / 通知 / 保活 / hooks', { a: DM.coffeeSettings }, 'primary')]),
       hr(),
+      settingSection('🏷️ 会话标题'),
+      note(
+        '让 Bridge 新建的聊天会话在 Claude Code / Codex 原生 resume 面板里显示干净标题。' +
+          summarizeSessionTitles(cfg),
+      ),
+      actions([button('设置各后端的标题模型 / Effort', { a: DM.sessionTitleSettings }, 'primary')]),
+      hr(),
       settingSection('📝 云文档评论'),
       note('在飞书云文档（文档 / 表格 / 多维表格，含 wiki）的评论里 @我，我读评论、跑 agent、把答案贴回评论。可设置评论响应用的后端 agent / 模型 / 推理强度，以及自定义提示词（全局，不分项目；仅管理员可 @）。'),
       actions([button('设置后端 / 模型 / 强度 / 提示词', { a: DM.commentSettings }, 'primary')]),
@@ -990,6 +1007,177 @@ export function buildCoffeeSettingsCard(section: CardElement[]): CardObject {
     ],
     { header: { title: '☕ 咖啡一下', template: 'blue' } },
   );
+}
+
+/** Reserved select value that switches the adjacent free-text input on. It is
+ * deliberately not a model id/allowlist: any caller-provided live model id is
+ * otherwise passed through unchanged, including third-party providers. */
+export const SESSION_TITLE_CUSTOM_MODEL_OPTION = '__bridge_custom_model__';
+
+export interface SessionTitleBackendOption {
+  id: string;
+  label: string;
+}
+
+/** Best-effort scalar reader for Feishu form values (string / array / {value}). */
+function sessionTitleFormScalar(formValue: Record<string, unknown> | undefined, name: string): string | undefined {
+  const raw = formValue?.[name];
+  const first = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof first === 'string') return first.trim();
+  if (first && typeof first === 'object') {
+    const obj = first as Record<string, unknown>;
+    for (const value of [obj.value, obj.id]) {
+      if (typeof value === 'string') return value.trim();
+    }
+  }
+  return undefined;
+}
+
+export type SessionTitleFormParseResult =
+  | { ok: true; config: SessionTitleAiConfig }
+  | { ok: false; message: string };
+
+/**
+ * Parse the model/Effort form without consulting a model allowlist. A live
+ * dropdown value is accepted verbatim; choosing “custom” makes the text input
+ * authoritative. Both fields are mandatory before AI can be enabled.
+ */
+export function parseSessionTitleFormValue(
+  formValue: Record<string, unknown> | undefined,
+): SessionTitleFormParseResult {
+  const selectedModel = sessionTitleFormScalar(formValue, 'model');
+  const customModel = sessionTitleFormScalar(formValue, 'customModel');
+  const model =
+    selectedModel === SESSION_TITLE_CUSTOM_MODEL_OPTION || !selectedModel ? customModel : selectedModel;
+  if (!model) return { ok: false, message: '请选择模型，或填写自定义模型 ID。' };
+
+  const rawEffort = sessionTitleFormScalar(formValue, 'effort');
+  if (!rawEffort || !(REASONING_EFFORTS as readonly string[]).includes(rawEffort)) {
+    return { ok: false, message: '请选择 Effort。' };
+  }
+  return {
+    ok: true,
+    config: { enabled: true, model, effort: rawEffort as ReasoningEffort },
+  };
+}
+
+/**
+ * Resume-title settings sub-card. The selected backend is transient UI state,
+ * supplied by the caller together with that backend's live model list. Config
+ * remains independent per backend under preferences.sessionTitles.byBackend.
+ */
+export function buildSessionTitleSettingsCard(
+  cfg: AppConfig,
+  backendOptions: SessionTitleBackendOption[],
+  selectedBackendId: string | undefined,
+  models: ModelInfo[],
+  notice?: string,
+): CardObject {
+  const curBackend =
+    (selectedBackendId && backendOptions.some((backend) => backend.id === selectedBackendId)
+      ? selectedBackendId
+      : backendOptions[0]?.id) ?? DEFAULT_BACKEND_ID;
+  const visible = models.filter((model) => !model.hidden && model.id.trim());
+  const configured = getSessionTitleConfig(cfg, curBackend);
+  const configuredLive = configured.enabled ? visible.find((model) => model.id === configured.model) : undefined;
+  const initialModel = configured.enabled
+    ? (configuredLive?.id ?? SESSION_TITLE_CUSTOM_MODEL_OPTION)
+    : undefined;
+  const customModel = configured.enabled && !configuredLive ? configured.model : undefined;
+
+  const modelSelect = {
+    ...selectMenu({
+      name: 'model',
+      placeholder: '选择模型',
+      options: [
+        ...visible.map((model) => ({ label: model.displayName || model.id, value: model.id })),
+        { label: '自定义模型 ID…', value: SESSION_TITLE_CUSTOM_MODEL_OPTION },
+      ],
+      initial: initialModel,
+    }),
+    required: true,
+  };
+  const effortSelect = {
+    ...selectMenu({
+      name: 'effort',
+      placeholder: '选择 Effort',
+      // 自定义/第三方模型的能力无法事先推断：给全量协议档位，
+      // 而不用某个 live 模型的 supportedEfforts 反向做隐形白名单。
+      options: getSessionTitleEfforts(curBackend).map((effort) => ({ label: reasoningEffortLabel(effort), value: effort })),
+      initial: configured.enabled ? configured.effort : undefined,
+    }),
+    required: true,
+  };
+
+  const elements: CardElement[] = [
+    ...(notice ? [md(notice)] : []),
+    md('**🏷️ 原生 resume 会话标题**'),
+    note(
+      '仅影响升级后由 Bridge 新建的聊天会话。标题始终先剔除发信人前缀；未开启 AI 时直接截断清洗后的首句。',
+    ),
+    hr(),
+  ];
+
+  if (backendOptions.length > 1) {
+    elements.push(
+      md('🧠 **Agent 后端**'),
+      actions(
+        backendOptions.map((backend) =>
+          button(
+            backend.label,
+            { a: DM.sessionTitleSetBackend, v: backend.id },
+            backend.id === curBackend ? 'primary' : 'default',
+          ),
+        ),
+      ),
+    );
+  } else {
+    elements.push(md(`🧠 **Agent 后端**：${backendOptions[0]?.label ?? curBackend}`));
+  }
+
+  elements.push(
+    md(`**当前方式**：${summarizeSessionTitleConfig(cfg, curBackend)}`),
+    actions([
+      button(
+        '不使用模型（截断首句）',
+        { a: DM.sessionTitleDisable, b: curBackend },
+        configured.enabled ? 'default' : 'primary',
+      ),
+    ]),
+    hr(),
+    md('**使用 AI 精炼**'),
+    note(
+      '开启后模型和 Effort 均必选。不限制模型厂商；实时列表里没有时可填写任意第三方模型 ID。调用失败会回退到截断首句。',
+    ),
+    ...(visible.length === 0 ? [note('未取到实时模型列表，请选“自定义模型 ID”后填写。')] : []),
+    form('session_title_model_effort', [
+      md('🤖 **模型**'),
+      modelSelect,
+      input({
+        name: 'customModel',
+        label: '自定义模型 ID（仅选“自定义”时使用）',
+        placeholder: '例如 provider/model-name',
+        value: customModel,
+        required: visible.length === 0,
+        maxLength: 200,
+        width: 'fill',
+      }),
+      md('🎚 **Effort**'),
+      effortSelect,
+      actions([
+        submitButton(
+          '✅ 保存并开启 AI',
+          { a: DM.sessionTitleSubmit, b: curBackend },
+          'primary',
+          'submit_session_title',
+        ),
+      ]),
+    ]),
+    hr(),
+    actions([button('⬅️ 返回设置', { a: DM.settings })]),
+  );
+
+  return card(elements, { header: { title: '🏷️ 会话标题设置', template: 'blue' } });
 }
 
 /** 飞书 CLI（lark-cli）使用文档——评论里读/改文档依赖它。 */

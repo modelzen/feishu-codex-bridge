@@ -251,6 +251,17 @@ export interface ResumeThreadOptions extends StartThreadOptions {
   sessionId: string;
 }
 
+/** Isolated one-shot title generation. The caller supplies the complete prompt
+ * (including title rules and the already-cleaned first user message); backends
+ * must use the selected model/effort verbatim and must not silently substitute
+ * a cheaper/default model. */
+export interface GenerateSessionTitleOptions {
+  cwd: string;
+  prompt: string;
+  model: string;
+  effort: ReasoningEffort;
+}
+
 // ── 账号用量（归一化）──────────────────────────────────────────────────
 // /usage 卡的数据形状。目前只有 codex（ChatGPT 登录）后端有这份数据（实现在
 // codex-appserver/usage，经 src/agent/usage 出口），但类型是后端中立的归一化
@@ -406,6 +417,17 @@ export interface AgentBackend {
    * live. Keeps the last `maxTurns` turns; never throws (returns empty on fail).
    */
   readHistory(cwd: string, sessionId: string, maxTurns?: number): Promise<ThreadHistory>;
+  /** Read the backend-native user title only (not preview/auto summary). Undefined
+   * means this session has no title yet. Kept optional for future backends that
+   * cannot participate in native resume-title synchronization. */
+  readSessionTitle?(cwd: string, sessionId: string): Promise<string | undefined>;
+  /** Persist a title through the backend's native session store so its own CLI
+   * resume picker sees it (codex: thread/name/set; Claude: customTitle). */
+  setSessionTitle?(cwd: string, sessionId: string, title: string): Promise<void>;
+  /** Run an isolated, non-persistent one-shot generation with the exact selected
+   * model and effort. Empty model output is represented as undefined; runtime
+   * errors intentionally propagate so the coordinator can apply its fallback. */
+  generateSessionTitle?(opts: GenerateSessionTitleOptions): Promise<string | undefined>;
   startThread(opts: StartThreadOptions): Promise<AgentThread>;
   resumeThread(opts: ResumeThreadOptions): Promise<AgentThread>;
 }

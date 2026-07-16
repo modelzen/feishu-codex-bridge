@@ -1,11 +1,17 @@
 import { randomUUID } from 'node:crypto';
-import type { SettingSource } from '@anthropic-ai/claude-agent-sdk';
+import type {
+  EffortLevel,
+  ModelInfo as ClaudeModelInfo,
+  Query,
+  SettingSource,
+} from '@anthropic-ai/claude-agent-sdk';
 import { log } from '../../core/logger';
 import type {
   AgentBackend,
   AgentCapabilities,
   AgentThread,
   BackendProbe,
+  GenerateSessionTitleOptions,
   ModelInfo,
   PermissionMode,
   ReasoningEffort,
@@ -58,8 +64,12 @@ function bridgeClaudeEnv(): Record<string, string> {
 
 /** The SDK's runtime surface we use (typed off the package, erased at build). */
 type ClaudeSdk = typeof import('@anthropic-ai/claude-agent-sdk');
+export type ClaudeSdkFacade = Pick<
+  ClaudeSdk,
+  'query' | 'listSessions' | 'getSessionInfo' | 'getSessionMessages' | 'renameSession'
+>;
 
-let sdkPromise: Promise<ClaudeSdk> | undefined;
+let sdkPromise: Promise<ClaudeSdkFacade> | undefined;
 /**
  * Lazy-load the SDK via the on-demand loader (bridge/global node_modules → user
  * private install dir). Cached after first success. Throws BackendNotInstalledError
@@ -68,9 +78,83 @@ let sdkPromise: Promise<ClaudeSdk> | undefined;
  * package anywhere on the resolve path (e.g. a global `npm i -g`), this finds it
  * and never re-downloads.
  */
-function loadSdk(): Promise<ClaudeSdk> {
-  sdkPromise ??= loadBackendDep<ClaudeSdk>(SDK_PKG);
+function loadSdk(): Promise<ClaudeSdkFacade> {
+  sdkPromise ??= loadBackendDep<ClaudeSdkFacade>(SDK_PKG);
   return sdkPromise;
+}
+
+const TITLE_GENERATION_TIMEOUT_MS = 30_000;
+const TITLE_OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: { title: { type: 'string', maxLength: 36 } },
+  required: ['title'],
+  additionalProperties: false,
+} as const;
+
+function parseGeneratedTitle(text: string): string | undefined {
+  const clean = text.trim();
+  if (!clean) return undefined;
+  try {
+    const parsed = JSON.parse(clean) as { title?: unknown };
+    if (typeof parsed.title === 'string') return parsed.title.trim() || undefined;
+  } catch {
+    // Structured output is preferred, but preserve a plain-text result from an
+    // older SDK/CLI so the coordinator can sanitize/fallback in one place.
+  }
+  return clean;
+}
+
+function titleFromStructuredOutput(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const title = (value as { title?: unknown }).title;
+  return typeof title === 'string' ? title.trim() || undefined : undefined;
+}
+
+/** Consume a title query until its terminal SDK result. Exported for a mock-only
+ * unit test; runtime errors deliberately propagate to the coordinator. */
+export async function consumeClaudeTitleQuery(query: Query): Promise<string | undefined> {
+  for await (const message of query) {
+    if (message.type !== 'result') continue;
+    if (message.subtype !== 'success') {
+      throw new Error(message.errors.join('; ') || `Claude title query failed: ${message.subtype}`);
+    }
+    return titleFromStructuredOutput(message.structured_output) ?? parseGeneratedTitle(message.result);
+  }
+  throw new Error('Claude title query closed before returning a result');
+}
+
+function withAbortDeadline<T>(
+  work: Promise<T>,
+  abortController: AbortController,
+  timeoutMs = TITLE_GENERATION_TIMEOUT_MS,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      abortController.abort();
+      reject(new Error(`Claude title generation timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Start the SDK in streaming-input mode but never submit a user turn. The CLI
+ * still emits its initialization payload (which contains supportedModels), and
+ * aborting after discovery releases the waiting input iterator. */
+async function* idleClaudeInput(signal: AbortSignal): AsyncGenerator<never, void, unknown> {
+  if (signal.aborted) return;
+  await new Promise<void>((resolve) => {
+    if (signal.aborted) resolve();
+    else signal.addEventListener('abort', () => resolve(), { once: true });
+  });
 }
 
 /**
@@ -91,6 +175,13 @@ function loadSdk(): Promise<ClaudeSdk> {
 export class ClaudeAgentBackend implements AgentBackend {
   readonly id = 'claude-agent';
   readonly displayName = 'Claude';
+  /** Successful SDK discovery is stable for this backend process and avoids
+   * spawning an auxiliary Claude CLI on every topic start/settings render.
+   * Failures are deliberately not cached so installation/login recovery can
+   * retry on the next call (same policy as the Codex backend). */
+  private modelCache: ModelInfo[] | null = null;
+
+  constructor(private readonly sdkLoader: () => Promise<ClaudeSdkFacade> = loadSdk) {}
 
   readonly capabilities: AgentCapabilities = {
     // /goal：goal-like —— 一个自主轮跑完目标 + 合成状态 + abort 硬停可终止续聊
@@ -137,14 +228,44 @@ export class ClaudeAgentBackend implements AgentBackend {
   }
 
   async listModels(): Promise<ModelInfo[]> {
-    return STATIC_MODELS;
+    if (this.modelCache) return this.modelCache;
+    let query: Query | undefined;
+    const abortController = new AbortController();
+    try {
+      const sdk = await this.sdkLoader();
+      // supportedModels() is exposed on an initialized SDK Query rather than as
+      // a package-level function. An idle streaming input lets the CLI initialize
+      // without submitting a user turn or spending model tokens.
+      query = sdk.query({
+        prompt: idleClaudeInput(abortController.signal),
+        options: {
+          abortController,
+          persistSession: false,
+          maxTurns: 1,
+          tools: [],
+          skills: [],
+          mcpServers: {},
+          settingSources: [],
+        },
+      });
+      const discovered = await withAbortDeadline(query.supportedModels(), abortController);
+      if (!discovered.length) throw new Error('Claude SDK returned an empty model catalog');
+      this.modelCache = discovered.map(mapClaudeModel);
+      return this.modelCache;
+    } catch (err) {
+      log.fail('agent', err, { backend: 'claude-agent', phase: 'supportedModels' });
+      return STATIC_MODELS;
+    } finally {
+      abortController.abort();
+      query?.close();
+    }
   }
 
   /** 最近会话（newest first），读 ~/.claude/projects/<cwd-hash> 的 JSONL 存储——
    * 与 `claude -r` 同源，故能列出本机用 `claude` 手开的会话。绝不抛错（契约）。 */
   async listThreads(cwd: string, limit = 15): Promise<ThreadSummary[]> {
     try {
-      const sdk = await loadSdk();
+      const sdk = await this.sdkLoader();
       const sessions = await sdk.listSessions({ dir: cwd, limit });
       return sessions
         .map(mapSessionSummary)
@@ -159,7 +280,7 @@ export class ClaudeAgentBackend implements AgentBackend {
    * 无 token 成本。绝不抛错（返回空）。 */
   async readHistory(cwd: string, sessionId: string, maxTurns = 10): Promise<ThreadHistory> {
     try {
-      const sdk = await loadSdk();
+      const sdk = await this.sdkLoader();
       const messages = await sdk.getSessionMessages(sessionId, { dir: cwd });
       return foldSessionMessages(messages, maxTurns, cwd);
     } catch (err) {
@@ -168,8 +289,58 @@ export class ClaudeAgentBackend implements AgentBackend {
     }
   }
 
+  async readSessionTitle(cwd: string, sessionId: string): Promise<string | undefined> {
+    const sdk = await this.sdkLoader();
+    // Read the exact transcript metadata instead of a bounded list page: an old
+    // resumed session may no longer be in the newest N entries. Only customTitle
+    // counts here; summary/firstPrompt do not make Claude Code's resume picker
+    // treat the session as explicitly named.
+    const session = await sdk.getSessionInfo(sessionId, { dir: cwd });
+    const title = session?.customTitle?.trim();
+    return title || undefined;
+  }
+
+  async setSessionTitle(cwd: string, sessionId: string, title: string): Promise<void> {
+    const clean = title.trim();
+    if (!clean) throw new Error('Cannot set an empty Claude session title');
+    const sdk = await this.sdkLoader();
+    await sdk.renameSession(sessionId, clean, { dir: cwd });
+  }
+
+  async generateSessionTitle(opts: GenerateSessionTitleOptions): Promise<string | undefined> {
+    const sdk = await this.sdkLoader();
+    const abortController = new AbortController();
+    const query = sdk.query({
+      prompt: opts.prompt,
+      options: {
+        cwd: opts.cwd,
+        model: opts.model,
+        // Pass through verbatim. If a stale configuration names an effort the
+        // installed SDK rejects, that error must reach the coordinator; never
+        // downgrade or substitute behind the administrator's back.
+        effort: opts.effort as EffortLevel,
+        abortController,
+        persistSession: false,
+        maxTurns: 1,
+        tools: [],
+        skills: [],
+        mcpServers: {},
+        settingSources: [],
+        outputFormat: { type: 'json_schema', schema: TITLE_OUTPUT_SCHEMA },
+      },
+    });
+    try {
+      return await withAbortDeadline(
+        consumeClaudeTitleQuery(query),
+        abortController,
+      );
+    } finally {
+      query.close();
+    }
+  }
+
   async startThread(opts: StartThreadOptions): Promise<AgentThread> {
-    const sdk = await loadSdk();
+    const sdk = await this.sdkLoader();
     return new ClaudeAgentThread({
       sessionId: randomUUID(),
       resume: false,
@@ -185,7 +356,7 @@ export class ClaudeAgentBackend implements AgentBackend {
   }
 
   async resumeThread(opts: ResumeThreadOptions): Promise<AgentThread> {
-    const sdk = await loadSdk();
+    const sdk = await this.sdkLoader();
     return new ClaudeAgentThread({
       sessionId: opts.sessionId,
       resume: true,
@@ -203,8 +374,27 @@ export class ClaudeAgentBackend implements AgentBackend {
 
 const EFFORTS: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh'];
 
-/** Static Claude model catalog for the model picker. The SDK accepts these ids
- * (Options.model). Effort is applied at thread creation via Options.effort. */
+function mapClaudeModel(model: ClaudeModelInfo, index: number): ModelInfo {
+  const reported = model.supportedEffortLevels as ReasoningEffort[] | undefined;
+  const supportedEfforts = model.supportsEffort === false ? [] : (reported?.length ? reported : EFFORTS);
+  const defaultEffort: ReasoningEffort = supportedEfforts.includes('high')
+    ? 'high'
+    : (supportedEfforts[0] ?? 'medium');
+  return {
+    id: model.value,
+    displayName: model.displayName || model.value,
+    description: model.description ?? '',
+    supportedEfforts,
+    defaultEffort,
+    // The SDK does not currently expose an explicit default bit. Its catalog is
+    // ordered for the picker, so mark the leading model as the bridge default.
+    isDefault: index === 0,
+    hidden: false,
+  };
+}
+
+/** Failure-only fallback when SDK model discovery cannot initialize. Successful
+ * discovery is cached above and remains the normal model-picker source. */
 const STATIC_MODELS: ModelInfo[] = [
   {
     id: 'claude-opus-4-8',

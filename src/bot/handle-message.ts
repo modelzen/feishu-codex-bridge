@@ -37,6 +37,8 @@ import {
   getPendingPolicy,
   getModelDisplay,
   getRunIdleTimeoutMs,
+  getSessionTitleConfig,
+  getSessionTitleEfforts,
   getShowToolCalls,
   getCommentsConfig,
   getCompletionReminderConfig,
@@ -58,6 +60,7 @@ import {
   type CommentsConfig,
   type CompletionReminderMode,
   type PendingPolicy,
+  type SessionTitleBackendConfig,
 } from '../config/schema';
 import { CardDispatcher } from '../card/dispatcher';
 import { sendManagedCard, updateManagedCard } from '../card/managed';
@@ -123,11 +126,13 @@ import {
   buildRmConfirmCard,
   buildCoffeeSettingsCard,
   buildCompletionReminderCustomCard,
+  buildSessionTitleSettingsCard,
   buildSettingsCard,
   buildUpdateCard,
   buildWatchdogCustomCard,
   DM,
   GS,
+  parseSessionTitleFormValue,
   type BackendProbeRow,
   type DoctorInfo,
 } from '../card/dm-cards';
@@ -177,7 +182,17 @@ import {
 import { createProject, joinExistingGroup } from '../project/lifecycle';
 import { refreshBranch } from '../project/announcement';
 import { leaveChat, transferOwnership } from '../project/group-ops';
-import { getSession, listSessions, patchSession, upsertSession, type SessionRecord } from './session-store';
+import {
+  clearSessionTitleJobKey,
+  getSession,
+  listSessions,
+  patchSession,
+  sessionTitleJobKey,
+  upsertSession,
+  type SessionRecord,
+  type SessionTitlePolicySnapshot,
+} from './session-store';
+import { SessionTitleCoordinator } from './session-title-coordinator';
 import { handleDmConsole } from './dm-console';
 import { fetchInteractiveCardText, isDegradedCardContent } from './card-content';
 import {
@@ -660,6 +675,52 @@ export function createOrchestrator(
    * routed yet (status card, /usage, models prewarm, resume-picker pick) keep
    * using it directly — identical to the pre-registry behavior. */
   const backend = backendFor();
+  const sessionTitles = new SessionTitleCoordinator({ backendFor: (id) => backendFor(id) });
+
+  /** Snapshot the selected backend's title policy when its native session is
+   * created. Later DM-setting changes affect future sessions only. */
+  function sessionTitlePolicy(backendId: string): SessionTitlePolicySnapshot {
+    const selected = getSessionTitleConfig(cfg, backendId);
+    return selected.enabled
+      ? { strategy: 'model', model: selected.model, effort: selected.effort }
+      : { strategy: 'truncate' };
+  }
+
+  /** Title bookkeeping is auxiliary: disk/backend failures never block the
+   * user's main conversation. */
+  async function registerSessionTitle(
+    be: AgentBackend,
+    sessionId: string,
+    cwd: string,
+    source?: string,
+  ): Promise<string | undefined> {
+    try {
+      return await sessionTitles.register({
+        backend: be.id,
+        sessionId,
+        cwd,
+        source,
+        policy: sessionTitlePolicy(be.id),
+      });
+    } catch (err) {
+      log.fail('agent', err, { phase: 'session-title-register', backend: be.id, sessionId });
+      return undefined;
+    }
+  }
+
+  async function attachSessionTitleSource(
+    backendId: string,
+    sessionId: string,
+    source: string,
+  ): Promise<string | undefined> {
+    const key = sessionTitleJobKey(backendId, sessionId);
+    try {
+      return (await sessionTitles.attachSource(key, source)) ? key : undefined;
+    } catch (err) {
+      log.fail('agent', err, { phase: 'session-title-attach', backend: backendId, sessionId });
+      return undefined;
+    }
+  }
   /** 后端 id → 展示名（项目设置卡）。手编 projects.json 写了未知 id 时原样显示。 */
   const backendDisplayName = (id?: string): string => {
     try {
@@ -1339,6 +1400,7 @@ export function createOrchestrator(
         ]);
         let firstText = ingested;
         let thread = resolved;
+        let titleJobKey: string | undefined;
         const neverSeen = !thread;
         // codex's history is EMPTY when the session is brand-new (neverSeen) OR a
         // resume failed and we fell back to a new thread (recreated) — both want
@@ -1354,12 +1416,14 @@ export function createOrchestrator(
           // 自愈观测：来源=全新会话（无持久化记录），与 resume-ok/resume-recreate
           // 互斥——三者其一 + agent 层的 spawn/prewarm-hit 即可还原完整恢复路径。
           log.info('agent', 'session-fresh', { sessionKey, sessionId: thread.sessionId, backend: be.id });
+          titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, summaryText ?? text);
           await upsertSession({
             threadId: sessionKey,
             chatId: msg.chatId,
             cwd,
             sessionId: thread.sessionId,
             backend: be.id,
+            titleJobKey,
             // `text` is already file-woven when preIngested; use the raw
             // `summaryText` (handleTurn's original) so the session label isn't
             // manifest boilerplate + a temp path.
@@ -1368,6 +1432,38 @@ export function createOrchestrator(
             createdAt: Date.now(),
             updatedAt: Date.now(),
           });
+        } else if (recreated) {
+          // resume 失败后创建的是一个全新的 HOST 会话；它属于升级后的新会话，
+          // 应独立登记标题任务（旧 sessionId 的 ledger/标题绝不复用）。
+          const be = backendFor(prior?.backend ?? project?.backend);
+          const cwd = project?.cwd ?? prior?.cwd ?? fallbackCwd;
+          titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, summaryText ?? text);
+          // Full replacement drops the old session's titleJobKey even if title
+          // registration failed; carrying it across would let a later turn attach
+          // source to the wrong native session.
+          if (prior) {
+            await upsertSession({
+              ...prior,
+              cwd,
+              sessionId: thread.sessionId,
+              backend: be.id,
+              ...(titleJobKey ? { titleJobKey } : { titleJobKey: undefined }),
+              updatedAt: Date.now(),
+            });
+          }
+        } else {
+          // `/clear` 先创建一个没有首条提问的 waiting_source job；只有它能在
+          // 此处被补源。手动 `/resume` 没有 ledger row，attach 返回 false，因而
+          // 不会给导入/历史会话自动改名。
+          const be = backendFor(prior?.backend ?? project?.backend);
+          const expected = sessionTitleJobKey(be.id, thread.sessionId);
+          if (prior?.titleJobKey === expected) {
+            await attachSessionTitleSource(be.id, thread.sessionId, summaryText ?? text);
+            // Even when the source was attached by an earlier run that got
+            // cancelled before runStreamed, carry the durable key forward so
+            // this first actually-issued turn can activate it.
+            titleJobKey = expected;
+          }
         }
         // 话题上文：在话题里 @bot 时，把 bot 还没喂给 codex 的人对人消息补进开场。
         // codexEmpty（新会话 / resume 失败重建）→ 用最近 N 条全量（即投机结果）；
@@ -1406,6 +1502,7 @@ export function createOrchestrator(
           // 编织完成 → turn/start 之间不再读盘：首轮直接用预取的会话记录
           // （prior=undefined 即确知是全新会话，刚 upsert 的记录还没有 model）。
           firstRec: prior ?? null,
+          titleJobKey,
           timing: { tResolve: tResolveDone - tIntake, tWeave: Date.now() - tIntake },
         };
         if (goal) await launchGoalRun(launchOpts);
@@ -1575,6 +1672,7 @@ export function createOrchestrator(
         return;
       }
       log.info('card', 'start', { project: project?.name ?? '(unregistered)', model, effort, images: images?.length ?? 0, goal: Boolean(goal) });
+      const titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, text);
       const launchOpts: LaunchOpts = {
         chatId: msg.chatId,
         replyTo: msg.messageId,
@@ -1590,6 +1688,7 @@ export function createOrchestrator(
         requestedAt: msg.createTime || tIntake,
         roleSuffix: perm.roleSuffix,
         backendId: be.id,
+        titleJobKey,
         timing: { tResolve: tResolveDone - tIntake, tWeave: Date.now() - tIntake },
       };
       if (goal) await launchGoalRun(launchOpts);
@@ -1875,12 +1974,17 @@ export function createOrchestrator(
         }
         trackSession(sessionKey, fresh);
         lastUsage.delete(sessionKey); // context gauge → 0 until the next turn
+        // `/clear` has no user question to title from. Park a policy-snapshotted
+        // waiting job; the next real message supplies the source and activates it
+        // only after that host turn is issued.
+        const titleJobKey = await registerSessionTitle(be, fresh.sessionId, cwd);
         await upsertSession({
           threadId: sessionKey,
           chatId: msg.chatId,
           cwd,
           sessionId: fresh.sessionId,
           backend: be.id,
+          titleJobKey,
           model: rec?.model,
           effort: rec?.effort,
           summary: '(新会话)',
@@ -2315,6 +2419,54 @@ export function createOrchestrator(
       keepAwake: cliPrefs.keepAwake.enabled,
     });
     return buildCoffeeSettingsCard(section);
+  }
+
+  // ── 🏷️ Bridge 新会话的原生 resume 标题设置 ───────────────────────
+  function sessionTitleBackendOptions(): { id: string; label: string }[] {
+    return visibleCatalog()
+      .filter((entry) => entry.id === DEFAULT_BACKEND_ID || isBackendEntryInstalled(entry))
+      .map((entry) => ({ id: entry.id, label: entry.displayName }));
+  }
+
+  async function renderSessionTitleSettings(
+    selectedBackendId?: string,
+    notice?: string,
+  ): Promise<object> {
+    const options = sessionTitleBackendOptions();
+    const selected =
+      selectedBackendId && options.some((entry) => entry.id === selectedBackendId)
+        ? selectedBackendId
+        : options[0]?.id ?? DEFAULT_BACKEND_ID;
+    const models = await listModels(backendFor(selected)).catch((err) => {
+      log.fail('agent', err, { phase: 'session-title-models', backend: selected });
+      return [] as ModelInfo[];
+    });
+    return buildSessionTitleSettingsCard(cfg, options, selected, models, notice);
+  }
+
+  function applySessionTitlePref(
+    evt: CardActionEvent,
+    backendId: string,
+    config: SessionTitleBackendConfig,
+    notice: string,
+  ): void {
+    if (!dmAdmin(evt.operator?.openId)) return;
+    const valid = sessionTitleBackendOptions().some((entry) => entry.id === backendId);
+    if (!valid) {
+      void patch(evt, () => renderSessionTitleSettings(undefined, '⚠️ 这个 Agent 后端当前不可用，未保存。'));
+      return;
+    }
+    const saved = writePreferences((prefs) => {
+      const current = prefs.sessionTitles ?? {};
+      prefs.sessionTitles = {
+        ...current,
+        byBackend: { ...(current.byBackend ?? {}), [backendId]: config },
+      };
+    }).catch((err) => log.fail('console', err, { phase: 'save-config' }));
+    void patch(evt, async () => {
+      await saved;
+      return renderSessionTitleSettings(backendId, notice);
+    });
   }
 
   // ── 📝 云文档评论 @bot 全局设置（DM「⚙️ 设置 → 📝 云文档评论」）───────────
@@ -2945,6 +3097,42 @@ export function createOrchestrator(
       const n = Number(value.v);
       if (Number.isFinite(n)) applyPref(evt, (p) => (p.maxConcurrentRuns = n));
     })
+    // 🏷️ 每个 Agent 后端独立配置。模型列表只用于方便选择，不充当白名单；
+    // 表单也接受任意第三方模型 ID，运行时严格原样调用，失败即截断兜底。
+    .on(DM.sessionTitleSettings, ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      void patch(evt, () => renderSessionTitleSettings());
+    })
+    .on(DM.sessionTitleSetBackend, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const backendId = typeof value.v === 'string' ? value.v : undefined;
+      void patch(evt, () => renderSessionTitleSettings(backendId));
+    })
+    .on(DM.sessionTitleDisable, ({ evt, value }) => {
+      const backendId = typeof value.b === 'string' ? value.b : '';
+      applySessionTitlePref(evt, backendId, { enabled: false }, '✅ 已关闭 AI；以后新建的会话将截断清洗后的首句。');
+    })
+    .on(DM.sessionTitleSubmit, ({ evt, value, formValue }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const backendId = typeof value.b === 'string' ? value.b : '';
+      const parsed = parseSessionTitleFormValue(formValue);
+      if (!parsed.ok) {
+        void patch(evt, () => renderSessionTitleSettings(backendId, `⚠️ ${parsed.message}`));
+        return;
+      }
+      if (!getSessionTitleEfforts(backendId).includes(parsed.config.effort)) {
+        void patch(evt, () =>
+          renderSessionTitleSettings(backendId, '⚠️ 这个 Effort 不受当前 Agent 后端协议支持，未保存。'),
+        );
+        return;
+      }
+      applySessionTitlePref(
+        evt,
+        backendId,
+        parsed.config,
+        `✅ 已开启 AI：${parsed.config.model} · ${parsed.config.effort}。仅影响以后新建的会话。`,
+      );
+    })
     // 📝 云文档评论 @bot 全局设置：纯按钮即点即改即重渲（提示词走 comment-instructions.md 文件，不在卡里）。
     .on(DM.commentSettings, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
@@ -3491,6 +3679,9 @@ export function createOrchestrator(
     /** the backend that created `thread` (persisted into the SessionRecord so a
      * restart resumes on the same runtime). Unset → default (codex). */
     backendId?: string;
+    /** Durable title ledger key for a Bridge-owned, newly-created native
+     * session. Absent for manual /resume, legacy sessions, and doc comments. */
+    titleJobKey?: string;
     /** prefetched SessionRecord for the FIRST turn (M-1 极限提前)：免掉编织完成
      * 与 turn/start 之间的 getSession 读盘。`null` = 确知没有记录（全新会话）；
      * undefined = 没预取，照旧读。后续排队轮永远重读（⚙️ 可能改了 model）。 */
@@ -3603,6 +3794,59 @@ export function createOrchestrator(
     let queuedCard = slot.queuedCard;
     reaction?.started(); // slot acquired → flip OneSecond → Typing
     let firstCardSent = false;
+    let titleStart: Promise<boolean> | undefined;
+    let titleApplyRequested = false;
+    let titleTurnAttempted = false;
+
+    const beginSessionTitle = (): void => {
+      if (!opts.titleJobKey || titleStart) return;
+      const key = opts.titleJobKey;
+      titleStart = (async () => {
+        try {
+          // Called only after the host emits turn_started. A start rejection
+          // leaves waiting_turn + its binding marker intact for the next message.
+          const activated = await sessionTitles.activate(key);
+          if (!activated) return false;
+          await sessionTitles.prepare(key);
+          return true;
+        } catch (err) {
+          log.fail('agent', err, { phase: 'session-title-start', key });
+          return false;
+        }
+      })();
+    };
+    const requestSessionTitleApply = (): void => {
+      if (!opts.titleJobKey || !titleStart || titleApplyRequested) return;
+      titleApplyRequested = true;
+      const key = opts.titleJobKey;
+      const bindingKey = topicThreadId;
+      void titleStart.then(async (activated) => {
+        if (!activated) {
+          titleStart = undefined;
+          titleApplyRequested = false;
+          return;
+        }
+        if (bindingKey) {
+          await clearSessionTitleJobKey(bindingKey, key).catch((err) =>
+            log.fail('agent', err, { phase: 'session-title-marker-clear', key }),
+          );
+        }
+        await sessionTitles.apply(key);
+      });
+    };
+    const retrySessionTitleAfterTurn = (): void => {
+      if (!opts.titleJobKey || !titleStart) return;
+      const key = opts.titleJobKey;
+      void (async () => {
+        if (!(await titleStart)) return;
+        // Claude's native session row may appear only after the first result. An
+        // idempotent post-turn attempt plus a short delayed retry covers that
+        // timing edge without holding the user's run/semaphore completion.
+        await sessionTitles.apply(key);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await sessionTitles.apply(key);
+      })();
+    };
 
     const persist = async (threadId: string): Promise<void> => {
       await upsertSession({
@@ -3611,6 +3855,7 @@ export function createOrchestrator(
         cwd: opts.cwd ?? fallbackCwd,
         sessionId: opts.thread.sessionId,
         backend: opts.backendId ?? DEFAULT_BACKEND_ID,
+        titleJobKey: opts.titleJobKey,
         model: opts.model,
         effort: opts.effort,
         summary: opts.summary ?? opts.firstText.slice(0, 80),
@@ -3652,6 +3897,14 @@ export function createOrchestrator(
       for (;;) {
         const turnInput = currentTurn.input;
         state.requesterOpenId = currentTurn.requesterOpenId;
+        if (titleTurnAttempted && !titleStart && opts.titleJobKey && turnInput.text) {
+          // A prior turn/start was rejected before turn_started. If a queued
+          // follow-up now becomes the first accepted turn, title that message,
+          // not the rejected one.
+          await sessionTitles.attachSource(opts.titleJobKey, turnInput.text).catch((err) =>
+            log.fail('agent', err, { phase: 'session-title-refresh', key: opts.titleJobKey }),
+          );
+        }
         // per-turn model/effort: prefer latest persisted (⚙️ may have changed it).
         // First turn uses the intake-prefetched record (null = known absent) so
         // runStreamed — i.e. turn/start — fires with zero awaits after weaving.
@@ -3662,6 +3915,7 @@ export function createOrchestrator(
         const turnEffort = rec?.effort ?? opts.effort;
         const modelDisp = getModelDisplay(cfg);
         const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
+        titleTurnAttempted = true;
         const turnStartAt = Date.now(); // turn/start 已在 runStreamed() 内发出（与下面的建卡并行）
         state.run = run;
         const render = new RunRender();
@@ -3796,6 +4050,12 @@ export function createOrchestrator(
           const tEv = Date.now();
           if (!firstEvAt) firstEvAt = tEv;
           const et = (ev as { type?: string }).type;
+          if (et === 'turn_started') {
+            // Host accepted the first turn. Title generation now overlaps the
+            // remainder of that turn; the binding was persisted before this loop.
+            beginSessionTitle();
+            requestSessionTitleApply();
+          }
           if (et === 'text_delta') {
             if (!firstTextAt) firstTextAt = tEv;
             const d = (ev as { delta?: string }).delta;
@@ -3946,6 +4206,7 @@ export function createOrchestrator(
           cardUpdated: terminalCardUpdated,
           replyInThread: !opts.flat,
         });
+        retrySessionTitleAfterTurn();
         replyTo = finalMsgId;
         replyInThread = !opts.flat; // stay in the topic for queued turns (single: stay flat)
         log.info('card', 'final', { terminal: render.terminal() });
@@ -4035,6 +4296,53 @@ export function createOrchestrator(
       void slot.queuedCard.stream.updateCard(channel, buildQueuedCard({ started: true }));
     }
 
+    let titleStart: Promise<boolean> | undefined;
+    let titleApplyRequested = false;
+    const beginGoalSessionTitle = (): void => {
+      if (!opts.titleJobKey || titleStart) return;
+      const key = opts.titleJobKey;
+      titleStart = (async () => {
+        try {
+          const activated = await sessionTitles.activate(key);
+          if (!activated) return false;
+          await sessionTitles.prepare(key);
+          return true;
+        } catch (err) {
+          log.fail('agent', err, { phase: 'session-title-start', key });
+          return false;
+        }
+      })();
+    };
+    const requestGoalSessionTitleApply = (): void => {
+      if (!opts.titleJobKey || !titleStart || titleApplyRequested) return;
+      titleApplyRequested = true;
+      const key = opts.titleJobKey;
+      const bindingKey = topicThreadId;
+      void titleStart.then(async (activated) => {
+        if (!activated) {
+          titleStart = undefined;
+          titleApplyRequested = false;
+          return;
+        }
+        if (bindingKey) {
+          await clearSessionTitleJobKey(bindingKey, key).catch((err) =>
+            log.fail('agent', err, { phase: 'session-title-marker-clear', key }),
+          );
+        }
+        await sessionTitles.apply(key);
+      });
+    };
+    const retryGoalSessionTitleAfterRun = (): void => {
+      if (!opts.titleJobKey || !titleStart) return;
+      const key = opts.titleJobKey;
+      void (async () => {
+        if (!(await titleStart)) return;
+        await sessionTitles.apply(key);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await sessionTitles.apply(key);
+      })();
+    };
+
     const persist = async (threadId: string): Promise<void> => {
       await upsertSession({
         threadId,
@@ -4042,6 +4350,7 @@ export function createOrchestrator(
         cwd: opts.cwd ?? fallbackCwd,
         sessionId: opts.thread.sessionId,
         backend: opts.backendId ?? DEFAULT_BACKEND_ID,
+        titleJobKey: opts.titleJobKey,
         model: opts.model,
         effort: opts.effort,
         summary: opts.summary ?? objective.slice(0, 80),
@@ -4132,6 +4441,7 @@ export function createOrchestrator(
       runsByCard.set(cardMsgId, state);
       runStreams.set(cardMsgId, stream);
       await adoptThreadId(cardMsgId, ctx.rc);
+      requestGoalSessionTitleApply();
       // chain the next turn's card (and the terminal card) under this one
       replyTo = cardMsgId;
       replyInThread = !opts.flat;
@@ -4215,6 +4525,10 @@ export function createOrchestrator(
           continue;
         }
         if (ev.type === 'turn_started') {
+          // Unlike runGoal() construction, this proves the host accepted and
+          // started the goal's first turn. Generate in parallel from here.
+          beginGoalSessionTitle();
+          if (topicThreadId) requestGoalSessionTitleApply();
           await finalizeCard(cur); // close the previous turn's card (if it produced one)
           cur = startTurn(); // render-only; the card is sent lazily on first content
           continue;
@@ -4259,6 +4573,10 @@ export function createOrchestrator(
       if (interrupted && cur) cur.render.interrupt();
       await finalizeCard(cur);
       cur = null;
+      // Covers a goal that produced no content card (and therefore never called
+      // ensureCard) plus Claude's post-result native-session timing.
+      requestGoalSessionTitleApply();
+      retryGoalSessionTitleAfterRun();
 
       // Always clear the goal when the run ends: a non-complete goal would
       // reactivate on the next resume, and a LEFTOVER goal (even complete) gets
@@ -4801,6 +5119,7 @@ export function createOrchestrator(
 
   async function shutdown(): Promise<void> {
     clearInterval(reaper);
+    await sessionTitles.shutdown();
     // adopt 失败的孤儿线程已在 launchRun/launchGoalRun 的 finally 就地 close，
     // 这里只需回收 LIVE 会话缓存。
     const live = [...new Set(sessions.values())];
@@ -4810,6 +5129,10 @@ export function createOrchestrator(
     await Promise.allSettled(live.map((t) => t.close()));
     log.info('bridge', 'shutdown', { closed: live.length });
   }
+
+  // Recover only ledger rows created by this feature. v1/v2 sessions migrate
+  // with an empty ledger, so startup never backfills legacy/manual sessions.
+  sessionTitles.startRecovery();
 
   // 启动预热：daemon 首个新话题原本恒吃一次 model/list 冷 spawn（独立 app-server
   // ~150–300ms），启动是空闲期，提前付掉。成功时只填 backend 内部缓存，后续
