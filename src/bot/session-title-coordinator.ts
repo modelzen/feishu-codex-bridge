@@ -11,9 +11,10 @@ import {
   type SessionTitlePolicySnapshot,
 } from './session-store';
 import {
+  cleanInboundSessionTitleSource,
   cleanGeneratedSessionTitle,
-  cleanSessionTitleSourcePreservingLines,
   prepareSessionTitle,
+  type SessionTitleSource,
 } from './session-title';
 
 const DEFAULT_LEASE_MS = 60_000;
@@ -43,8 +44,8 @@ export interface RegisterSessionTitleInput {
   backend: string;
   sessionId: string;
   cwd: string;
-  /** The first user message. It may still contain Bridge's sender block. */
-  source?: string;
+  /** The first user message, captured before Bridge prompt weaving. */
+  source?: SessionTitleSource;
   /** Captured now so later settings changes cannot alter an existing job. */
   policy: SessionTitlePolicySnapshot;
 }
@@ -110,13 +111,15 @@ function withoutClaim(
 }
 
 /**
- * Durable, exactly-once coordinator for backend-native resume titles.
+ * Durable, at-most-once coordinator for backend-native resume titles.
  *
- * The generated candidate is persisted before the native write. Every write is
- * preceded by a native title read, so a crash after the write but before the
- * ledger transition, a duplicated lifecycle callback, or a user rename never
- * causes a second overwrite. Cross-process serialization is supplied by the
- * bridge's existing per-bot single-instance lock.
+ * The generated candidate and a writeAttempted marker are persisted before the
+ * native mutation. Once marked, recovery may read the host to classify the
+ * outcome but can never issue the mutation again. This deliberately prefers a
+ * missing title after a crash in the tiny marker→call window over violating the
+ * product guarantee that Bridge modifies a host title only once. Cross-process
+ * serialization is supplied by the bridge's existing per-bot single-instance
+ * lock.
  */
 export class SessionTitleCoordinator {
   private readonly store: SessionTitleStore;
@@ -141,7 +144,7 @@ export class SessionTitleCoordinator {
     const key = sessionTitleJobKey(input.backend, input.sessionId);
     const now = this.now();
     const clean =
-      input.source === undefined ? undefined : cleanSessionTitleSourcePreservingLines(input.source);
+      input.source === undefined ? undefined : cleanInboundSessionTitleSource(input.source);
     const hasSource = Boolean(clean);
     await this.store.create({
       key,
@@ -165,8 +168,8 @@ export class SessionTitleCoordinator {
 
   /** Attach the first post-/clear prompt. Missing jobs (including manual resume)
    * are deliberately ignored rather than implicitly registered. */
-  async attachSource(key: string, rawSource: string): Promise<boolean> {
-    const source = cleanSessionTitleSourcePreservingLines(rawSource);
+  async attachSource(key: string, rawSource: SessionTitleSource): Promise<boolean> {
+    const source = cleanInboundSessionTitleSource(rawSource);
     return this.store.update(
       key,
       // `waiting_turn` has not been accepted by the host yet, so a queued run
@@ -407,19 +410,55 @@ export class SessionTitleCoordinator {
       return;
     }
 
+    let existing: string | undefined;
     try {
-      const existing = (await backend.readSessionTitle(job.cwd, job.sessionId))?.trim();
-      if (existing) {
-        // Equal means a prior process completed the write but crashed before its
-        // ledger update. Different means a user/native client won; never overwrite.
-        await this.finishClaim(
-          job,
-          claimId,
-          existing === job.candidate ? 'written' : 'preexisting',
-          existing,
-        );
-        return;
+      existing = (await backend.readSessionTitle(job.cwd, job.sessionId))?.trim();
+    } catch (err) {
+      // No native mutation is possible before the durable write boundary, so a
+      // transient read failure remains safely retryable.
+      if (isUnsupportedError(err)) {
+        await this.finishClaim(job, claimId, 'unsupported', undefined, errorMessage(err));
+      } else {
+        await this.releaseClaim(job, claimId, 'prepared', err);
       }
+      return;
+    }
+
+    if (existing) {
+      // Equal means the single native call landed before its ledger terminal
+      // transition. Different means a user/native client won; never overwrite.
+      await this.finishClaim(
+        job,
+        claimId,
+        existing === job.candidate ? 'written' : 'preexisting',
+        existing,
+      );
+      return;
+    }
+
+    if (job.writeAttempted) {
+      // A prior process reached the durable write boundary. An empty native
+      // read can mean either "crashed before the call" or "host cache has not
+      // observed the commit"; both are intentionally terminal so Bridge never
+      // calls setSessionTitle twice.
+      await this.finishClaim(
+        job,
+        claimId,
+        'failed',
+        undefined,
+        job.lastError ?? 'native title write outcome is unknown; not retried',
+      );
+      return;
+    }
+
+    const armed = await this.store.update(
+      key,
+      (current) => current.phase === 'applying' && current.claimId === claimId && !current.writeAttempted,
+      (current) => ({ ...current, writeAttempted: true }),
+    );
+    if (!armed) return;
+
+    try {
       await backend.setSessionTitle(job.cwd, job.sessionId, job.candidate);
       await this.finishClaim(job, claimId, 'written', job.candidate);
       log.info('agent', 'session-title-written', { backend: job.backend, sessionId: job.sessionId });
@@ -427,7 +466,27 @@ export class SessionTitleCoordinator {
       if (isUnsupportedError(err)) {
         await this.finishClaim(job, claimId, 'unsupported', undefined, errorMessage(err));
       } else {
-        await this.releaseClaim(job, claimId, 'prepared', err);
+        // The native call may have committed before reporting an error. Verify
+        // once for diagnostics, but never release to `prepared` (which would
+        // permit a second mutation after a stale/lagged read).
+        try {
+          const observed = (await backend.readSessionTitle(job.cwd, job.sessionId))?.trim();
+          await this.finishClaim(
+            job,
+            claimId,
+            observed === job.candidate ? 'written' : observed ? 'preexisting' : 'failed',
+            observed || undefined,
+            observed === job.candidate ? undefined : errorMessage(err),
+          );
+        } catch (readErr) {
+          await this.finishClaim(
+            job,
+            claimId,
+            'failed',
+            undefined,
+            `${errorMessage(err)}; verification failed: ${errorMessage(readErr)}`,
+          );
+        }
       }
     }
   }

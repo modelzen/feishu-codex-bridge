@@ -548,6 +548,6 @@ export function summarizeSessionTitles(cfg: AppConfig): string {
   const ids = Object.keys(cfg.preferences?.sessionTitles?.byBackend ?? {});
   const enabledCount = ids.filter((id) => getSessionTitleConfig(cfg, id).enabled).length;
   return enabledCount === 0
-    ? '未开启 AI，各后端默认截断首句。'
-    : `已为 ${enabledCount} 个后端开启 AI；其余后端截断首句。`;
+    ? '各 Agent 均截断首句（不调用模型）。'
+    : `${enabledCount} 个 Agent 使用 AI 精炼，其余截断首句。`;
 }

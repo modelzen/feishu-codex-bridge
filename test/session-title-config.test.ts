@@ -18,7 +18,7 @@ describe('session title config', () => {
   it('defaults every backend to no model / first-sentence truncation', () => {
     expect(getSessionTitleConfig(cfg(), 'codex-appserver')).toEqual({ enabled: false });
     expect(summarizeSessionTitleConfig(cfg(), 'claude-agent')).toContain('截断首句');
-    expect(summarizeSessionTitles(cfg())).toContain('未开启 AI');
+    expect(summarizeSessionTitles(cfg())).toBe('各 Agent 均截断首句（不调用模型）。');
   });
 
   it('keeps model + effort settings isolated per backend', () => {
@@ -39,7 +39,7 @@ describe('session title config', () => {
       effort: 'low',
     });
     expect(getSessionTitleConfig(config, 'some-new-backend')).toEqual({ enabled: false });
-    expect(summarizeSessionTitles(config)).toContain('2 个后端');
+    expect(summarizeSessionTitles(config)).toContain('2 个 Agent 使用 AI 精炼');
   });
 
   it('treats incomplete or invalid enabled configs as disabled', () => {

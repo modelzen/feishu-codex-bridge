@@ -80,6 +80,9 @@ export interface SessionTitleJob {
   /** Worker lease. claimId gates every later conditional transition. */
   claimId?: string;
   leaseUntil?: number;
+  /** Persisted immediately before the one allowed native title mutation.
+   * Recovery may verify its outcome, but must never issue that mutation again. */
+  writeAttempted?: boolean;
   attempts: number;
   nextRetryAt?: number;
   outcome?: SessionTitleOutcome;

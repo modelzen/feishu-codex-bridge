@@ -153,6 +153,43 @@ describe('Codex backend native session titles', () => {
 });
 
 describe('Claude backend native session titles', () => {
+  it('passes the dedicated non-SDK entrypoint on both fresh and resumed chats', async () => {
+    const firstQuery = asyncQuery([]);
+    const resumedQuery = asyncQuery([]);
+    const query = vi.fn()
+      .mockReturnValueOnce(firstQuery)
+      .mockReturnValueOnce(resumedQuery);
+    const sdk = {
+      query,
+      listSessions: vi.fn(),
+      getSessionInfo: vi.fn(),
+      getSessionMessages: vi.fn(),
+      renameSession: vi.fn(),
+    } as unknown as ClaudeSdkFacade;
+    const backend = new ClaudeAgentBackend(async () => sdk);
+
+    const fresh = await backend.startThread({ cwd: '/repo' });
+    const resumed = await backend.resumeThread({ cwd: '/repo', sessionId: 'session-1' });
+
+    for (const call of query.mock.calls) {
+      expect(call[0].options?.env).toEqual(expect.objectContaining({
+        FEISHU_CODEX_BRIDGE: '1',
+        CLAUDE_CODE_ENTRYPOINT: 'feishu-codex-bridge',
+      }));
+    }
+    expect(query.mock.calls[0]![0].options).toEqual(expect.objectContaining({
+      cwd: '/repo',
+      sessionId: fresh.sessionId,
+    }));
+    expect(query.mock.calls[1]![0].options).toEqual(expect.objectContaining({
+      cwd: '/repo',
+      resume: 'session-1',
+    }));
+
+    await fresh.close();
+    await resumed.close();
+  });
+
   it('uses customTitle/renameSession and an ephemeral no-tools structured query', async () => {
     const modelQuery = asyncQuery([], [{
       value: 'claude-title-model',

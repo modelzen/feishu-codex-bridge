@@ -50,15 +50,26 @@ const BRIDGE_SETTING_SOURCES: SettingSource[] = ['user', 'project'];
 /**
  * Env for the SDK's spawned CLI. The SDK does NOT merge with process.env, so we
  * spread it and add the re-entrancy marker the cli-bridge hook handler reads
- * (parser.ts `bridgeOwned`): a bridge-owned session is not self-forwarded to
- * Feishu by default (schema.ts `includeBridgeOwnedSessionsForDebugging`). Mirrors
- * the codex app-server child (app-server-client.ts). NOTE: this only governs the
- * cli-bridge's own forwarding — it does not gate execution of other SDK hooks loaded
- * via settingSources (see BRIDGE_SETTING_SOURCES). */
+ * (parser.ts `bridgeOwned`). That marker prevents a Bridge-owned session from
+ * self-forwarding to Feishu by default.
+ *
+ * Persistent Bridge chats also get a dedicated entrypoint: Claude Code's
+ * native `/resume` picker intentionally filters `sdk-ts`/`sdk-py`/`sdk-cli`
+ * sessions even when they have a customTitle. Plain `cli` is not usable here:
+ * headless Claude normalizes it back to `sdk-cli`. An unknown, honest Bridge
+ * value is preserved and currently falls through Claude's CLI client path,
+ * while the stream-json/control protocol still comes from SDK CLI flags. This
+ * compatibility boundary depends on Claude's upstream picker/entrypoint rules
+ * and must be rechecked when upgrading the bundled Claude Code runtime.
+ *
+ * NOTE: FEISHU_CODEX_BRIDGE only governs the cli-bridge's own forwarding — it
+ * does not gate other SDK hooks loaded via settingSources (see
+ * BRIDGE_SETTING_SOURCES). Mirrors the codex app-server child. */
 function bridgeClaudeEnv(): Record<string, string> {
   const base: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) if (typeof v === 'string') base[k] = v;
   base.FEISHU_CODEX_BRIDGE = '1';
+  base.CLAUDE_CODE_ENTRYPOINT = 'feishu-codex-bridge';
   return base;
 }
 

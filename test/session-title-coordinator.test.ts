@@ -5,6 +5,11 @@ import {
   type SessionTitleStore,
 } from '../src/bot/session-title-coordinator';
 import type { SessionTitleJob } from '../src/bot/session-store';
+import type { SessionTitleSource } from '../src/bot/session-title';
+
+function titleSource(text: string, rawContentType = 'text'): SessionTitleSource {
+  return { text, rawContentType };
+}
 
 function memoryStore(): SessionTitleStore & { jobs: Map<string, SessionTitleJob> } {
   const jobs = new Map<string, SessionTitleJob>();
@@ -57,7 +62,7 @@ describe('SessionTitleCoordinator', () => {
       backend: backend.id,
       sessionId: 's-short',
       cwd: '/repo',
-      source: '[本条消息的发信人：某用户（open_id：ou_123）]\n\n帮我看下这个报错',
+      source: titleSource('[本条消息的发信人：某用户（open_id：ou_123）]\n\n帮我看下这个报错'),
       policy: { strategy: 'model', model: 'third-party-cheap', effort: 'low' },
     });
 
@@ -83,7 +88,7 @@ describe('SessionTitleCoordinator', () => {
       backend: backend.id,
       sessionId: 's-model',
       cwd: '/repo',
-      source: '[本条消息的发信人：张三（open_id：ou_x）]\n\n请帮我排查登录回调长期超时的问题，重点检查网关日志和最近发布的认证改动，然后给出修复方案。',
+      source: titleSource('[本条消息的发信人：张三（open_id：ou_x）]\n\n请帮我排查登录回调长期超时的问题，重点检查网关日志和最近发布的认证改动，然后给出修复方案。'),
       policy: { strategy: 'model', model: 'vendor/custom-title-v7', effort: 'xhigh' },
     });
 
@@ -111,7 +116,7 @@ describe('SessionTitleCoordinator', () => {
       backend: backend.id,
       sessionId: 's-fallback',
       cwd: '/repo',
-      source: '请帮我排查登录回调长期超时的问题。后面还有很多背景信息，不能拿来替换指定模型。',
+      source: titleSource('请帮我排查登录回调长期超时的问题。后面还有很多背景信息，不能拿来替换指定模型。'),
       policy: { strategy: 'model', model: 'vendor/missing', effort: 'medium' },
     });
 
@@ -130,7 +135,7 @@ describe('SessionTitleCoordinator', () => {
       backend: backend.id,
       sessionId: 's-default-off',
       cwd: '/repo',
-      source: `[本条消息的发信人：某用户（open_id：ou_off）]\n\n请帮我分析这个很长的构建失败问题。${'后面是大量背景，不应该进入标题。'.repeat(4)}`,
+      source: titleSource(`[本条消息的发信人：某用户（open_id：ou_off）]\n\n请帮我分析这个很长的构建失败问题。${'后面是大量背景，不应该进入标题。'.repeat(4)}`),
       policy: { strategy: 'truncate' },
     });
 
@@ -152,7 +157,7 @@ describe('SessionTitleCoordinator', () => {
       backend: backend.id,
       sessionId: 's-existing',
       cwd: '/repo',
-      source: '这是一个足够长的问题，需要生成标题，但原生会话已经被用户命名了，所以绝对不能覆盖。',
+      source: titleSource('这是一个足够长的问题，需要生成标题，但原生会话已经被用户命名了，所以绝对不能覆盖。'),
       policy: { strategy: 'model', model: 'vendor/model', effort: 'high' },
     });
 
@@ -172,7 +177,7 @@ describe('SessionTitleCoordinator', () => {
       backend: backend.id,
       sessionId: 's-recovery',
       cwd: '/repo',
-      source: '这是一个足够长的首条问题，用于验证标题候选已经落盘以后，重启恢复不会再次调用模型生成标题。',
+      source: titleSource('这是一个足够长的首条问题，用于验证标题候选已经落盘以后，重启恢复不会再次调用模型生成标题。'),
       policy: { strategy: 'model', model: 'vendor/title', effort: 'low' },
     });
     await firstProcess.activate(key);
@@ -203,7 +208,7 @@ describe('SessionTitleCoordinator', () => {
       backend: backend.id,
       sessionId: 's-uncertain',
       cwd: '/repo',
-      source: '帮我检查支付回调为什么失败',
+      source: titleSource('帮我检查支付回调为什么失败'),
       policy: { strategy: 'truncate' },
     });
 
@@ -215,11 +220,74 @@ describe('SessionTitleCoordinator', () => {
     expect(store.jobs.get(key)).toMatchObject({ phase: 'done', outcome: 'written', finalTitle: nativeTitle });
   });
 
+  it('never retries an uncertain native write when the host read cache still lags', async () => {
+    const store = memoryStore();
+    let nativeTitle: string | undefined;
+    let reads = 0;
+    const set = vi.fn(async (_cwd: string, _sessionId: string, title: string) => {
+      nativeTitle = title;
+      throw new Error('connection dropped after commit');
+    });
+    const backend = titleBackend({
+      // prepare, pre-write and post-error verification all observe the lag.
+      readSessionTitle: vi.fn(async () => (++reads >= 4 ? nativeTitle : undefined)),
+      setSessionTitle: set,
+    });
+    const subject = coordinator(store, backend);
+    const key = await subject.register({
+      backend: backend.id,
+      sessionId: 's-lagged-uncertain',
+      cwd: '/repo',
+      source: titleSource('排查订单同步为什么失败'),
+      policy: { strategy: 'truncate' },
+    });
+
+    await subject.activate(key);
+    await subject.apply(key); // pre-read + lagged post-error verification are empty
+    await subject.apply(key); // terminal: must not read or write again
+
+    expect(set).toHaveBeenCalledTimes(1);
+    expect(store.jobs.get(key)).toMatchObject({ phase: 'skipped', outcome: 'failed' });
+    expect(store.jobs.get(key)?.lastError).toContain('connection dropped after commit');
+  });
+
+  it('recovers a stale armed write by reading only and never mutating again', async () => {
+    const store = memoryStore();
+    const backend = titleBackend();
+    const subject = coordinator(store, backend);
+    const key = await subject.register({
+      backend: backend.id,
+      sessionId: 's-stale-armed',
+      cwd: '/repo',
+      source: titleSource('检查通知消息为什么没有发送'),
+      policy: { strategy: 'truncate' },
+    });
+
+    await subject.activate(key);
+    await subject.prepare(key);
+    await store.update(
+      key,
+      (job) => job.phase === 'prepared',
+      (job) => ({
+        ...job,
+        phase: 'applying',
+        claimId: 'crashed-worker',
+        leaseUntil: 0,
+        writeAttempted: true,
+      }),
+    );
+
+    await subject.recover();
+
+    expect(backend.setSessionTitle).not.toHaveBeenCalled();
+    expect(store.jobs.get(key)).toMatchObject({ phase: 'skipped', outcome: 'failed' });
+  });
+
   it('only attaches post-clear source to a pre-registered waiting job', async () => {
     const store = memoryStore();
     const backend = titleBackend();
     const subject = coordinator(store, backend);
-    expect(await subject.attachSource('codex-appserver:manual-resume-id', '不要给手动恢复的会话改名')).toBe(false);
+    expect(await subject.attachSource('codex-appserver:manual-resume-id', titleSource('不要给手动恢复的会话改名'))).toBe(false);
     expect(store.jobs.size).toBe(0);
 
     const key = await subject.register({
@@ -229,8 +297,8 @@ describe('SessionTitleCoordinator', () => {
       policy: { strategy: 'truncate' },
     });
     expect(store.jobs.get(key)?.phase).toBe('waiting_source');
-    expect(await subject.attachSource(key, '这条消息排队时被取消，不应成为标题')).toBe(true);
-    expect(await subject.attachSource(key, '[本条消息的发信人：某用户（open_id：ou_y）]\n继续排查构建失败')).toBe(true);
+    expect(await subject.attachSource(key, titleSource('这条消息排队时被取消，不应成为标题'))).toBe(true);
+    expect(await subject.attachSource(key, titleSource('[本条消息的发信人：某用户（open_id：ou_y）]\n继续排查构建失败'))).toBe(true);
     expect(store.jobs.get(key)?.phase).toBe('waiting_turn');
     await subject.activate(key);
     await subject.apply(key);

@@ -42,8 +42,14 @@ describe('session-title settings cards', () => {
   it('adds a dedicated entry to the global DM settings card', () => {
     const rendered = JSON.stringify(buildSettingsCard(cfg()));
     expect(rendered).toContain(DM.sessionTitleSettings);
+    expect(rendered).toContain(DM.commentSettings);
+    expect(rendered).toContain('专项功能');
+    expect(rendered).toContain('分别配置，互不影响');
     expect(rendered).toContain('会话标题');
-    expect(rendered).toContain('默认截断首句');
+    expect(rendered).toContain('截断首句（不调用模型）');
+    expect(rendered).toContain('配置会话标题');
+    expect(rendered).toContain('配置评论处理');
+    expect(rendered).not.toContain('设置各后端的标题模型 / Effort');
   });
 
   it('renders live third-party models without a provider whitelist and hides hidden models', () => {
@@ -70,7 +76,7 @@ describe('session-title settings cards', () => {
     });
     expect(parseSessionTitleFormValue({ model: 'openrouter/acme-title-v3' })).toEqual({
       ok: false,
-      message: '请选择 Effort。',
+      message: '请选择推理强度。',
     });
     expect(
       parseSessionTitleFormValue({ model: 'openrouter/acme-title-v3', effort: 'high' }),
@@ -112,9 +118,9 @@ describe('session-title settings cards', () => {
     const claude = json(config, BACKENDS, 'claude-agent', [
       model({ id: 'vendor/claude-title', displayName: 'Vendor Claude Title' }),
     ]);
-    expect(codex).toContain('AI 精炼：openrouter/acme-title-v3 · high');
+    expect(codex).toContain('AI 精炼 · openrouter/acme-title-v3 · 高');
     expect(codex).toContain('"initial_option":"openrouter/acme-title-v3"');
-    expect(claude).toContain('AI 精炼：vendor/claude-title · low');
+    expect(claude).toContain('AI 精炼 · vendor/claude-title · 低');
     expect(claude).toContain('"initial_option":"vendor/claude-title"');
   });
 
