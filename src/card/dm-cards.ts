@@ -5,11 +5,15 @@ import {
   getMaxConcurrentRuns,
   getModelDisplay,
   getPendingPolicy,
+  getSessionTitleConfig,
+  getSessionTitleEfforts,
   getShowToolCalls,
   resolveOwner,
   RUN_IDLE_TIMEOUT_MAX_SEC,
   RUN_IDLE_TIMEOUT_MIN_SEC,
+  summarizeSessionTitles,
   type AppConfig,
+  type SessionTitleAiConfig,
 } from '../config/schema';
 import { defaultNoMention, effectiveGuestMode, effectiveMode, type Project } from '../project/registry';
 import {
@@ -112,6 +116,11 @@ export const DM = {
   commentEditPrompt: 'dm.comment.editPrompt',
   commentPromptSubmit: 'dm.comment.promptSubmit',
   commentResetPrompt: 'dm.comment.resetPrompt',
+  // 🏷️ Bridge 新建会话的原生 resume 标题：按后端独立选模型 + Effort。
+  sessionTitleSettings: 'dm.sessionTitle.settings',
+  sessionTitleSetBackend: 'dm.sessionTitle.setBackend',
+  sessionTitleSubmit: 'dm.sessionTitle.submit',
+  sessionTitleDisable: 'dm.sessionTitle.disable',
 } as const;
 
 /** Action ids for the in-group settings card (@bot /settings). */
@@ -873,6 +882,16 @@ function settingItem(
   ];
 }
 
+/** Compact, IO-free status for the document-comment entry on the global card. */
+function summarizeCommentSettings(cfg: AppConfig): string {
+  const comments = cfg.preferences?.comments ?? {};
+  const backendId = comments.backend?.trim() || DEFAULT_BACKEND_ID;
+  const backend = catalogById(backendId)?.displayName ?? backendId;
+  const model = comments.model?.trim() || '默认模型';
+  const effort = comments.effort ? reasoningEffortLabel(comments.effort) : '默认推理强度';
+  return `${backend} · ${model} · ${effort}`;
+}
+
 /**
  * Global preferences card. Grouped into sections (📤 输出展示 / ⏱ 运行控制), each
  * setting a self-explaining {@link settingItem} (name + grey caption + option
@@ -964,9 +983,17 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
       note('去倒杯咖啡的工夫，我替你盯着本机的 Claude Code / Codex——它要审批、要问你、或跑完了，都推到这个私聊。含通知范围、转发后端、离开保活、hooks 修复。'),
       actions([button('设置咖啡一下 / 通知 / 保活 / hooks', { a: DM.coffeeSettings }, 'primary')]),
       hr(),
-      settingSection('📝 云文档评论'),
-      note('在飞书云文档（文档 / 表格 / 多维表格，含 wiki）的评论里 @我，我读评论、跑 agent、把答案贴回评论。可设置评论响应用的后端 agent / 模型 / 推理强度，以及自定义提示词（全局，不分项目；仅管理员可 @）。'),
-      actions([button('设置后端 / 模型 / 强度 / 提示词', { a: DM.commentSettings }, 'primary')]),
+      settingSection('🧩 专项功能'),
+      note('会话标题与云文档评论分别配置，互不影响，也不会改变普通聊天使用的模型。'),
+      md('**🏷️ 会话标题**'),
+      note('让 Bridge 新建的会话在 Claude Code / Codex 的恢复列表（/resume）中显示易识别的标题。'),
+      md(`**当前策略**\n${summarizeSessionTitles(cfg, reasoningEffortLabel)}`),
+      actions([button('配置会话标题', { a: DM.sessionTitleSettings }, 'primary')]),
+      hr(),
+      md('**📝 云文档评论**'),
+      note('在飞书文档、表格或多维表格（含 wiki）的评论里 @我，自动运行 Agent 并回复；回复规则可控制是否直接修改文档。'),
+      md(`**当前**：${summarizeCommentSettings(cfg)}`),
+      actions([button('配置评论处理', { a: DM.commentSettings }, 'primary')]),
       hr(),
       actions([button('👮 管理员', { a: DM.admins }), button('⬅️ 菜单', { a: DM.menu })]),
     ],
@@ -992,34 +1019,253 @@ export function buildCoffeeSettingsCard(section: CardElement[]): CardObject {
   );
 }
 
+/** Reserved select value that switches the adjacent free-text input on. It is
+ * deliberately not a model id/allowlist: any caller-provided live model id is
+ * otherwise passed through unchanged, including third-party providers. */
+export const SESSION_TITLE_CUSTOM_MODEL_OPTION = '__bridge_custom_model__';
+
+export interface SessionTitleBackendOption {
+  id: string;
+  label: string;
+}
+
+/** Best-effort scalar reader for Feishu form values (string / array / {value}). */
+function sessionTitleFormScalar(formValue: Record<string, unknown> | undefined, name: string): string | undefined {
+  const raw = formValue?.[name];
+  const first = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof first === 'string') return first.trim();
+  if (first && typeof first === 'object') {
+    const obj = first as Record<string, unknown>;
+    for (const value of [obj.value, obj.id]) {
+      if (typeof value === 'string') return value.trim();
+    }
+  }
+  return undefined;
+}
+
+export type SessionTitleFormParseResult =
+  | { ok: true; config: SessionTitleAiConfig }
+  | { ok: false; message: string };
+
+/**
+ * Parse the model/Effort form without consulting a model allowlist. A live
+ * dropdown value is accepted verbatim; choosing “custom” makes the text input
+ * authoritative. Both fields are mandatory before AI can be enabled.
+ */
+export function parseSessionTitleFormValue(
+  formValue: Record<string, unknown> | undefined,
+): SessionTitleFormParseResult {
+  const selectedModel = sessionTitleFormScalar(formValue, 'model');
+  const customModel = sessionTitleFormScalar(formValue, 'customModel');
+  const model =
+    selectedModel === SESSION_TITLE_CUSTOM_MODEL_OPTION || !selectedModel ? customModel : selectedModel;
+  if (!model) return { ok: false, message: '请选择模型，或填写自定义模型 ID。' };
+
+  const rawEffort = sessionTitleFormScalar(formValue, 'effort');
+  if (!rawEffort || !(REASONING_EFFORTS as readonly string[]).includes(rawEffort)) {
+    return { ok: false, message: '请选择推理强度。' };
+  }
+  return {
+    ok: true,
+    config: { enabled: true, model, effort: rawEffort as ReasoningEffort },
+  };
+}
+
+/**
+ * Resume-title settings sub-card. The selected backend is transient UI state,
+ * supplied by the caller together with that backend's live model list. Config
+ * remains independent per backend under preferences.sessionTitles.byBackend.
+ */
+export function buildSessionTitleSettingsCard(
+  cfg: AppConfig,
+  backendOptions: SessionTitleBackendOption[],
+  selectedBackendId: string | undefined,
+  models: ModelInfo[],
+  notice?: string,
+): CardObject {
+  const curBackend =
+    (selectedBackendId && backendOptions.some((backend) => backend.id === selectedBackendId)
+      ? selectedBackendId
+      : backendOptions[0]?.id) ?? DEFAULT_BACKEND_ID;
+  const visible = models.filter((model) => !model.hidden && model.id.trim());
+  const configured = getSessionTitleConfig(cfg, curBackend);
+  const configuredLive = configured.enabled ? visible.find((model) => model.id === configured.model) : undefined;
+  const initialModel = configured.enabled
+    ? (configuredLive?.id ?? SESSION_TITLE_CUSTOM_MODEL_OPTION)
+    : undefined;
+  const customModel = configured.enabled && !configuredLive ? configured.model : undefined;
+
+  const modelSelect = {
+    ...selectMenu({
+      name: 'model',
+      placeholder: '选择标题模型',
+      options: [
+        ...visible.map((model) => ({ label: model.displayName || model.id, value: model.id })),
+        { label: '自定义模型 ID…', value: SESSION_TITLE_CUSTOM_MODEL_OPTION },
+      ],
+      initial: initialModel,
+    }),
+    required: true,
+  };
+  const effortSelect = {
+    ...selectMenu({
+      name: 'effort',
+      placeholder: '选择推理强度',
+      // 自定义/第三方模型的能力无法事先推断：给全量协议档位，
+      // 而不用某个 live 模型的 supportedEfforts 反向做隐形白名单。
+      options: getSessionTitleEfforts(curBackend).map((effort) => ({ label: reasoningEffortLabel(effort), value: effort })),
+      initial: configured.enabled ? configured.effort : undefined,
+    }),
+    required: true,
+  };
+
+  const elements: CardElement[] = [
+    ...(notice ? [md(notice)] : []),
+    note(
+      'Bridge 只为升级后新建的会话设置一次原生标题。生成前会移除发信人、引用、话题历史、附件等封装；短提问直接使用，长提问按当前 Agent 的策略处理。',
+    ),
+    hr(),
+  ];
+
+  if (backendOptions.length > 1) {
+    elements.push(
+      md('🧠 **正在配置的 Agent**'),
+      note('这里只切换编辑对象；每个 Agent 分别保存，互不影响。'),
+      actions(
+        backendOptions.map((backend) =>
+          button(
+            backend.label,
+            { a: DM.sessionTitleSetBackend, v: backend.id },
+            backend.id === curBackend ? 'primary' : 'default',
+          ),
+        ),
+      ),
+    );
+  } else {
+    elements.push(md(`🧠 **正在配置的 Agent**：${backendOptions[0]?.label ?? curBackend}`));
+  }
+
+  elements.push(
+    md(
+      `**当前方式**：${
+        configured.enabled
+          ? `AI 精炼 · ${configured.model} · ${reasoningEffortLabel(configured.effort)}`
+          : '截断首句（不调用模型）'
+      }`,
+    ),
+    actions([
+      button(
+        configured.enabled ? '改为截断首句' : '✓ 截断首句（不调用模型）',
+        { a: DM.sessionTitleDisable, b: curBackend },
+        configured.enabled ? 'default' : 'primary',
+      ),
+    ]),
+    hr(),
+    md('**AI 精炼（可选）**'),
+    note(
+      '仅长提问会调用标题模型，短提问不增加成本；调用失败会自动回退到截断首句。支持填写任意第三方模型 ID。',
+    ),
+    ...(visible.length === 0 ? [note('未取到实时模型列表，请选“自定义模型 ID”后填写。')] : []),
+    form('session_title_model_effort', [
+      md('🤖 **标题模型**'),
+      modelSelect,
+      input({
+        name: 'customModel',
+        label: '第三方 / 自定义模型 ID（仅选“自定义”时使用）',
+        placeholder: '例如 provider/model-name',
+        value: customModel,
+        required: visible.length === 0,
+        maxLength: 200,
+        width: 'fill',
+      }),
+      md('🎚 **推理强度**'),
+      effortSelect,
+      actions([
+        submitButton(
+          '✅ 保存并使用 AI 精炼',
+          { a: DM.sessionTitleSubmit, b: curBackend },
+          'primary',
+          'submit_session_title',
+        ),
+      ]),
+    ]),
+    hr(),
+    actions([button('⬅️ 返回设置', { a: DM.settings })]),
+  );
+
+  return card(elements, { header: { title: '🏷️ 会话标题', template: 'blue' } });
+}
+
 /** 飞书 CLI（lark-cli）使用文档——评论里读/改文档依赖它。 */
 const LARK_CLI_DOC_URL = 'https://bytedance.larkoffice.com/wiki/ILuTww7Xcimb6GkhH0mcK2f4nS7';
 
+export type CommentModelFormResolution =
+  | { ok: false; message: string }
+  | { ok: true; model: ModelInfo; effort?: ReasoningEffort; adjusted: boolean };
+
+/** Resolve the comment form against the selected model, not the backend-wide
+ * effort union shown by CardKit. The UI cannot dynamically cascade its effort
+ * select, so an incompatible value falls back to that model's default. */
+export function resolveCommentModelFormValue(
+  models: ModelInfo[],
+  modelId: string | undefined,
+  requestedEffort: ReasoningEffort | undefined,
+): CommentModelFormResolution {
+  const visible = models.filter((model) => !model.hidden && model.id.trim());
+  const selected = modelId
+    ? visible.find((model) => model.id === modelId)
+    : visible.find((model) => model.isDefault) ?? visible[0];
+  if (!selected) return { ok: false, message: '所选模型当前不可用，未保存。请重新选择。' };
+
+  const supported = selected.supportedEfforts ?? [];
+  const effort = supported.length === 0
+    ? undefined
+    : requestedEffort && supported.includes(requestedEffort)
+      ? requestedEffort
+      : supported.includes(selected.defaultEffort)
+        ? selected.defaultEffort
+        : supported[0];
+  return {
+    ok: true,
+    model: selected,
+    effort,
+    adjusted: Boolean(requestedEffort && effort !== requestedEffort),
+  };
+}
+
 /**
- * 云文档评论 @bot 的全局设置卡（DM「⚙️ 设置 → 📝 云文档评论」进入）。后端用按钮做级联源
- * （点了重渲下面的模型 / 强度下拉）；模型 + 推理强度是一个表单（下拉，不锁卡），预选当前
- * 生效值、一次提交两者——不再有「默认」这种显式空选项。提示词在卡内单独子卡编辑
- * （{@link buildCommentPromptCard}）。`models` 为当前后端的实时模型列表（调用方传入）。
+ * 云文档评论的全局设置卡。Agent 按钮只切换待编辑对象并重渲模型列表，不立即落盘；
+ * Agent + 模型 + 推理强度在表单提交时一次保存。表单内的下拉本身无 callback，浏览不会
+ * 产生半套配置；提交后 CardKit 会锁原卡，handler 负责发送一张新的可交互结果卡。
+ * 回复规则在 {@link buildCommentPromptCard} 中单独编辑。`models` 是待编辑 Agent 的实时列表。
  */
 export function buildCommentSettingsCard(
   cfg: AppConfig,
   backendOptions: { id: string; label: string }[],
   models: ModelInfo[],
   notice?: string,
+  selectedBackendId?: string,
 ): CardObject {
   const comments = cfg.preferences?.comments ?? {};
   const visible = models.filter((m) => !m.hidden);
-  const curBackend =
+  const configuredBackend =
     comments.backend && backendOptions.some((b) => b.id === comments.backend)
       ? comments.backend
       : (backendOptions.find((b) => b.id === DEFAULT_BACKEND_ID)?.id ?? backendOptions[0]?.id ?? DEFAULT_BACKEND_ID);
+  const curBackend =
+    selectedBackendId && backendOptions.some((backend) => backend.id === selectedBackendId)
+      ? selectedBackendId
+      : configuredBackend;
+  const editingConfiguredBackend = curBackend === configuredBackend;
   // Resolved current values — no explicit "unset" option; just preselect the
   // effective default (backend's own default when nothing is configured).
-  const explicit = comments.model ? visible.find((m) => m.id === comments.model) : undefined;
+  const explicit = editingConfiguredBackend && comments.model
+    ? visible.find((m) => m.id === comments.model)
+    : undefined;
   const curModel = explicit ?? visible.find((m) => m.isDefault) ?? visible[0];
   const unionEfforts = EFFORT_ORDER.filter((e) => visible.some((m) => (m.supportedEfforts ?? []).includes(e)));
   const curEffort =
-    comments.effort && (curModel?.supportedEfforts ?? []).includes(comments.effort)
+    editingConfiguredBackend && comments.effort && (curModel?.supportedEfforts ?? []).includes(comments.effort)
       ? comments.effort
       : curModel?.defaultEffort;
   const canPickModel = visible.length > 1;
@@ -1027,15 +1273,15 @@ export function buildCommentSettingsCard(
 
   const els: CardElement[] = [
     ...(notice ? [md(notice)] : []),
-    md('**📝 云文档评论 @bot**'),
-    note('评论里 @我时用的后端 / 模型 / 推理强度。只影响之后新建的评论。'),
+    note('在云文档评论里 @我后，使用这里的配置运行 Agent 并回复。回复规则可控制怎么回答、是否直接修改文档；下一条新评论起生效，不影响普通聊天。'),
     hr(),
   ];
 
   // 后端：级联源。多后端给按钮（点了重渲下面的模型/强度表单），单后端只读。
   if (backendOptions.length > 1) {
     els.push(
-      md('🧠 **后端**'),
+      md('🧠 **评论使用的 Agent**'),
+      note('这里只预览可选配置；点击“保存评论配置”后才会生效。'),
       actions(
         backendOptions.map((b) =>
           button(b.label, { a: DM.commentSetBackend, v: b.id }, b.id === curBackend ? 'primary' : 'default'),
@@ -1043,15 +1289,26 @@ export function buildCommentSettingsCard(
       ),
     );
   } else {
-    els.push(md(`🧠 **后端**：${backendOptions[0]?.label ?? curBackend}`));
+    els.push(md(`🧠 **评论使用的 Agent**：${backendOptions[0]?.label ?? curBackend}`));
   }
 
-  // 模型 + 推理强度：表单下拉（selectMenu 不锁卡），预选当前值，一次提交两者。
-  if (canPickModel || canPickEffort) {
+  els.push(
+    md(
+      `**${editingConfiguredBackend ? '当前配置' : '待保存配置'}**：${curModel?.displayName ?? '默认模型'}${
+        curEffort ? ` · ${reasoningEffortLabel(curEffort)}` : ''
+      }`,
+    ),
+  );
+
+  if (visible.length === 0) {
+    els.push(note('暂时没有取到这个 Agent 的模型列表，未提供保存入口；请稍后重试或检查 Agent 登录状态。'));
+  } else {
+    // Agent + model + effort are committed by this one submit. The select
+    // values themselves have no callbacks, so browsing cannot partially save.
     const formEls: CardElement[] = [];
     if (canPickModel) {
       formEls.push(
-        md('🤖 **模型**'),
+        md('🤖 **回复模型**'),
         selectMenu({
           name: 'model',
           placeholder: '选择模型',
@@ -1060,7 +1317,7 @@ export function buildCommentSettingsCard(
         }),
       );
     } else {
-      formEls.push(md(`🤖 **模型**：${curModel?.displayName ?? '后端默认'}（该后端仅一个模型）`));
+      formEls.push(md(`🤖 **回复模型**：${curModel?.displayName ?? visible[0]!.id}（该 Agent 仅一个模型）`));
     }
     if (canPickEffort) {
       formEls.push(
@@ -1072,33 +1329,36 @@ export function buildCommentSettingsCard(
           initial: curEffort,
         }),
       );
+    } else {
+      formEls.push(note('该模型没有可调推理档位。'));
     }
-    formEls.push(actions([submitButton('✅ 保存模型 / 强度', { a: DM.commentSubmit }, 'primary', 'submit_comment')]));
+    formEls.push(actions([
+      submitButton('✅ 保存评论配置', { a: DM.commentSubmit, b: curBackend }, 'primary', 'submit_comment'),
+    ]));
     els.push(form('comment_model_effort', formEls));
-  } else {
-    els.push(note('该后端只有一个模型且不调推理强度，无需设置。'));
   }
 
   els.push(
     hr(),
-    md('✍️ **提示词**'),
-    note('评论 @我 时我的角色与回复规则（含怎么读 / 改文档）。点开可直接在卡里编辑。'),
-    actions([button('编辑提示词', { a: DM.commentEditPrompt }, 'primary')]),
+    md('✍️ **回复规则**'),
+    note('控制 Agent 如何理解评论、组织回复，以及是否读取或直接修改文档。'),
+    actions([button('编辑回复规则', { a: DM.commentEditPrompt }, 'primary')]),
     hr(),
-    md('📎 **配合飞书 CLI**'),
+    md('📎 **文档读写能力**'),
     note(
-      '评论里要**读 / 改文档**，靠飞书 CLI（lark-cli）：装好并登录后即可（用你自己的身份读写、对自己的文档有权限）。' +
-        `Tips：飞书 CLI 可与本机器人复用同一个 App。安装与用法见 [飞书 CLI 文档](${LARK_CLI_DOC_URL})。`,
+      '如需读取或直接修改文档，本机还要安装并登录飞书 CLI（lark-cli）；访问权限以当前登录身份为准。' +
+        ` [查看安装与用法](${LARK_CLI_DOC_URL})`,
     ),
     hr(),
     actions([button('⬅️ 返回设置', { a: DM.settings })]),
   );
 
-  return card(els, { header: { title: '📝 文档评论设置', template: 'blue' } });
+  return card(els, { header: { title: '📝 云文档评论', template: 'blue' } });
 }
 
 /**
- * 评论提示词编辑子卡（📝 文档评论设置 →「编辑提示词」）。一个表单：撑满卡宽的多行输入框，
+ * 评论回复规则编辑子卡（📝 云文档评论 →「编辑回复规则」）。底层仍是可直接维护的
+ * comment-instructions.md 提示词；卡片用用户任务语言呈现。一个表单：撑满卡宽的多行输入框，
  * 预填当前 master 模板内容（含 {变量}）+ 保存按钮。保存后由 handler 写 master 并同步进
  * 所有文档（含历史）。卡里同时展示每轮自动追加给 agent 的实时消息长什么样，让用户清楚
  * 「固定人设（这段）+ 每轮实时facts」的分工。飞书 input 硬上限 1000 字（range 1–1000），
@@ -1112,8 +1372,8 @@ export function buildCommentPromptCard(
   return card(
     [
       ...(notice ? [md(notice)] : []),
-      md('**✍️ 评论提示词**'),
-      note('评论 @我 时我的固定人设与回复规则——保存后会同步到所有文档（含历史），下一条评论生效。'),
+      md('**✍️ 回复规则**'),
+      note('这段自定义评论提示词控制 Agent 如何回复、是否读取或修改文档。保存后会同步到所有文档（含历史），下一条评论生效。'),
       md(
         [
           '**可用变量**（同步到每篇文档时自动替换成该文档自己的值）：',
@@ -1125,11 +1385,11 @@ export function buildCommentPromptCard(
           '    - `bitable`（多维表格）',
         ].join('\n'),
       ),
-      note('评论的选中原文、用户问题每轮会自动给我，无需写进提示词。'),
+      note('评论的选中原文和用户问题每轮都会自动提供，无需重复写进规则。'),
       form('comment_prompt', [
         input({
           name: 'prompt',
-          label: '提示词内容',
+          label: '回复规则（提示词）',
           value: currentPrompt,
           required: true,
           inputType: 'multiline_text',
@@ -1140,7 +1400,7 @@ export function buildCommentPromptCard(
         // 两个都是 form 提交按钮（普通 button 在 form 内不保证触发）：保存读输入框内容落盘；
         // 重置忽略输入框、直接把内置默认写回 master 并同步（handler 端处理）。
         actions([
-          submitButton('✅ 保存提示词', { a: DM.commentPromptSubmit }, 'primary', 'submit_prompt'),
+          submitButton('✅ 保存回复规则', { a: DM.commentPromptSubmit }, 'primary', 'submit_prompt'),
           submitButton('↩️ 重置为默认', { a: DM.commentResetPrompt }, 'default', 'reset_prompt'),
         ]),
       ]),
@@ -1162,12 +1422,12 @@ export function buildCommentPromptCard(
       ),
       note(
         masterFile
-          ? `提示词也可直接编辑 ${masterFile}（改文件后新内容在每篇文档的下一条评论时生效）。`
-          : '提示词也可直接编辑 bot 目录下的 comment-instructions.md。',
+          ? `也可直接编辑 ${masterFile}（改文件后，新规则在每篇文档的下一条评论时生效）。`
+          : '也可直接编辑 bot 目录下的 comment-instructions.md。',
       ),
       actions([button('⬅️ 返回', { a: DM.commentSettings })]),
     ],
-    { header: { title: '✍️ 编辑提示词', template: 'blue' }, widthMode: 'fill' },
+    { header: { title: '✍️ 编辑回复规则', template: 'blue' }, widthMode: 'fill' },
   );
 }
 

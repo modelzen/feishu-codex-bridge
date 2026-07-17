@@ -37,6 +37,8 @@ import {
   getPendingPolicy,
   getModelDisplay,
   getRunIdleTimeoutMs,
+  getSessionTitleConfig,
+  getSessionTitleEfforts,
   getShowToolCalls,
   getCommentsConfig,
   getCompletionReminderConfig,
@@ -58,6 +60,7 @@ import {
   type CommentsConfig,
   type CompletionReminderMode,
   type PendingPolicy,
+  type SessionTitleBackendConfig,
 } from '../config/schema';
 import { CardDispatcher } from '../card/dispatcher';
 import { sendManagedCard, updateManagedCard } from '../card/managed';
@@ -72,6 +75,7 @@ import {
   buildResumeErrorCard,
   buildResumeLaunchingCard,
   MC,
+  reasoningEffortLabel,
   RES,
   type HelpScope,
   type ModelCardState,
@@ -123,11 +127,14 @@ import {
   buildRmConfirmCard,
   buildCoffeeSettingsCard,
   buildCompletionReminderCustomCard,
+  buildSessionTitleSettingsCard,
   buildSettingsCard,
   buildUpdateCard,
   buildWatchdogCustomCard,
   DM,
   GS,
+  parseSessionTitleFormValue,
+  resolveCommentModelFormValue,
   type BackendProbeRow,
   type DoctorInfo,
 } from '../card/dm-cards';
@@ -177,7 +184,21 @@ import {
 import { createProject, joinExistingGroup } from '../project/lifecycle';
 import { refreshBranch } from '../project/announcement';
 import { leaveChat, transferOwnership } from '../project/group-ops';
-import { getSession, listSessions, patchSession, upsertSession, type SessionRecord } from './session-store';
+import {
+  clearSessionTitleJobKey,
+  getSession,
+  listSessions,
+  patchSession,
+  sessionTitleJobKey,
+  upsertSession,
+  type SessionRecord,
+  type SessionTitlePolicySnapshot,
+} from './session-store';
+import { SessionTitleCoordinator } from './session-title-coordinator';
+import {
+  sessionTitleSourceFromMessage,
+  type SessionTitleSource,
+} from './session-title';
 import { handleDmConsole } from './dm-console';
 import { fetchInteractiveCardText, isDegradedCardContent } from './card-content';
 import {
@@ -383,6 +404,9 @@ export { BACKEND_PROBE_TIMEOUT_MS, probeBackends, validateBackendSwitch } from '
  * manual-reminder ownership and long-task timing never leak from turn one. */
 export interface QueuedTurn {
   input: AgentInput;
+  /** Un-woven SDK message source used only if this becomes the first accepted
+   * host turn. Never recover a title from AgentInput.text. */
+  titleSource: SessionTitleSource;
   requesterOpenId?: string;
   requestedAt: number;
   /** Clean user-authored label; never derive reminder copy from woven input. */
@@ -660,6 +684,52 @@ export function createOrchestrator(
    * routed yet (status card, /usage, models prewarm, resume-picker pick) keep
    * using it directly — identical to the pre-registry behavior. */
   const backend = backendFor();
+  const sessionTitles = new SessionTitleCoordinator({ backendFor: (id) => backendFor(id) });
+
+  /** Snapshot the selected backend's title policy when its native session is
+   * created. Later DM-setting changes affect future sessions only. */
+  function sessionTitlePolicy(backendId: string): SessionTitlePolicySnapshot {
+    const selected = getSessionTitleConfig(cfg, backendId);
+    return selected.enabled
+      ? { strategy: 'model', model: selected.model, effort: selected.effort }
+      : { strategy: 'truncate' };
+  }
+
+  /** Title bookkeeping is auxiliary: disk/backend failures never block the
+   * user's main conversation. */
+  async function registerSessionTitle(
+    be: AgentBackend,
+    sessionId: string,
+    cwd: string,
+    source?: SessionTitleSource,
+  ): Promise<string | undefined> {
+    try {
+      return await sessionTitles.register({
+        backend: be.id,
+        sessionId,
+        cwd,
+        source,
+        policy: sessionTitlePolicy(be.id),
+      });
+    } catch (err) {
+      log.fail('agent', err, { phase: 'session-title-register', backend: be.id, sessionId });
+      return undefined;
+    }
+  }
+
+  async function attachSessionTitleSource(
+    backendId: string,
+    sessionId: string,
+    source: SessionTitleSource,
+  ): Promise<string | undefined> {
+    const key = sessionTitleJobKey(backendId, sessionId);
+    try {
+      return (await sessionTitles.attachSource(key, source)) ? key : undefined;
+    } catch (err) {
+      log.fail('agent', err, { phase: 'session-title-attach', backend: backendId, sessionId });
+      return undefined;
+    }
+  }
   /** 后端 id → 展示名（项目设置卡）。手编 projects.json 写了未知 id 时原样显示。 */
   const backendDisplayName = (id?: string): string => {
     try {
@@ -1164,6 +1234,8 @@ export function createOrchestrator(
     project: Project | undefined,
     perm: TurnPerm,
   ): Promise<void> {
+    // Capture title material before ingestContext adds sender/quote/file blocks.
+    const titleSource = sessionTitleSourceFromMessage(msg, text);
     // Mid-turn: steer (引导) or queue (排队).
     const existing = active.get(sessionKey);
     if (existing) {
@@ -1207,6 +1279,7 @@ export function createOrchestrator(
       }
       cur.queue.push({
         input: { text: woven, images },
+        titleSource,
         requesterOpenId: msg.senderId,
         requestedAt: msg.createTime || Date.now(),
         summary: stripFileTokens(text).slice(0, 80) || undefined,
@@ -1252,6 +1325,12 @@ export function createOrchestrator(
     summaryText?: string,
     goal?: boolean,
   ): void {
+    // A goal title is the already-extracted objective. Ordinary turns retain
+    // the SDK content type so merge-forward/media envelopes can be decoded
+    // without applying broad regexes to normal user text.
+    const titleSource: SessionTitleSource = goal
+      ? { text, rawContentType: 'text' }
+      : sessionTitleSourceFromMessage(msg, summaryText ?? text);
     const existing = active.get(sessionKey);
     if (existing) {
       // A goal can't co-run with (or queue behind) a turn on the same session —
@@ -1273,6 +1352,7 @@ export function createOrchestrator(
       // already file-woven when preIngested (handleTurn's fall-through).
       existing.queue.push({
         input: { text, images: preloadedImages },
+        titleSource,
         requesterOpenId: msg.senderId,
         requestedAt: msg.createTime || Date.now(),
         summary: stripFileTokens(summaryText ?? text).slice(0, 80) || undefined,
@@ -1339,6 +1419,7 @@ export function createOrchestrator(
         ]);
         let firstText = ingested;
         let thread = resolved;
+        let titleJobKey: string | undefined;
         const neverSeen = !thread;
         // codex's history is EMPTY when the session is brand-new (neverSeen) OR a
         // resume failed and we fell back to a new thread (recreated) — both want
@@ -1354,12 +1435,14 @@ export function createOrchestrator(
           // 自愈观测：来源=全新会话（无持久化记录），与 resume-ok/resume-recreate
           // 互斥——三者其一 + agent 层的 spawn/prewarm-hit 即可还原完整恢复路径。
           log.info('agent', 'session-fresh', { sessionKey, sessionId: thread.sessionId, backend: be.id });
+          titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource);
           await upsertSession({
             threadId: sessionKey,
             chatId: msg.chatId,
             cwd,
             sessionId: thread.sessionId,
             backend: be.id,
+            titleJobKey,
             // `text` is already file-woven when preIngested; use the raw
             // `summaryText` (handleTurn's original) so the session label isn't
             // manifest boilerplate + a temp path.
@@ -1368,6 +1451,38 @@ export function createOrchestrator(
             createdAt: Date.now(),
             updatedAt: Date.now(),
           });
+        } else if (recreated) {
+          // resume 失败后创建的是一个全新的 HOST 会话；它属于升级后的新会话，
+          // 应独立登记标题任务（旧 sessionId 的 ledger/标题绝不复用）。
+          const be = backendFor(prior?.backend ?? project?.backend);
+          const cwd = project?.cwd ?? prior?.cwd ?? fallbackCwd;
+          titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource);
+          // Full replacement drops the old session's titleJobKey even if title
+          // registration failed; carrying it across would let a later turn attach
+          // source to the wrong native session.
+          if (prior) {
+            await upsertSession({
+              ...prior,
+              cwd,
+              sessionId: thread.sessionId,
+              backend: be.id,
+              ...(titleJobKey ? { titleJobKey } : { titleJobKey: undefined }),
+              updatedAt: Date.now(),
+            });
+          }
+        } else {
+          // `/clear` 先创建一个没有首条提问的 waiting_source job；只有它能在
+          // 此处被补源。手动 `/resume` 没有 ledger row，attach 返回 false，因而
+          // 不会给导入/历史会话自动改名。
+          const be = backendFor(prior?.backend ?? project?.backend);
+          const expected = sessionTitleJobKey(be.id, thread.sessionId);
+          if (prior?.titleJobKey === expected) {
+            await attachSessionTitleSource(be.id, thread.sessionId, titleSource);
+            // Even when the source was attached by an earlier run that got
+            // cancelled before runStreamed, carry the durable key forward so
+            // this first actually-issued turn can activate it.
+            titleJobKey = expected;
+          }
         }
         // 话题上文：在话题里 @bot 时，把 bot 还没喂给 codex 的人对人消息补进开场。
         // codexEmpty（新会话 / resume 失败重建）→ 用最近 N 条全量（即投机结果）；
@@ -1406,6 +1521,8 @@ export function createOrchestrator(
           // 编织完成 → turn/start 之间不再读盘：首轮直接用预取的会话记录
           // （prior=undefined 即确知是全新会话，刚 upsert 的记录还没有 model）。
           firstRec: prior ?? null,
+          titleJobKey,
+          titleSource,
           timing: { tResolve: tResolveDone - tIntake, tWeave: Date.now() - tIntake },
         };
         if (goal) await launchGoalRun(launchOpts);
@@ -1518,6 +1635,9 @@ export function createOrchestrator(
    * Detached — onMessage must return fast (see {@link handleTurn}); a new
    * topic has a unique reply target so no same-topic reservation is needed. */
   function startTopicDirectly(msg: NormalizedMessage, text: string, project?: Project, goal?: boolean): void {
+    const titleSource: SessionTitleSource = goal
+      ? { text, rawContentType: 'text' }
+      : sessionTitleSourceFromMessage(msg, text);
     void withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       // 🫳 Typing on receive (⏳ OneSecond if a slot isn't free) → ✅ DONE once
       // the topic is created (onTopicCreated, below). For this path the acked
@@ -1575,6 +1695,7 @@ export function createOrchestrator(
         return;
       }
       log.info('card', 'start', { project: project?.name ?? '(unregistered)', model, effort, images: images?.length ?? 0, goal: Boolean(goal) });
+      const titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource);
       const launchOpts: LaunchOpts = {
         chatId: msg.chatId,
         replyTo: msg.messageId,
@@ -1590,6 +1711,8 @@ export function createOrchestrator(
         requestedAt: msg.createTime || tIntake,
         roleSuffix: perm.roleSuffix,
         backendId: be.id,
+        titleJobKey,
+        titleSource,
         timing: { tResolve: tResolveDone - tIntake, tWeave: Date.now() - tIntake },
       };
       if (goal) await launchGoalRun(launchOpts);
@@ -1875,12 +1998,17 @@ export function createOrchestrator(
         }
         trackSession(sessionKey, fresh);
         lastUsage.delete(sessionKey); // context gauge → 0 until the next turn
+        // `/clear` has no user question to title from. Park a policy-snapshotted
+        // waiting job; the next real message supplies the source and activates it
+        // only after that host turn is issued.
+        const titleJobKey = await registerSessionTitle(be, fresh.sessionId, cwd);
         await upsertSession({
           threadId: sessionKey,
           chatId: msg.chatId,
           cwd,
           sessionId: fresh.sessionId,
           backend: be.id,
+          titleJobKey,
           model: rec?.model,
           effort: rec?.effort,
           summary: '(新会话)',
@@ -2301,6 +2429,31 @@ export function createOrchestrator(
     return buildSettingsCard(cfg);
   }
 
+  /** A submitted CardKit form locks its card id, so any result containing more
+   * controls must be sent as a fresh managed card. Button-only settings still
+   * use `patch` and remain in-place. */
+  function sendFreshSettingsResult(
+    evt: CardActionEvent,
+    render: () => object | Promise<object>,
+    phase: string,
+  ): void {
+    void (async () => {
+      const next = await render();
+      await sendManagedCard(channel, evt.chatId, next);
+    })().catch((err) => log.fail('console', err, { phase }));
+  }
+
+  /** Old interactive cards can be abandoned without a callback. Bound their
+   * transient render state so a long-running bot cannot accumulate message ids
+   * forever; insertion order makes this a tiny FIFO eviction. */
+  function setBoundedCardState<T>(map: Map<string, T>, messageId: string, value: T): void {
+    if (!map.has(messageId) && map.size >= 64) {
+      const oldest = map.keys().next().value;
+      if (oldest !== undefined) map.delete(oldest);
+    }
+    map.set(messageId, value);
+  }
+
   /** ☕ 咖啡一下 二级卡：本机离开转发那组控件（总开关 / 通知范围 / 转发后端 / 离开保活 /
    *  hooks）独立渲染。进卡 / 修复 hooks 时刷新一次 hook 安装状态，其它轴的改动复用缓存。 */
   async function renderCoffeeSettings(refreshHooks = false): Promise<object> {
@@ -2317,6 +2470,88 @@ export function createOrchestrator(
     return buildCoffeeSettingsCard(section);
   }
 
+  // ── 🏷️ Bridge 新会话的原生 resume 标题设置 ───────────────────────
+  function sessionTitleBackendOptions(): { id: string; label: string }[] {
+    return visibleCatalog()
+      .filter((entry) => entry.id === DEFAULT_BACKEND_ID || isBackendEntryInstalled(entry))
+      .map((entry) => ({ id: entry.id, label: entry.displayName }));
+  }
+
+  async function renderSessionTitleSettings(
+    selectedBackendId?: string,
+    notice?: string,
+  ): Promise<object> {
+    const options = sessionTitleBackendOptions();
+    const selected =
+      selectedBackendId && options.some((entry) => entry.id === selectedBackendId)
+        ? selectedBackendId
+        : options[0]?.id ?? DEFAULT_BACKEND_ID;
+    const models = await listModels(backendFor(selected)).catch((err) => {
+      log.fail('agent', err, { phase: 'session-title-models', backend: selected });
+      return [] as ModelInfo[];
+    });
+    return buildSessionTitleSettingsCard(cfg, options, selected, models, notice);
+  }
+
+  const sessionTitleRenderStates = new Map<string, { generation: number; selectedBackendId?: string }>();
+  async function renderSessionTitleSettingsFor(
+    messageId: string,
+    selectedBackendId?: string,
+    notice?: string,
+  ): Promise<object> {
+    const previous = sessionTitleRenderStates.get(messageId);
+    const state = { generation: (previous?.generation ?? 0) + 1, selectedBackendId };
+    setBoundedCardState(sessionTitleRenderStates, messageId, state);
+    for (;;) {
+      const latestState = sessionTitleRenderStates.get(messageId) ?? state;
+      const rendered = await renderSessionTitleSettings(latestState.selectedBackendId, notice);
+      const current = sessionTitleRenderStates.get(messageId);
+      if (!current || current === latestState) return rendered;
+    }
+  }
+
+  function applySessionTitlePref(
+    evt: CardActionEvent,
+    backendId: string,
+    config: SessionTitleBackendConfig,
+    notice: string,
+    freshAfterSubmit = false,
+  ): void {
+    if (!dmAdmin(evt.operator?.openId)) return;
+    const valid = sessionTitleBackendOptions().some((entry) => entry.id === backendId);
+    if (!valid) {
+      const renderInvalid = () => renderSessionTitleSettings(undefined, '⚠️ 这个 Agent 当前不可用，未保存。');
+      if (freshAfterSubmit) {
+        sendFreshSettingsResult(evt, renderInvalid, 'session-title-submit-validation');
+      } else {
+        void patch(evt, renderInvalid);
+      }
+      return;
+    }
+    const saved = writePreferences((prefs) => {
+      const current = prefs.sessionTitles ?? {};
+      prefs.sessionTitles = {
+        ...current,
+        byBackend: { ...(current.byBackend ?? {}), [backendId]: config },
+      };
+    }).then(
+      () => true,
+      (err) => {
+        log.fail('console', err, { phase: 'save-config' });
+        return false;
+      },
+    );
+    const renderSaved = async (): Promise<object> => {
+      const ok = await saved;
+      return renderSessionTitleSettings(backendId, ok ? notice : '⚠️ 保存失败，原配置未改变，请重试。');
+    };
+    if (freshAfterSubmit) {
+      sendFreshSettingsResult(evt, renderSaved, 'session-title-submit-result');
+    } else {
+      void patch(evt, renderSaved);
+    }
+  }
+
   // ── 📝 云文档评论 @bot 全局设置（DM「⚙️ 设置 → 📝 云文档评论」）───────────
   /** Installed backends offered for the comment flow (codex always; others when
    * downloaded) — same gate as the project backend picker. */
@@ -2326,20 +2561,20 @@ export function createOrchestrator(
       .map((e) => ({ id: e.id, label: e.displayName }));
   }
 
-  /** Render the comment-settings card for the CURRENT comments config: fetch the
-   * configured backend's live model list so the model/effort dropdowns match it. */
-  let commentSettingsRenderGeneration = 0;
-  async function renderCommentSettings(notice?: string): Promise<object> {
-    ++commentSettingsRenderGeneration;
+  /** Render the comment-settings card. Agent buttons are transient edit state;
+   * the selected Agent/model/effort commit together only on form submit. */
+  async function renderCommentSettings(notice?: string, selectedBackendId?: string): Promise<object> {
+    const options = commentBackendOptions();
+    const configured = getCommentsConfig(cfg).backend ?? DEFAULT_BACKEND_ID;
+    const selected =
+      selectedBackendId && options.some((entry) => entry.id === selectedBackendId)
+        ? selectedBackendId
+        : options.some((entry) => entry.id === configured)
+          ? configured
+          : options[0]?.id ?? DEFAULT_BACKEND_ID;
     for (;;) {
-      const generation = commentSettingsRenderGeneration;
       const comments = getCommentsConfig(cfg);
-      const models = await listModels(backendFor(comments.backend)).catch(() => [] as ModelInfo[]);
-      // Another external settings render started while this backend's model
-      // request was in flight. Retry against that latest generation without
-      // incrementing it again; concurrent stale renders can converge instead
-      // of recursively invalidating one another forever.
-      if (generation !== commentSettingsRenderGeneration) continue;
+      const models = await listModels(backendFor(selected)).catch(() => [] as ModelInfo[]);
       const latest = getCommentsConfig(cfg);
       if (
         latest.backend !== comments.backend ||
@@ -2352,24 +2587,65 @@ export function createOrchestrator(
         ...cfg,
         preferences: { ...(cfg.preferences ?? {}), comments: { ...comments } },
       };
-      return buildCommentSettingsCard(snapshot, commentBackendOptions(), models, notice);
+      return buildCommentSettingsCard(snapshot, options, models, notice, selected);
     }
   }
 
-  /** Mutate cfg.preferences.comments (admin-gated), persist, and re-render the
-   * comment-settings card in place. Mirrors {@link applyPref} but scoped to the
-   * comments block and refreshing the comment card (not the global one). */
-  function applyCommentsPref(evt: CardActionEvent, mut: (c: CommentsConfig) => void): void {
+  /** Per-card transient selection + generation. Two admins (or two old cards)
+   * can browse different Agents without sharing UI state; rapid clicks on one
+   * card converge to that card's newest selection after async model discovery. */
+  const commentSettingsRenderStates = new Map<string, { generation: number; selectedBackendId?: string }>();
+  async function renderCommentSettingsFor(
+    messageId: string,
+    selectedBackendId?: string,
+    notice?: string,
+  ): Promise<object> {
+    const previous = commentSettingsRenderStates.get(messageId);
+    const state = {
+      generation: (previous?.generation ?? 0) + 1,
+      selectedBackendId,
+    };
+    setBoundedCardState(commentSettingsRenderStates, messageId, state);
+    for (;;) {
+      const latestState = commentSettingsRenderStates.get(messageId) ?? state;
+      const rendered = await renderCommentSettings(notice, latestState.selectedBackendId);
+      const current = commentSettingsRenderStates.get(messageId);
+      if (!current || current === latestState) return rendered;
+    }
+  }
+
+  /** Mutate cfg.preferences.comments (admin-gated), persist, then render the
+   * comment card. Form submissions request a fresh card because CardKit locks
+   * the submitted entity; button-only callers may still update in place. */
+  function applyCommentsPref(
+    evt: CardActionEvent,
+    mut: (c: CommentsConfig) => void,
+    opts: { freshAfterSubmit?: boolean; notice?: string; selectedBackendId?: string } = {},
+  ): void {
     if (!dmAdmin(evt.operator?.openId)) return;
     const saved = writePreferences((prefs) => {
       const comments: CommentsConfig = { ...(prefs.comments ?? {}) };
       mut(comments);
       prefs.comments = comments;
-    }).catch((err) => log.fail('console', err, { phase: 'save-config' }));
-    void patch(evt, async () => {
-      await saved;
-      return renderCommentSettings();
-    });
+    }).then(
+      () => true,
+      (err) => {
+        log.fail('console', err, { phase: 'save-config' });
+        return false;
+      },
+    );
+    const renderSaved = async (): Promise<object> => {
+      const ok = await saved;
+      return renderCommentSettings(
+        ok ? opts.notice : '⚠️ 保存失败，原配置未改变，请重试。',
+        ok ? undefined : opts.selectedBackendId,
+      );
+    };
+    if (opts.freshAfterSubmit) {
+      sendFreshSettingsResult(evt, renderSaved, 'comment-settings-submit-result');
+    } else {
+      void patch(evt, renderSaved);
+    }
   }
 
   // Back-to-menu: the settings card is button-only (never locks) and the
@@ -2572,7 +2848,9 @@ export function createOrchestrator(
       patch(evt, () => renderProjectList(page));
     })
     .on(DM.settings, async ({ evt }) => {
-      if (dmAdmin(evt.operator?.openId)) await patch(evt, renderSettings);
+      if (dmAdmin(evt.operator?.openId)) {
+        await patch(evt, renderSettings);
+      }
     })
     // ☕ 咖啡一下 二级卡：进卡时读一次 hook 安装状态（~/.claude、~/.codex）再渲染。
     .on(DM.coffeeSettings, async ({ evt }) => {
@@ -2945,32 +3223,115 @@ export function createOrchestrator(
       const n = Number(value.v);
       if (Number.isFinite(n)) applyPref(evt, (p) => (p.maxConcurrentRuns = n));
     })
-    // 📝 云文档评论 @bot 全局设置：纯按钮即点即改即重渲（提示词走 comment-instructions.md 文件，不在卡里）。
+    // 🏷️ 每个 Agent 后端独立配置。模型列表只用于方便选择，不充当白名单；
+    // 表单也接受任意第三方模型 ID，运行时严格原样调用，失败即截断兜底。
+    .on(DM.sessionTitleSettings, ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      void patch(evt, () => renderSessionTitleSettingsFor(evt.messageId));
+    })
+    .on(DM.sessionTitleSetBackend, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const backendId = typeof value.v === 'string' ? value.v : undefined;
+      void patch(evt, () => renderSessionTitleSettingsFor(evt.messageId, backendId));
+    })
+    .on(DM.sessionTitleDisable, ({ evt, value }) => {
+      const backendId = typeof value.b === 'string' ? value.b : '';
+      applySessionTitlePref(evt, backendId, { enabled: false }, '✅ 已改为截断首句；以后新建的会话不调用标题模型。');
+    })
+    .on(DM.sessionTitleSubmit, ({ evt, value, formValue }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const backendId = typeof value.b === 'string' ? value.b : '';
+      const parsed = parseSessionTitleFormValue(formValue);
+      if (!parsed.ok) {
+        sendFreshSettingsResult(
+          evt,
+          () => renderSessionTitleSettings(backendId, `⚠️ ${parsed.message}`),
+          'session-title-submit-validation',
+        );
+        return;
+      }
+      if (!getSessionTitleEfforts(backendId).includes(parsed.config.effort)) {
+        sendFreshSettingsResult(
+          evt,
+          () => renderSessionTitleSettings(backendId, '⚠️ 当前 Agent 不支持这个推理强度，未保存。'),
+          'session-title-submit-validation',
+        );
+        return;
+      }
+      applySessionTitlePref(
+        evt,
+        backendId,
+        parsed.config,
+        `✅ 已保存：AI 精炼 · ${parsed.config.model} · ${reasoningEffortLabel(parsed.config.effort)}。仅影响以后新建的会话。`,
+        true,
+      );
+    })
+    // 📝 云文档评论 @bot 全局设置：Agent 按钮仅切换预览，模型/强度随表单一次保存；
+    // 回复规则走 comment-instructions.md 文件，不塞进 config.json。
     .on(DM.commentSettings, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      void patch(evt, () => renderCommentSettings());
+      void patch(evt, () => renderCommentSettingsFor(evt.messageId));
     })
     .on(DM.commentSetBackend, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
       const v = typeof value.v === 'string' ? value.v : undefined;
-      // Backend is a button (cascade source): switching invalidates the stored
-      // model/effort (backend-specific) → clear them, then re-render so the form's
-      // dropdowns reflect the new backend's models.
-      applyCommentsPref(evt, (c) => {
-        c.backend = v && backendIds().includes(v) ? v : undefined;
-        c.model = undefined;
-        c.effort = undefined;
-      });
+      // Transient cascade source: fetch that Agent's models, but do not mutate
+      // persistent comments config until the form is submitted.
+      void patch(evt, () => renderCommentSettingsFor(evt.messageId, v));
     })
     // Model + effort form submit (one save for both). The dropdowns preselect the
     // current value, so a submit always carries a concrete model/effort to store.
-    .on(DM.commentSubmit, ({ evt, formValue }) => {
+    .on(DM.commentSubmit, ({ evt, value, formValue }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
+      const backendId = typeof value.b === 'string' ? value.b : getCommentsConfig(cfg).backend ?? DEFAULT_BACKEND_ID;
+      if (!commentBackendOptions().some((entry) => entry.id === backendId)) {
+        sendFreshSettingsResult(
+          evt,
+          () => renderCommentSettings('⚠️ 这个 Agent 当前不可用，未保存。'),
+          'comment-settings-submit-validation',
+        );
+        return;
+      }
       const modelId = selectValue(formValue, 'model');
-      const effort = asEffort(selectValue(formValue, 'effort'));
-      applyCommentsPref(evt, (c) => {
-        if (modelId) c.model = modelId; // single-model backend renders no select → leave as-is
-        if (effort) c.effort = effort; // no-effort backend renders no select → leave as-is
-      });
+      const rawRequestedEffort = selectValue(formValue, 'effort');
+      const requestedEffort = asEffort(rawRequestedEffort);
+      if (rawRequestedEffort && !requestedEffort) {
+        sendFreshSettingsResult(
+          evt,
+          () => renderCommentSettings('⚠️ 推理强度无效，未保存。请重新选择。', backendId),
+          'comment-settings-submit-validation',
+        );
+        return;
+      }
+      void (async () => {
+        const models = await listModels(backendFor(backendId)).catch(() => [] as ModelInfo[]);
+        const resolved = resolveCommentModelFormValue(models, modelId, requestedEffort);
+        if (!resolved.ok) {
+          sendFreshSettingsResult(
+            evt,
+            () => renderCommentSettings(`⚠️ ${resolved.message}`, backendId),
+            'comment-settings-submit-validation',
+          );
+          return;
+        }
+        const { model: selected, effort, adjusted } = resolved;
+        const summary = `${selected.displayName || selected.id}${effort ? ` · ${reasoningEffortLabel(effort)}` : ''}`;
+        applyCommentsPref(
+          evt,
+          (c) => {
+            c.backend = backendId;
+            c.model = selected.id;
+            c.effort = effort;
+          },
+          {
+            freshAfterSubmit: true,
+            selectedBackendId: backendId,
+            notice: adjusted
+              ? `✅ 已保存：${summary}。所选强度不适用于这个模型，已自动调整。`
+              : `✅ 已保存：${summary}。下一条新评论起生效。`,
+          },
+        );
+      })().catch((err) => log.fail('console', err, { phase: 'comment-settings-submit' }));
     })
     // ✍️ 编辑提示词：打开预填当前 master 模板（含 {变量}）的编辑子卡。
     .on(DM.commentEditPrompt, ({ evt }) => {
@@ -2991,21 +3352,40 @@ export function createOrchestrator(
       void (async () => {
         if (!content.trim()) {
           const cur = await loadCommentInstructions(paths.commentInstructionsFile);
-          await patch(evt, buildCommentPromptCard(cur, '⚠️ 提示词不能为空，未保存。', paths.commentInstructionsFile));
+          sendFreshSettingsResult(
+            evt,
+            () => buildCommentPromptCard(cur, '⚠️ 回复规则不能为空，未保存。', paths.commentInstructionsFile),
+            'comment-prompt-submit-validation',
+          );
           return;
         }
-        await saveCommentInstructions(paths.commentInstructionsFile, content).catch((err) =>
-          log.fail('console', err, { phase: 'save-comment-prompt' }),
-        );
+        try {
+          await saveCommentInstructions(paths.commentInstructionsFile, content);
+        } catch (err) {
+          log.fail('console', err, { phase: 'save-comment-prompt' });
+          sendFreshSettingsResult(
+            evt,
+            () => buildCommentPromptCard(content, '⚠️ 回复规则保存失败，原规则未改变，请重试。', paths.commentInstructionsFile),
+            'comment-prompt-submit-result',
+          );
+          return;
+        }
         const n = await syncAllCommentInstructions(paths.commentsRootDir, content, cfg.accounts.app.tenant).catch(
-          () => 0,
+          (err) => {
+            log.fail('console', err, { phase: 'sync-comment-prompt' });
+            return undefined;
+          },
         );
-        await patch(evt, () =>
-          buildCommentPromptCard(
+        sendFreshSettingsResult(
+          evt,
+          () => buildCommentPromptCard(
             content,
-            `✅ 提示词已保存，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
+            n === undefined
+              ? '⚠️ 回复规则已保存，但同步到已有文档失败，请重试。'
+              : `✅ 回复规则已保存，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
             paths.commentInstructionsFile,
           ),
+          'comment-prompt-submit-result',
         );
       })();
     })
@@ -3014,20 +3394,38 @@ export function createOrchestrator(
     .on(DM.commentResetPrompt, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       void (async () => {
-        await saveCommentInstructions(paths.commentInstructionsFile, DEFAULT_COMMENT_INSTRUCTIONS).catch((err) =>
-          log.fail('console', err, { phase: 'reset-comment-prompt' }),
-        );
+        try {
+          await saveCommentInstructions(paths.commentInstructionsFile, DEFAULT_COMMENT_INSTRUCTIONS);
+        } catch (err) {
+          log.fail('console', err, { phase: 'reset-comment-prompt' });
+          const current = await loadCommentInstructions(paths.commentInstructionsFile).catch(
+            () => DEFAULT_COMMENT_INSTRUCTIONS,
+          );
+          sendFreshSettingsResult(
+            evt,
+            () => buildCommentPromptCard(current, '⚠️ 重置失败，原回复规则未改变，请重试。', paths.commentInstructionsFile),
+            'comment-prompt-reset-result',
+          );
+          return;
+        }
         const n = await syncAllCommentInstructions(
           paths.commentsRootDir,
           DEFAULT_COMMENT_INSTRUCTIONS,
           cfg.accounts.app.tenant,
-        ).catch(() => 0);
-        await patch(evt, () =>
-          buildCommentPromptCard(
+        ).catch((err) => {
+          log.fail('console', err, { phase: 'sync-comment-prompt' });
+          return undefined;
+        });
+        sendFreshSettingsResult(
+          evt,
+          () => buildCommentPromptCard(
             DEFAULT_COMMENT_INSTRUCTIONS,
-            `↩️ 已重置为默认提示词，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
+            n === undefined
+              ? '⚠️ 已重置为默认回复规则，但同步到已有文档失败，请重试。'
+              : `↩️ 已重置为默认回复规则，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
             paths.commentInstructionsFile,
           ),
+          'comment-prompt-reset-result',
         );
       })();
     })
@@ -3491,6 +3889,12 @@ export function createOrchestrator(
     /** the backend that created `thread` (persisted into the SessionRecord so a
      * restart resumes on the same runtime). Unset → default (codex). */
     backendId?: string;
+    /** Durable title ledger key for a Bridge-owned, newly-created native
+     * session. Absent for manual /resume, legacy sessions, and doc comments. */
+    titleJobKey?: string;
+    /** Structured, un-woven first message. Required so a rejected first turn
+     * can be retitled from a later queued message without touching AgentInput. */
+    titleSource: SessionTitleSource;
     /** prefetched SessionRecord for the FIRST turn (M-1 极限提前)：免掉编织完成
      * 与 turn/start 之间的 getSession 读盘。`null` = 确知没有记录（全新会话）；
      * undefined = 没预取，照旧读。后续排队轮永远重读（⚙️ 可能改了 model）。 */
@@ -3603,6 +4007,59 @@ export function createOrchestrator(
     let queuedCard = slot.queuedCard;
     reaction?.started(); // slot acquired → flip OneSecond → Typing
     let firstCardSent = false;
+    let titleStart: Promise<boolean> | undefined;
+    let titleApplyRequested = false;
+    let titleTurnAttempted = false;
+
+    const beginSessionTitle = (): void => {
+      if (!opts.titleJobKey || titleStart) return;
+      const key = opts.titleJobKey;
+      titleStart = (async () => {
+        try {
+          // Called only after the host emits turn_started. A start rejection
+          // leaves waiting_turn + its binding marker intact for the next message.
+          const activated = await sessionTitles.activate(key);
+          if (!activated) return false;
+          await sessionTitles.prepare(key);
+          return true;
+        } catch (err) {
+          log.fail('agent', err, { phase: 'session-title-start', key });
+          return false;
+        }
+      })();
+    };
+    const requestSessionTitleApply = (): void => {
+      if (!opts.titleJobKey || !titleStart || titleApplyRequested) return;
+      titleApplyRequested = true;
+      const key = opts.titleJobKey;
+      const bindingKey = topicThreadId;
+      void titleStart.then(async (activated) => {
+        if (!activated) {
+          titleStart = undefined;
+          titleApplyRequested = false;
+          return;
+        }
+        if (bindingKey) {
+          await clearSessionTitleJobKey(bindingKey, key).catch((err) =>
+            log.fail('agent', err, { phase: 'session-title-marker-clear', key }),
+          );
+        }
+        await sessionTitles.apply(key);
+      });
+    };
+    const retrySessionTitleAfterTurn = (): void => {
+      if (!opts.titleJobKey || !titleStart) return;
+      const key = opts.titleJobKey;
+      void (async () => {
+        if (!(await titleStart)) return;
+        // Claude's native session row may appear only after the first result. An
+        // idempotent post-turn attempt plus a short delayed retry covers that
+        // timing edge without holding the user's run/semaphore completion.
+        await sessionTitles.apply(key);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await sessionTitles.apply(key);
+      })();
+    };
 
     const persist = async (threadId: string): Promise<void> => {
       await upsertSession({
@@ -3611,6 +4068,7 @@ export function createOrchestrator(
         cwd: opts.cwd ?? fallbackCwd,
         sessionId: opts.thread.sessionId,
         backend: opts.backendId ?? DEFAULT_BACKEND_ID,
+        titleJobKey: opts.titleJobKey,
         model: opts.model,
         effort: opts.effort,
         summary: opts.summary ?? opts.firstText.slice(0, 80),
@@ -3643,6 +4101,7 @@ export function createOrchestrator(
     try {
       let currentTurn: QueuedTurn = {
         input: { text: opts.firstText, images: opts.images },
+        titleSource: opts.titleSource,
         requesterOpenId: opts.requesterOpenId,
         requestedAt: opts.requestedAt ?? Date.now(),
         summary: opts.summary,
@@ -3652,6 +4111,15 @@ export function createOrchestrator(
       for (;;) {
         const turnInput = currentTurn.input;
         state.requesterOpenId = currentTurn.requesterOpenId;
+        if (titleTurnAttempted && !titleStart && opts.titleJobKey) {
+          // A prior turn/start was rejected before turn_started. If a queued
+          // follow-up now becomes the first accepted turn, title that message,
+          // not the rejected one. AgentInput.text is deliberately forbidden
+          // here because it contains Bridge sender/quote/history/file context.
+          await sessionTitles.attachSource(opts.titleJobKey, currentTurn.titleSource).catch((err) =>
+            log.fail('agent', err, { phase: 'session-title-refresh', key: opts.titleJobKey }),
+          );
+        }
         // per-turn model/effort: prefer latest persisted (⚙️ may have changed it).
         // First turn uses the intake-prefetched record (null = known absent) so
         // runStreamed — i.e. turn/start — fires with zero awaits after weaving.
@@ -3662,6 +4130,7 @@ export function createOrchestrator(
         const turnEffort = rec?.effort ?? opts.effort;
         const modelDisp = getModelDisplay(cfg);
         const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
+        titleTurnAttempted = true;
         const turnStartAt = Date.now(); // turn/start 已在 runStreamed() 内发出（与下面的建卡并行）
         state.run = run;
         const render = new RunRender();
@@ -3796,6 +4265,12 @@ export function createOrchestrator(
           const tEv = Date.now();
           if (!firstEvAt) firstEvAt = tEv;
           const et = (ev as { type?: string }).type;
+          if (et === 'turn_started') {
+            // Host accepted the first turn. Title generation now overlaps the
+            // remainder of that turn; the binding was persisted before this loop.
+            beginSessionTitle();
+            requestSessionTitleApply();
+          }
           if (et === 'text_delta') {
             if (!firstTextAt) firstTextAt = tEv;
             const d = (ev as { delta?: string }).delta;
@@ -3946,6 +4421,7 @@ export function createOrchestrator(
           cardUpdated: terminalCardUpdated,
           replyInThread: !opts.flat,
         });
+        retrySessionTitleAfterTurn();
         replyTo = finalMsgId;
         replyInThread = !opts.flat; // stay in the topic for queued turns (single: stay flat)
         log.info('card', 'final', { terminal: render.terminal() });
@@ -4035,6 +4511,53 @@ export function createOrchestrator(
       void slot.queuedCard.stream.updateCard(channel, buildQueuedCard({ started: true }));
     }
 
+    let titleStart: Promise<boolean> | undefined;
+    let titleApplyRequested = false;
+    const beginGoalSessionTitle = (): void => {
+      if (!opts.titleJobKey || titleStart) return;
+      const key = opts.titleJobKey;
+      titleStart = (async () => {
+        try {
+          const activated = await sessionTitles.activate(key);
+          if (!activated) return false;
+          await sessionTitles.prepare(key);
+          return true;
+        } catch (err) {
+          log.fail('agent', err, { phase: 'session-title-start', key });
+          return false;
+        }
+      })();
+    };
+    const requestGoalSessionTitleApply = (): void => {
+      if (!opts.titleJobKey || !titleStart || titleApplyRequested) return;
+      titleApplyRequested = true;
+      const key = opts.titleJobKey;
+      const bindingKey = topicThreadId;
+      void titleStart.then(async (activated) => {
+        if (!activated) {
+          titleStart = undefined;
+          titleApplyRequested = false;
+          return;
+        }
+        if (bindingKey) {
+          await clearSessionTitleJobKey(bindingKey, key).catch((err) =>
+            log.fail('agent', err, { phase: 'session-title-marker-clear', key }),
+          );
+        }
+        await sessionTitles.apply(key);
+      });
+    };
+    const retryGoalSessionTitleAfterRun = (): void => {
+      if (!opts.titleJobKey || !titleStart) return;
+      const key = opts.titleJobKey;
+      void (async () => {
+        if (!(await titleStart)) return;
+        await sessionTitles.apply(key);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await sessionTitles.apply(key);
+      })();
+    };
+
     const persist = async (threadId: string): Promise<void> => {
       await upsertSession({
         threadId,
@@ -4042,6 +4565,7 @@ export function createOrchestrator(
         cwd: opts.cwd ?? fallbackCwd,
         sessionId: opts.thread.sessionId,
         backend: opts.backendId ?? DEFAULT_BACKEND_ID,
+        titleJobKey: opts.titleJobKey,
         model: opts.model,
         effort: opts.effort,
         summary: opts.summary ?? objective.slice(0, 80),
@@ -4132,6 +4656,7 @@ export function createOrchestrator(
       runsByCard.set(cardMsgId, state);
       runStreams.set(cardMsgId, stream);
       await adoptThreadId(cardMsgId, ctx.rc);
+      requestGoalSessionTitleApply();
       // chain the next turn's card (and the terminal card) under this one
       replyTo = cardMsgId;
       replyInThread = !opts.flat;
@@ -4215,6 +4740,10 @@ export function createOrchestrator(
           continue;
         }
         if (ev.type === 'turn_started') {
+          // Unlike runGoal() construction, this proves the host accepted and
+          // started the goal's first turn. Generate in parallel from here.
+          beginGoalSessionTitle();
+          if (topicThreadId) requestGoalSessionTitleApply();
           await finalizeCard(cur); // close the previous turn's card (if it produced one)
           cur = startTurn(); // render-only; the card is sent lazily on first content
           continue;
@@ -4259,6 +4788,10 @@ export function createOrchestrator(
       if (interrupted && cur) cur.render.interrupt();
       await finalizeCard(cur);
       cur = null;
+      // Covers a goal that produced no content card (and therefore never called
+      // ensureCard) plus Claude's post-result native-session timing.
+      requestGoalSessionTitleApply();
+      retryGoalSessionTitleAfterRun();
 
       // Always clear the goal when the run ends: a non-complete goal would
       // reactivate on the next resume, and a LEFTOVER goal (even complete) gets
@@ -4801,6 +5334,7 @@ export function createOrchestrator(
 
   async function shutdown(): Promise<void> {
     clearInterval(reaper);
+    await sessionTitles.shutdown();
     // adopt 失败的孤儿线程已在 launchRun/launchGoalRun 的 finally 就地 close，
     // 这里只需回收 LIVE 会话缓存。
     const live = [...new Set(sessions.values())];
@@ -4810,6 +5344,10 @@ export function createOrchestrator(
     await Promise.allSettled(live.map((t) => t.close()));
     log.info('bridge', 'shutdown', { closed: live.length });
   }
+
+  // Recover only ledger rows created by this feature. v1/v2 sessions migrate
+  // with an empty ledger, so startup never backfills legacy/manual sessions.
+  sessionTitles.startRecovery();
 
   // 启动预热：daemon 首个新话题原本恒吃一次 model/list 冷 spawn（独立 app-server
   // ~150–300ms），启动是空闲期，提前付掉。成功时只填 backend 内部缓存，后续

@@ -1,4 +1,4 @@
-import type { ReasoningEffort } from '../agent/types';
+import { REASONING_EFFORTS, type ReasoningEffort } from '../agent/types';
 
 export type TenantBrand = 'feishu' | 'lark';
 
@@ -123,7 +123,38 @@ export interface AppPreferences {
    * 自定义提示词不在这里——它落在每 bot 的 `comment-instructions.md` 文件里，由桥同步进
    * 每个文档的评论工作目录（AGENTS.md / CLAUDE.md），见 bot/comments.ts。 */
   comments?: CommentsConfig;
+  /** Bridge 新建聊天会话的 resume 标题配置。每个 agent 后端独立；
+   * 缺省/未命中的后端不调模型，直接截断清洗后的首句。 */
+  sessionTitles?: SessionTitlesConfig;
 }
+
+/** 开启 AI 的完整配置；不允许只填 model 或只填 effort。 */
+export interface SessionTitleAiConfig {
+  enabled: true;
+  model: string;
+  effort: ReasoningEffort;
+}
+
+/** 某一 agent 后端的会话标题策略。开启 AI 时 model + effort 必须成对存在。 */
+export type SessionTitleBackendConfig = { enabled?: false; model?: never; effort?: never } | SessionTitleAiConfig;
+
+/** 后端 id → 该后端的标题策略。不设全局模型，也不设模型白名单。 */
+export interface SessionTitlesConfig {
+  byBackend?: Record<string, SessionTitleBackendConfig | undefined>;
+}
+
+/** Effort values accepted by each host protocol for an isolated title turn.
+ * This constrains the transport, not the model id: third-party/custom models
+ * remain unrestricted. Unknown future backends receive the full bridge ladder. */
+export function getSessionTitleEfforts(backendId: string): readonly ReasoningEffort[] {
+  if (backendId === 'claude-agent') return ['low', 'medium', 'high', 'xhigh', 'max'];
+  return REASONING_EFFORTS;
+}
+
+/** 消费侧可以直接使用的完整联合：关闭时绝不携带模型参数。 */
+export type ResolvedSessionTitleBackendConfig =
+  | { enabled: false }
+  | { enabled: true; model: string; effort: ReasoningEffort };
 
 /**
  * 云文档评论流的全局可配项。仅三个短标量（后端 / 模型 / 推理强度），都可空——
@@ -485,4 +516,46 @@ export function canEnableCliBridge(cfg: AppConfig): { ok: true } | { ok: false; 
  * loadConfig 返回 Partial 时这里返回空对象。 */
 export function getCommentsConfig(cfg: AppConfig): CommentsConfig {
   return cfg.preferences?.comments ?? {};
+}
+
+/**
+ * Resolve one backend's title strategy with a fail-closed default. Hand-edited
+ * or stale JSON that says enabled but omits either model or effort is treated as
+ * disabled, so the bridge never makes an accidental/default model call.
+ */
+export function getSessionTitleConfig(cfg: AppConfig, backendId: string): ResolvedSessionTitleBackendConfig {
+  const raw = cfg.preferences?.sessionTitles?.byBackend?.[backendId];
+  const validEffort =
+    raw?.enabled === true &&
+    typeof raw.effort === 'string' &&
+    (getSessionTitleEfforts(backendId) as readonly string[]).includes(raw.effort);
+  if (raw?.enabled !== true || typeof raw.model !== 'string' || !raw.model.trim() || !validEffort) {
+    return { enabled: false };
+  }
+  return { enabled: true, model: raw.model.trim(), effort: raw.effort };
+}
+
+/** Short DM-card summary for one backend. */
+export function summarizeSessionTitleConfig(cfg: AppConfig, backendId: string): string {
+  const resolved = getSessionTitleConfig(cfg, backendId);
+  return resolved.enabled
+    ? `AI 精炼：${resolved.model} · ${resolved.effort}`
+    : '不使用模型（截断首句）';
+}
+
+/** Fixed two-backend strategy list for the global-settings entry. */
+export function summarizeSessionTitles(
+  cfg: AppConfig,
+  effortLabel: (effort: string) => string = (effort) => effort,
+): string {
+  const strategy = (backendId: string): string => {
+    const resolved = getSessionTitleConfig(cfg, backendId);
+    return resolved.enabled
+      ? `AI 精炼 · ${resolved.model} · ${effortLabel(resolved.effort)}`
+      : '截断首句';
+  };
+  return [
+    `- Codex：${strategy('codex-appserver')}`,
+    `- Claude Code：${strategy('claude-agent')}`,
+  ].join('\n');
 }

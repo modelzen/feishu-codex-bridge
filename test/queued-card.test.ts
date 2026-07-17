@@ -100,7 +100,8 @@ describe('queued follow-up requester isolation', () => {
   it('moves control ownership to that turn and clears the previous manual override', () => {
     const state = { requesterOpenId: 'ou_first', completionReminderRequested: true };
     const queued: QueuedTurn = {
-      input: { text: 'second turn' },
+      input: { text: '[本条消息的发信人：某用户（open_id：ou_second）]\n\nsecond turn' },
+      titleSource: { text: 'second turn', rawContentType: 'text' },
       requesterOpenId: 'ou_second',
       requestedAt: 123_000,
       summary: 'second turn',
@@ -112,5 +113,7 @@ describe('queued follow-up requester isolation', () => {
     // Timing/title stay attached to the same turn object used by notification.
     expect(queued.requestedAt).toBe(123_000);
     expect(queued.summary).toBe('second turn');
+    expect(queued.titleSource.text).toBe('second turn');
+    expect(queued.input.text).toContain('open_id');
   });
 });
