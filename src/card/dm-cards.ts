@@ -987,7 +987,7 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
       note('会话标题与云文档评论分别配置，互不影响，也不会改变普通聊天使用的模型。'),
       md('**🏷️ 会话标题**'),
       note('让 Bridge 新建的会话在 Claude Code / Codex 的恢复列表（/resume）中显示易识别的标题。'),
-      md(`**当前**：${summarizeSessionTitles(cfg)}`),
+      md(`**当前策略**\n${summarizeSessionTitles(cfg, reasoningEffortLabel)}`),
       actions([button('配置会话标题', { a: DM.sessionTitleSettings }, 'primary')]),
       hr(),
       md('**📝 云文档评论**'),

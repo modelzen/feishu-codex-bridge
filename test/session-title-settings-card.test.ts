@@ -46,10 +46,22 @@ describe('session-title settings cards', () => {
     expect(rendered).toContain('专项功能');
     expect(rendered).toContain('分别配置，互不影响');
     expect(rendered).toContain('会话标题');
-    expect(rendered).toContain('截断首句（不调用模型）');
+    expect(rendered).toContain('当前策略');
+    expect(rendered).toContain('Codex：截断首句');
+    expect(rendered).toContain('Claude Code：截断首句');
     expect(rendered).toContain('配置会话标题');
     expect(rendered).toContain('配置评论处理');
     expect(rendered).not.toContain('设置各后端的标题模型 / Effort');
+  });
+
+  it('shows model and Effort only for backends using AI title refinement', () => {
+    const rendered = JSON.stringify(buildSettingsCard(cfg({
+      byBackend: {
+        'codex-appserver': { enabled: true, model: 'openrouter/acme-title', effort: 'xhigh' },
+      },
+    })));
+    expect(rendered).toContain('Codex：AI 精炼 · openrouter/acme-title · 极高');
+    expect(rendered).toContain('Claude Code：截断首句');
   });
 
   it('renders live third-party models without a provider whitelist and hides hidden models', () => {

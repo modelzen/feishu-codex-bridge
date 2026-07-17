@@ -543,11 +543,19 @@ export function summarizeSessionTitleConfig(cfg: AppConfig, backendId: string): 
     : '不使用模型（截断首句）';
 }
 
-/** Aggregate summary for the global-settings entry, without needing backend IO. */
-export function summarizeSessionTitles(cfg: AppConfig): string {
-  const ids = Object.keys(cfg.preferences?.sessionTitles?.byBackend ?? {});
-  const enabledCount = ids.filter((id) => getSessionTitleConfig(cfg, id).enabled).length;
-  return enabledCount === 0
-    ? '各 Agent 均截断首句（不调用模型）。'
-    : `${enabledCount} 个 Agent 使用 AI 精炼，其余截断首句。`;
+/** Fixed two-backend strategy list for the global-settings entry. */
+export function summarizeSessionTitles(
+  cfg: AppConfig,
+  effortLabel: (effort: string) => string = (effort) => effort,
+): string {
+  const strategy = (backendId: string): string => {
+    const resolved = getSessionTitleConfig(cfg, backendId);
+    return resolved.enabled
+      ? `AI 精炼 · ${resolved.model} · ${effortLabel(resolved.effort)}`
+      : '截断首句';
+  };
+  return [
+    `- Codex：${strategy('codex-appserver')}`,
+    `- Claude Code：${strategy('claude-agent')}`,
+  ].join('\n');
 }
