@@ -113,7 +113,7 @@ feishu-codex-bridge start                       后台 daemon：装系统服务�
 feishu-codex-bridge status|logs|restart|stop    daemon 生命周期（logs -f 跟随日志）
 feishu-codex-bridge update [--check]            更新到最新版（npm i -g）并自动重启 daemon
 feishu-codex-bridge web [--port <端口>]          打开本机网页控制台（默认端口 51847）
-feishu-codex-bridge bot init|list|use|rm        多机器人：注册 / 列表 / 选要连接的 / 移除
+feishu-codex-bridge bot init|list|use|rm        多机器人：扫码注册 / 列表 / 选要连接的 / 移除
 feishu-codex-bridge doctor                      本地自检：后端 / 登录 / 当前机器人
 ```
 

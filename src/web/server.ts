@@ -32,15 +32,15 @@ const LOGO_PNG = Buffer.from(LOGO_PNG_BASE64, 'base64');
  *   3. Host/Origin 校验防 DNS rebinding（只认 127.0.0.1 / localhost / [::1]）。
  *   4. 端点最小化：只读（state / diagnosis / logs / sessions / setup-status /
  *      daemon / update.check / host-doctor / backends）+「DM 卡片已有等价操作」的
- *      写入（backend / permission / no-mention / auto-compact / completion-reminder）+ Web 专属（POST
- *      /api/bots 手填注册；GET /api/bots/register-qr/stream 扫码注册 SSE + DELETE
- *      取消；POST /api/backends/:id/install 按需安装 SSE；PATCH/DELETE /api/bots/:id
+ *      写入（backend / permission / no-mention / auto-compact / completion-reminder）+ Web 专属（GET
+ *      /api/bots/register-qr/stream 扫码注册 SSE + DELETE 取消；
+ *      POST /api/backends/:id/install 按需安装 SSE；PATCH/DELETE /api/bots/:id
  *      多 bot 管理；POST /api/daemon/restart 与 /api/update 经 detached helper）。
  *      restart/update/install 只投递固定 action / catalog 内置包名给内部执行器，
  *      绝不暴露「执行任意命令」「装任意 npm 包」「读任意文件」。
  *   5. 日志流只透传现有文件日志行（已是尾 6 位脱敏风格），token 绝不进日志；
- *      POST /api/bots 的 appSecret、扫码会话的 client_secret 仅一次性经
- *      body/内存→keystore，绝不回显/不进日志（扫码 SSE 的 done 事件白名单字段，
+ *      扫码会话的 client_secret 仅一次性经内存→keystore，绝不回显/不进日志
+ *      （扫码 SSE 的 done 事件白名单字段，
  *      永不含 secret）。
  *
  * 进程形态（第二棒已接）：daemon（run/supervisor 进程）经 web/mount.ts 内嵌同一
@@ -296,14 +296,7 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       return;
     }
 
-    // ── Web 专属：初始化 / 添加机器人向导（day-0，飞书 DM 卡片做不到）──────────
-    // POST /api/bots —— 直填 appId+appSecret 注册。appSecret 仅这一次性经过 body，
-    // 绝不回显、绝不进日志（service 层探活后进 keystore，明文不落任何文件）。
-    if (req.method === 'POST' && pathName === '/api/bots') {
-      await handleRegisterBot(req, res);
-      return;
-    }
-
+    // ── Web 专属：扫码初始化 / 添加机器人（day-0）───────────────────────────
     // GET /api/bots/register-qr/stream —— 扫码注册 SSE（启动 registerApp 会话，推
     // qr → status* → done/error 全程）。EventSource 只能 GET，鉴权靠 cookie。
     // 必须排在 /^\/api\/bots\/([^/]+)$/ 的 botMatch 之前（否则 register-qr 被当 appId）。
@@ -554,57 +547,6 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       out.push({ ...b, projects });
     }
     sendJson(res, 200, { version: bridgeVersion(), generatedAt: Date.now(), bots: out });
-  }
-
-  /**
-   * POST /api/bots —— 注册机器人。请求体 { appId, appSecret, tenant?, name? }。
-   * appSecret 只在此一次性流过：service 层探活有效后进 keystore，明文绝不回显、
-   * 绝不进日志（响应只回 appId / name / botName / 缺失 scope，无 secret）。
-   *   - 成功 → 201 { ok:true, bot:{...} }
-   *   - 格式错（空 / appId 格式）→ 400 invalid_input
-   *   - 探活拒绝（密钥无效）→ 409 credential_rejected
-   *   - 写盘失败 → 500 persist_failed
-   */
-  async function handleRegisterBot(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    let body: Record<string, unknown>;
-    try {
-      body = await readJsonBody(req);
-    } catch {
-      sendJson(res, 400, { error: 'bad_body', message: '请求体必须是 JSON' });
-      return;
-    }
-    const appId = typeof body.appId === 'string' ? body.appId : '';
-    const appSecret = typeof body.appSecret === 'string' ? body.appSecret : '';
-    const tenant = body.tenant === 'lark' ? 'lark' : 'feishu';
-    const desiredName = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
-
-    let result;
-    try {
-      result = await opts.service.registerBot({ appId, appSecret, tenant, desiredName });
-    } catch (err) {
-      // 只读预览（没启动）不许加机器人 → 501（前端已先用 daemon 状态拦在按钮处，这是兜底）。
-      if (err instanceof NotWiredYetError) {
-        sendJson(res, 501, { error: 'not_wired_yet', message: err.message });
-        return;
-      }
-      throw err;
-    }
-    if (result.ok) {
-      sendJson(res, 201, {
-        ok: true,
-        bot: {
-          appId: result.appId,
-          name: result.name,
-          tenant: result.tenant,
-          botName: result.botName,
-          missingScopes: result.missingScopes,
-        },
-      });
-      return;
-    }
-    // 机器可分支的 code → HTTP 状态：格式错 400、密钥无效 409、写盘失败 500。
-    const status = result.code === 'invalid_input' ? 400 : result.code === 'credential_rejected' ? 409 : 500;
-    sendJson(res, status, { error: result.code, message: result.reason });
   }
 
   /**

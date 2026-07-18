@@ -85,22 +85,6 @@ function stubService(): AdminService {
     async tailLogs() {
       return '{"ts":"2026-06-13T00:00:00Z","level":"info","phase":"ws","event":"connected"}\n';
     },
-    async registerBot(input) {
-      if (!input.appId || !input.appSecret) {
-        return { ok: false as const, code: 'invalid_input' as const, reason: 'App ID 与 App Secret 都不能为空。' };
-      }
-      if (input.appSecret === 'bad') {
-        return { ok: false as const, code: 'credential_rejected' as const, reason: '凭据校验失败：code=10003' };
-      }
-      return {
-        ok: true as const,
-        name: 'newbot',
-        appId: input.appId,
-        tenant: (input.tenant ?? 'feishu') as 'feishu' | 'lark',
-        botName: '新机器人',
-        missingScopes: [],
-      };
-    },
     async getSetupStatus(botId) {
       return {
         appId: botId,
@@ -505,42 +489,15 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
   });
 });
 
-describe('web server · 添加机器人向导（day-0）', () => {
-  function postBots(body: unknown, withAuth = true): Promise<Response> {
-    return fetch(`${base}/api/bots`, {
+describe('web server · 扫码初始化与机器人管理', () => {
+  it('POST /api/bots 手填注册入口已下线 → 404', async () => {
+    const res = await authed('/api/bots', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(withAuth ? { Authorization: `Bearer ${TOKEN}` } : {}),
-      },
-      body: JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ appId: 'cli_manual1111', appSecret: 'secret' }),
     });
-  }
-
-  it('POST /api/bots 注册成功 → 201 { ok, bot:{appId,name,botName} }', async () => {
-    const res = await postBots({ appId: 'cli_new111111', appSecret: 'goodsecret', tenant: 'feishu' });
-    expect(res.status).toBe(201);
-    const body = await jsonOf(res);
-    expect(body.ok).toBe(true);
-    expect(body.bot.appId).toBe('cli_new111111');
-    expect(body.bot.botName).toBe('新机器人');
-  });
-
-  it('POST /api/bots 缺字段 → 400 invalid_input', async () => {
-    const res = await postBots({ appId: '', appSecret: '' });
-    expect(res.status).toBe(400);
-    expect((await jsonOf(res)).error).toBe('invalid_input');
-  });
-
-  it('POST /api/bots 探活失败 → 409 credential_rejected', async () => {
-    const res = await postBots({ appId: 'cli_bad1111111', appSecret: 'bad', tenant: 'feishu' });
-    expect(res.status).toBe(409);
-    expect((await jsonOf(res)).error).toBe('credential_rejected');
-  });
-
-  it('POST /api/bots 同样要鉴权：无 token → 401', async () => {
-    const res = await postBots({ appId: 'cli_x', appSecret: 'y' }, false);
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(404);
+    expect((await jsonOf(res)).error).toBe('not_found');
   });
 
   it('GET /api/bots/:appId/setup-status：聚合三/四态 checklist', async () => {

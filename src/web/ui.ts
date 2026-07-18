@@ -83,6 +83,7 @@ export const UI_PURE_JS = `
     if (code === 'abort') return null;
     if (code === 'expired_token') return '二维码已过期，请重新生成。';
     if (code === 'access_denied') return '你在飞书里取消或拒绝了创建。';
+    if (code === 'identity_missing') return '未获取到你的飞书身份，机器人没有保存。请重新扫码并确认授权。';
     return message || '创建失败，请重试。';
   }
 
@@ -671,7 +672,6 @@ export const UI_HTML = `<!doctype html>
   }
   .wiz input::placeholder { color: var(--text-3); }
   .wiz input:focus { outline: 0; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
-  .wiz .radio-row { display: flex; gap: 16px; margin: 6px 0; font-size: 13px; }
   .wiz .actions { display: flex; gap: 10px; margin-top: 18px; align-items: center; }
   .wiz .actions .grow { flex: 1; }
   .qrbox {
@@ -681,7 +681,6 @@ export const UI_HTML = `<!doctype html>
   .qrbox .qr-count { color: #555; }
   .qrbox svg { display: block; }
   .qr-count { font-size: 12px; color: var(--text-2); }
-  .adv-toggle { font-size: 12px; color: var(--blue); cursor: pointer; user-select: none; margin-top: 10px; display: inline-block; }
   .check-item {
     display: flex; align-items: flex-start; gap: 10px; padding: 10px 0;
     border-bottom: 1px solid var(--border);
@@ -744,7 +743,7 @@ export const UI_HTML = `<!doctype html>
 <div class="drawer-mask" id="drawerMask"></div>
 <div class="drawer" id="drawer"></div>
 
-<!-- ➕ 添加机器人向导：内容由 JS 按步骤渲染（扫码 / 手填 → checklist → 完成） -->
+<!-- ➕ 添加机器人向导：内容由 JS 按步骤渲染（扫码 → checklist → 完成） -->
 <div id="wizMask"><div class="wiz" id="wizBody"></div></div>
 
 <!-- 二次确认弹窗（重启 daemon / 删除机器人等破坏性操作） -->
@@ -2374,14 +2373,12 @@ ${UI_PURE_JS}
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  //  ➕ 添加机器人向导（扫码为主 + 手填降级折叠 → checklist → 完成）
+  //  ➕ 添加机器人向导（扫码 → checklist → 完成）
   // ════════════════════════════════════════════════════════════════════════════
-  var wizStep = 1;          // 1=扫码/手填 2=checklist 3=完成
+  var wizStep = 1;          // 1=扫码 2=checklist 3=完成
   var wizBotId = null;
   var wizPoll = null;       // setup-status 轮询定时器
   var wizSetup = null;
-  var wizTenant = 'feishu';
-  var wizManualOpen = false;
   var wizEs = null;         // 扫码 SSE EventSource
   var wizQrSessionId = null;
   var wizCountdown = null;  // 二维码过期倒计时
@@ -2389,7 +2386,7 @@ ${UI_PURE_JS}
   var wizRestartPrompted = false; // 完成步是否已弹过「重启拉起」确认（一次性）
 
   // 添加机器人是写操作：Feishu Bridge 没在跑时控制台为只读，不能加（与「没启动只读」一致）。
-  // 没在跑就引导先启动，而不是打开向导让用户白填一通再被 501 挡回。
+  // 没在跑就引导先启动，而不是打开向导让用户扫码后再被 501 挡回。
   function tryAddBot() {
     if (daemon && daemon.running) { openWizard(); return; }
     confirmDialog({
@@ -2404,7 +2401,7 @@ ${UI_PURE_JS}
   }
 
   function openWizard() {
-    wizStep = 1; wizBotId = null; wizSetup = null; wizManualOpen = false;
+    wizStep = 1; wizBotId = null; wizSetup = null;
     wizAutoEnabled = false; wizRestartPrompted = false;
     stopWizPoll(); stopWizQr();
     $('wizMask').classList.add('open');
@@ -2442,12 +2439,12 @@ ${UI_PURE_JS}
     return renderWizDone();
   }
 
-  // ── ① 扫码（默认主 CTA）+ 手填折叠（降级 fallback）─────────────────────────
+  // ── ① 扫码注册 ────────────────────────────────────────────────────────────
   function renderWizScan() {
     var w = $('wizBody');
     w.textContent = '';
     w.appendChild(el('h3', null, '➕ 添加机器人'));
-    w.appendChild(el('div', 'note', '用飞书 App 扫一下二维码 —— 自动创建应用、拿密钥入库、设你为管理员。'));
+    w.appendChild(el('div', 'note', '用飞书 App 扫一下二维码 —— 创建或复用应用、拿密钥入库，并自动将你设为管理员。'));
     w.appendChild(wizStepBar(1));
 
     var qrWrap = el('div', 'qrbox');
@@ -2463,13 +2460,6 @@ ${UI_PURE_JS}
     var statusLine = el('div', 'note'); statusLine.id = 'wizScanStatus';
     statusLine.style.textAlign = 'center';
     w.appendChild(statusLine);
-
-    // 手填降级（折叠次级入口）
-    var toggle = el('span', 'adv-toggle', wizManualOpen ? '收起手填 ▲' : '已有飞书应用？手动填 App ID/Secret →');
-    toggle.onclick = function () { wizManualOpen = !wizManualOpen; renderWizManual(manualBox); toggle.textContent = wizManualOpen ? '收起手填 ▲' : '已有飞书应用？手动填 App ID/Secret →'; };
-    w.appendChild(toggle);
-    var manualBox = el('div'); w.appendChild(manualBox);
-    renderWizManual(manualBox);
 
     var actions = el('div', 'actions');
     var cancel = el('button', 'btn', '取消');
@@ -2562,66 +2552,6 @@ ${UI_PURE_JS}
     re.style.marginTop = '8px';
     re.onclick = function () { wrap.textContent = ''; wrap.appendChild(el('div', 'note', '正在生成二维码…')); startWizQr(); };
     wrap.appendChild(re);
-  }
-
-  // ── 手填降级（折叠面板，接既有 POST /api/bots）──────────────────────────────
-  function renderWizManual(box) {
-    box.textContent = '';
-    if (!wizManualOpen) return;
-    box.appendChild(el('hr', 'hr'));
-    box.appendChild(el('label', null, 'App ID'));
-    var idIn = el('input'); idIn.type = 'text'; idIn.id = 'wizAppId'; idIn.placeholder = 'cli_xxxxxxxxxxxxxxxx'; idIn.autocomplete = 'off';
-    box.appendChild(idIn);
-    box.appendChild(el('label', null, 'App Secret'));
-    var secIn = el('input'); secIn.type = 'password'; secIn.id = 'wizAppSecret'; secIn.placeholder = '••••••••••••••••'; secIn.autocomplete = 'new-password';
-    box.appendChild(secIn);
-    box.appendChild(el('div', 'note', '🔒 密钥仅用于一次性探活验证后，加密存储在本机 keystore（AES-256-GCM）；不回显、不进日志。'));
-    box.appendChild(el('label', null, '版本'));
-    var radioRow = el('div', 'radio-row');
-    [['feishu', '飞书（feishu.cn）'], ['lark', 'Lark（larksuite.com）']].forEach(function (pair) {
-      var lbl = el('label'); lbl.style.fontWeight = '400'; lbl.style.margin = '0';
-      var r = el('input'); r.type = 'radio'; r.name = 'wizTenant'; r.value = pair[0];
-      if (pair[0] === wizTenant) r.checked = true;
-      r.onchange = function () { wizTenant = pair[0]; };
-      lbl.appendChild(r); lbl.appendChild(document.createTextNode(' ' + pair[1]));
-      radioRow.appendChild(lbl);
-    });
-    box.appendChild(radioRow);
-    var msg = el('div', 'note'); msg.id = 'wizFormMsg'; msg.style.color = 'var(--red)';
-    box.appendChild(msg);
-    var submit = el('button', 'btn primary', '验证并添加'); submit.id = 'wizSubmit';
-    submit.style.marginTop = '8px';
-    submit.onclick = submitWizForm;
-    box.appendChild(submit);
-  }
-
-  function submitWizForm() {
-    var appId = (($('wizAppId') || {}).value || '').trim();
-    var appSecret = (($('wizAppSecret') || {}).value || '').trim();
-    var msg = $('wizFormMsg');
-    if (msg) msg.textContent = '';
-    if (!appId || !appSecret) { if (msg) msg.textContent = 'App ID 与 App Secret 都要填。'; return; }
-    var btn = $('wizSubmit');
-    btn.textContent = '验证中…'; btn.className = 'btn primary disabled'; btn.disabled = true;
-    fetch('/api/bots', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ appId: appId, appSecret: appSecret, tenant: wizTenant }),
-    }).then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
-      .then(function (resp) {
-        if ($('wizAppSecret')) $('wizAppSecret').value = '';
-        if (resp.status === 201 && resp.body.ok) {
-          stopWizQr();
-          wizBotId = resp.body.bot.appId;
-          wizStep = 2; renderWizard(); startWizPoll();
-        } else {
-          btn.textContent = '验证并添加'; btn.className = 'btn primary'; btn.disabled = false;
-          if (msg) msg.textContent = '❌ ' + (resp.body.message || ('添加失败（HTTP ' + resp.status + '）'));
-        }
-      })
-      .catch(function () {
-        btn.textContent = '验证并添加'; btn.className = 'btn primary'; btn.disabled = false;
-        if (msg) msg.textContent = '❌ 请求失败，请重试。';
-      });
   }
 
   // ── ② checklist（复用 getSetupStatus 5s 轮询）─────────────────────────────

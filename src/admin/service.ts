@@ -22,11 +22,7 @@ import { resolveAppSecret } from '../config/secret-resolver';
 import { diagnoseEventSubscription, type EventDiagnosis } from '../utils/event-diagnosis';
 import { validateAppCredentials } from '../utils/feishu-auth';
 import { buildScopeGrantUrl, buildEventConfigUrl } from '../config/scopes';
-import {
-  registerBotFromCredentials,
-  type RegisterBotResult,
-  type RegisterBotFailure,
-} from '../bot/register-bot';
+import { registerBotFromCredentials } from '../bot/register-bot';
 import {
   startRegistration,
   registrationErrorCode,
@@ -128,20 +124,7 @@ export interface AdminService {
   /** 最近文件日志尾部（JSON lines 文本）。 */
   tailLogs(opts?: { maxBytes?: number }): Promise<string>;
 
-  // ── Web 专属：初始化 / 添加机器人（day-0 场景，飞书 DM 卡片做不到）──────────
-  /**
-   * 直填 appId + appSecret 注册一个机器人：真探活验证密钥 → 进 keystore + bots.json
-   * 注册。这是 day-0 场景——bot 连上之前飞书 DM 卡片不存在，只能从 Web/CLI 手填。
-   * 与每项目写操作（switchBackend 等）不同：注册纯写宿主机级别的 keystore + 注册表，
-   * **不需要 daemon 在跑**（只读预览进程也能注册），所以无 NotWiredYetError 分支。
-   * 绝不 throw——失败落 {@link RegisterBotFailure}（HTTP 层按 code 映射 400/409）。
-   */
-  registerBot(input: {
-    appId: string;
-    appSecret: string;
-    tenant?: 'feishu' | 'lark';
-    desiredName?: string;
-  }): Promise<RegisterBotResult | RegisterBotFailure>;
+  // ── Web 专属：扫码初始化 / 添加机器人（day-0 场景）─────────────────────────
   /**
    * 某 bot 的初始化 checklist 聚合三/四态：密钥有效（探活）/ 长连接在线 / 事件订阅
    * 三态诊断（复用 M-7）/ 缺失 scope 清单 + 一键深链。向导页 5s 轮询它直到「事件已
@@ -154,7 +137,7 @@ export interface AdminService {
    * open_id 自动落成 owner+admin。绝不 throw——失败落 {@link QrRegisterFailure}
    * （HTTP/SSE 层据 code 映射）。callbacks 把 SDK 的 onQr/onStatus 透传给上层做 SSE，
    * signal 取消（abort → SDK reject code='abort'，本方法返回 {ok:false,code:'abort'}）。
-   * 与 registerBot（手填）的差异：扫码**创建新应用**并拿密钥，手填是接入既有应用。
+   * 拿不到扫码人的 open_id 时拒绝落盘，避免产生无人可管理的机器人配置。
    */
   registerBotByQr(opts: {
     signal: AbortSignal;
@@ -231,7 +214,7 @@ export interface AdminService {
   hostDoctor(): Promise<AdminHostDoctor>;
   /**
    * 切换某 bot 的 enabled（= 活跃集 active 字段，bots.json 落盘）。纯写宿主机级
-   * 注册表，不需 daemon 在跑（与 registerBot 同档）。改活跃集需重启 daemon 才生效
+   * 注册表，不需 daemon 在跑。改活跃集需重启 daemon 才生效
    * （提示由 UI 给），这里只落盘。绝不 throw——失败回 {@link BotMutationResult}。
    */
   setBotEnabled(appId: string, enabled: boolean): Promise<BotMutationResult>;
@@ -358,7 +341,7 @@ export interface AdminSetupStatus {
   eventConfigUrl: string;
 }
 
-/** 扫码注册成功：与手填 registerBot 同构的基本信息 + adminOpenId（扫码人 = owner）。
+/** 扫码注册成功：基本信息 + adminOpenId（扫码人 = owner）。
  * 绝不含 client_secret（已进 keystore）。Web SSE 的 done 事件 payload 据此组装。 */
 export interface QrRegisterResult {
   ok: true;
@@ -366,17 +349,25 @@ export interface QrRegisterResult {
   name: string;
   tenant: 'feishu' | 'lark';
   botName?: string;
-  /** 扫码人 open_id（已落成 owner+admin）；SDK 偶尔不返回 → undefined。 */
-  adminOpenId?: string;
+  /** 扫码人 open_id（已落成 owner+admin）。 */
+  adminOpenId: string;
   /** 必需 scope 中尚未授权的（undefined = 没查成；空 = 已齐全）。 */
   missingScopes?: string[];
 }
 
-/** 扫码注册失败：code 来自 SDK reject（abort/expired_token/access_denied）或写盘
- * （persist_failed）/ 校验（credential_rejected）。SSE 据 code 映射前端文案与「重试」。 */
+/** 扫码注册失败：code 来自 SDK reject（abort/expired_token/access_denied）或身份缺失
+ * （identity_missing）/ 写盘（persist_failed）/ 校验（credential_rejected）。 */
 export interface QrRegisterFailure {
   ok: false;
-  code: 'abort' | 'expired_token' | 'access_denied' | 'persist_failed' | 'credential_rejected' | 'network' | 'unknown';
+  code:
+    | 'abort'
+    | 'expired_token'
+    | 'access_denied'
+    | 'identity_missing'
+    | 'persist_failed'
+    | 'credential_rejected'
+    | 'network'
+    | 'unknown';
   reason: string;
 }
 
@@ -439,8 +430,8 @@ export interface AdminServiceDeps {
   /** 停止后台服务的执行器（detached helper，service uninstall）。daemon 进程注入，缺省抛 NotWiredYetError。 */
   stopDaemon?: () => void;
   /**
-   * 只读预览标记（仅 {@link createReadonlyAdminService} 置 true）。置 true 时**注册机器人**
-   * （registerBot / registerBotByQr，属写操作）一律 NotWiredYetError——「没启动只读」：加机器人
+   * 只读预览标记（仅 {@link createReadonlyAdminService} 置 true）。置 true 时扫码注册机器人
+   * （registerBotByQr，属写操作）一律 NotWiredYetError——「没启动只读」：加机器人
    * 必须先有 daemon 在跑。daemon 托管的服务不置此标记，注册照常。
    */
   readonlyPreview?: boolean;
@@ -642,18 +633,6 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       return readRecentLogs({ maxBytes: opts?.maxBytes ?? 64 * 1024 });
     },
 
-    registerBot(input): Promise<RegisterBotResult | RegisterBotFailure> {
-      // 「没启动只读」：只读预览不许加机器人——必须先有 daemon 在跑（前台 run 的引导控制台
-      // 本身就是个在跑的 daemon，第一个 bot 在那里加）。
-      if (deps.readonlyPreview) throw new NotWiredYetError('➕ 添加机器人');
-      return registerBotFromCredentials({
-        appId: input.appId,
-        appSecret: input.appSecret,
-        tenant: input.tenant === 'lark' ? 'lark' : 'feishu',
-        desiredName: input.desiredName,
-      });
-    },
-
     async getSetupStatus(botId: string): Promise<AdminSetupStatus> {
       const reg = await loadBots();
       const entry = reg.bots.find((b) => b.appId === botId);
@@ -725,7 +704,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     },
 
     async registerBotByQr(opts): Promise<QrRegisterResult | QrRegisterFailure> {
-      // 「没启动只读」：只读预览不许扫码加机器人——必须先有 daemon 在跑（见 registerBot）。
+      // 「没启动只读」：只读预览不许扫码加机器人——必须先有 daemon 在跑。
       if (deps.readonlyPreview) throw new NotWiredYetError('➕ 添加机器人');
       // ① 扫码会话：透传 onQr/onStatus 给上层做 SSE；signal 取消 → SDK reject code='abort'。
       let creds;
@@ -735,14 +714,21 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
         const code = registrationErrorCode(err);
         return mapQrFailure(code, registrationErrorMessage(err));
       }
-      // ② 入库：复用手填路径的「探活→keystore→config→bots.json」，扫码人 open_id
-      //    落成 owner+admin（registerBotFromCredentials 的 ownerOpenId 入参）。
+      const ownerOpenId = creds.operatorOpenId?.trim();
+      if (!ownerOpenId) {
+        return {
+          ok: false,
+          code: 'identity_missing',
+          reason: '未获取到扫码人的飞书身份，未保存机器人。请重新扫码并确认授权。',
+        };
+      }
+      // ② 入库：「探活→keystore→config→bots.json」，扫码人 open_id 落成 owner+admin。
       //    明文 client_secret 只此一次喂进去，绝不回显——done payload 永不含它。
       const r = await registerBotFromCredentials({
         appId: creds.clientId,
         appSecret: creds.clientSecret,
         tenant: creds.tenant,
-        ownerOpenId: creds.operatorOpenId,
+        ownerOpenId,
       });
       if (!r.ok) {
         // 写盘 / 探活失败 → 据 register-bot 的 code 映射（invalid_input 理论不该出现，
@@ -757,7 +743,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
         name: r.name,
         tenant: r.tenant,
         botName: r.botName,
-        adminOpenId: creds.operatorOpenId,
+        adminOpenId: ownerOpenId,
         missingScopes: r.missingScopes,
       };
     },
@@ -1045,7 +1031,7 @@ async function probeAllBackends(): Promise<AdminBackendStatus[]> {
  */
 export function createReadonlyAdminService(deps: Pick<AdminServiceDeps, 'startDaemon' | 'applyUpdate'> = {}): AdminService {
   // 只读预览能做的宿主级写操作只有「启动」和「更新」（没启动只读，但这俩是为了让用户能
-  // 起 / 升级 daemon）；readonlyPreview 闸挡掉注册机器人等其余写。
+  // 起 / 升级 daemon）；readonlyPreview 闸挡掉扫码注册等其余写。
   return createAdminService({ startDaemon: deps.startDaemon, applyUpdate: deps.applyUpdate, readonlyPreview: true });
 }
 

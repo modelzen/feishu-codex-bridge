@@ -398,19 +398,3 @@ describe('createAdminService · getSetupStatus（初始化 checklist 聚合）',
     expect(s.scopes.grantUrl).toContain('/auth?q='); // 深链总归得给
   });
 });
-
-describe('createAdminService · registerBot（委托共享注册函数）', () => {
-  it('daemon 托管：registerBot 把 input 透传给共享注册逻辑并回结果（探活打真 API，这里只验证不抛 + 形状）', async () => {
-    // 不 mock 网络时 validateAppCredentials 会真发请求——给个明显非法的 appId 让它
-    // 在格式校验阶段就被 invalid_input 挡掉（绝不出网），验证委托链通即可。
-    const svc = createAdminService({});
-    const r = await svc.registerBot({ appId: '', appSecret: '' });
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.code).toBe('invalid_input');
-  });
-
-  it('只读预览（没启动）：registerBot 抛 NotWiredYetError——加机器人必须先有 daemon 在跑', () => {
-    // 同步抛（registerBot 非 async）：没启动只读，写操作一律挡回。
-    expect(() => createReadonlyAdminService().registerBot({ appId: 'x', appSecret: 'y' })).toThrow(NotWiredYetError);
-  });
-});

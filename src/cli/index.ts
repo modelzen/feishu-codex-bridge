@@ -99,7 +99,7 @@ program
 const bot = program.command('bot').description('飞书机器人管理（多机器人）');
 bot
   .command('init [name]')
-  .description('注册一个飞书机器人并授权（可选短名）')
+  .description('扫码注册一个飞书机器人并授权（可选短名）')
   .action(async (name?: string) => {
     await runBotInit(name);
   });

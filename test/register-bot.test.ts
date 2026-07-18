@@ -63,16 +63,25 @@ beforeEach(() => {
 
 describe('registerBotFromCredentials · 校验', () => {
   it('空 appId / 空 secret → invalid_input（绝不打真 API）', async () => {
-    const r1 = await registerBotFromCredentials({ appId: '', appSecret: 's', tenant: 'feishu' }, okValidate);
+    const r1 = await registerBotFromCredentials(
+      { appId: '', appSecret: 's', tenant: 'feishu', ownerOpenId: 'ou_scanner' },
+      okValidate,
+    );
     expect(r1.ok).toBe(false);
     if (!r1.ok) expect(r1.code).toBe('invalid_input');
-    const r2 = await registerBotFromCredentials({ appId: 'cli_abc123', appSecret: '', tenant: 'feishu' }, okValidate);
+    const r2 = await registerBotFromCredentials(
+      { appId: 'cli_abc123', appSecret: '', tenant: 'feishu', ownerOpenId: 'ou_scanner' },
+      okValidate,
+    );
     expect(r2.ok).toBe(false);
     expect(okValidate).not.toHaveBeenCalled();
   });
 
   it('appId 格式不对 → invalid_input（不以 cli_ 开头）', async () => {
-    const r = await registerBotFromCredentials({ appId: 'not_an_app', appSecret: 'sec', tenant: 'feishu' }, okValidate);
+    const r = await registerBotFromCredentials(
+      { appId: 'not_an_app', appSecret: 'sec', tenant: 'feishu', ownerOpenId: 'ou_scanner' },
+      okValidate,
+    );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.code).toBe('invalid_input');
     expect(okValidate).not.toHaveBeenCalled();
@@ -81,7 +90,7 @@ describe('registerBotFromCredentials · 校验', () => {
   it('探活失败 → credential_rejected，且坏密钥绝不落 keystore', async () => {
     const badValidate = vi.fn(async () => ({ ok: false as const, reason: 'code=10003 msg=invalid' }));
     const r = await registerBotFromCredentials(
-      { appId: 'cli_badbad99', appSecret: 'wrong', tenant: 'feishu' },
+      { appId: 'cli_badbad99', appSecret: 'wrong', tenant: 'feishu', ownerOpenId: 'ou_scanner' },
       badValidate,
     );
     expect(r.ok).toBe(false);
@@ -98,7 +107,7 @@ describe('registerBotFromCredentials · 校验', () => {
 describe('registerBotFromCredentials · 注册落盘', () => {
   it('成功：secret 进 keystore（明文绝不进 config.json）+ bots.json 注册 + 返回基本信息', async () => {
     const r = await registerBotFromCredentials(
-      { appId: 'cli_alpha12345', appSecret: 'super-secret-value', tenant: 'feishu' },
+      { appId: 'cli_alpha12345', appSecret: 'super-secret-value', tenant: 'feishu', ownerOpenId: 'ou_scanner' },
       okValidate,
     );
     expect(r.ok).toBe(true);
@@ -125,13 +134,13 @@ describe('registerBotFromCredentials · 注册落盘', () => {
     expect(reg.current).toBe('cli_alpha12345'); // 首个注册成为 current
   });
 
-  it('幂等：同 appId 重填覆盖 keystore 密钥，不产生重复 entry', async () => {
+  it('幂等：同 appId 重复扫码覆盖 keystore 密钥，不产生重复 entry', async () => {
     await registerBotFromCredentials(
-      { appId: 'cli_dup1234567', appSecret: 'secret-1', tenant: 'feishu' },
+      { appId: 'cli_dup1234567', appSecret: 'secret-1', tenant: 'feishu', ownerOpenId: 'ou_dup' },
       okValidate,
     );
     await registerBotFromCredentials(
-      { appId: 'cli_dup1234567', appSecret: 'secret-2', tenant: 'feishu' },
+      { appId: 'cli_dup1234567', appSecret: 'secret-2', tenant: 'feishu', ownerOpenId: 'ou_dup' },
       okValidate,
     );
     expect(await getSecret(secretKeyForApp('cli_dup1234567'))).toBe('secret-2');
@@ -141,7 +150,7 @@ describe('registerBotFromCredentials · 注册落盘', () => {
 
   it('lark 租户透传给探活与注册', async () => {
     const r = await registerBotFromCredentials(
-      { appId: 'cli_lark1234567', appSecret: 'sec', tenant: 'lark' },
+      { appId: 'cli_lark1234567', appSecret: 'sec', tenant: 'lark', ownerOpenId: 'ou_lark' },
       okValidate,
     );
     expect(r.ok).toBe(true);
@@ -167,14 +176,17 @@ describe('registerBotFromCredentials · ownerOpenId（扫码人 = owner+admin）
     expect(cfg.preferences.access.admins).toContain('ou_scanner');
   });
 
-  it('不传 ownerOpenId → 不强行写空管理员（preferences.access 缺省 = 所有人可建项目）', async () => {
-    await registerBotFromCredentials(
-      { appId: 'cli_noowner1234', appSecret: 'sec', tenant: 'feishu' },
+  it('ownerOpenId 为空 → 拒绝保存无人可管理的配置', async () => {
+    const r = await registerBotFromCredentials(
+      { appId: 'cli_noowner1234', appSecret: 'sec', tenant: 'feishu', ownerOpenId: '   ' },
       okValidate,
     );
-    const cfg = JSON.parse(readFileSync(botPaths('cli_noowner1234').configFile, 'utf8'));
-    // 没有 ownerOpenId → 不写 access（或 access 不含 ownerOpenId），不空写管理员名单
-    expect(cfg.preferences?.access?.ownerOpenId).toBeUndefined();
+    expect(r).toMatchObject({ ok: false, code: 'invalid_input' });
+    if (!r.ok) expect(r.reason).toContain('未获取到扫码人的飞书身份');
+    expect(okValidate).not.toHaveBeenCalled();
+    expect(await getSecret(secretKeyForApp('cli_noowner1234'))).toBeUndefined();
+    expect(() => readFileSync(botPaths('cli_noowner1234').configFile, 'utf8')).toThrow();
+    expect((await loadBots()).bots.find((b) => b.appId === 'cli_noowner1234')).toBeUndefined();
   });
 
   it('幂等：同 appId 重扫 owner，admins 去重不重复堆叠', async () => {

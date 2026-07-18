@@ -101,8 +101,8 @@ export function registrationErrorMessage(err: unknown): string {
 
 /**
  * 命令行扫码向导：在 TTY 前用 ASCII 二维码引导扫码创建 PersonalAgent 应用，返回含
- * 明文 client_secret 的 AppConfig（调用方移进 keystore）。扫码人 open_id 落成
- * owner+admin（缺失则保留「管理员空=所有人可建项目」告警，design §5）。
+ * 明文 client_secret 的 AppConfig（调用方移进 keystore）。扫码人 open_id 必须落成
+ * owner+admin；缺失时拒绝返回配置，避免产生无人可管理的机器人。
  */
 export async function runRegistrationWizard(): Promise<AppConfig> {
   console.log('\n未检测到飞书应用配置，进入扫码创建向导。\n');
@@ -128,19 +128,15 @@ export async function runRegistrationWizard(): Promise<AppConfig> {
   console.log(`  App ID:  ${creds.clientId}`);
   console.log(`  Tenant:  ${creds.tenant}`);
 
+  const ownerOpenId = creds.operatorOpenId?.trim();
+  if (!ownerOpenId) {
+    throw new Error('扫码成功，但未获取到你的飞书身份；未保存机器人。请重新扫码并确认授权。');
+  }
   const cfg: AppConfig = {
     accounts: { app: { id: creds.clientId, secret: creds.clientSecret, tenant: creds.tenant } },
+    preferences: { access: { ownerOpenId, admins: [ownerOpenId] } },
   };
-
-  if (creds.operatorOpenId) {
-    cfg.preferences = { access: { ownerOpenId: creds.operatorOpenId, admins: [creds.operatorOpenId] } };
-    console.log(`  Admin:   ${creds.operatorOpenId} (你自己，已自动加入管理员名单)`);
-  } else {
-    console.log(
-      '  ⚠️ 未拿到扫码用户的 open_id；管理员列表留空 = 所有用户都能私聊建项目。\n' +
-        '     可稍后在 /config 手动设置管理员。',
-    );
-  }
+  console.log(`  Admin:   ${ownerOpenId} (你自己，已自动加入管理员名单)`);
   console.log('');
   return cfg;
 }

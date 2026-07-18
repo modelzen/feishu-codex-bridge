@@ -15,6 +15,7 @@ vi.mock('../src/bot/register-bot', () => ({
 }));
 
 import { createAdminService } from '../src/admin/service';
+import { runRegistrationWizard } from '../src/bot/wizard';
 
 afterEach(() => {
   registerAppMock.mockReset();
@@ -139,20 +140,24 @@ describe('registerBotByQr · 扫码编排', () => {
     if (!r.ok) expect(r.reason).toContain('磁盘满');
   });
 
-  it('SDK 偶尔不返回 open_id：不传 ownerOpenId（保留管理员空告警语义），仍成功', async () => {
+  it('SDK 未返回 open_id：拒绝落盘，避免产生无人可管理的机器人', async () => {
     registerAppMock.mockResolvedValue({ client_id: 'cli_qrnoopen11', client_secret: 'sec', user_info: {} });
-    registerBotFromCredentialsMock.mockResolvedValue({
-      ok: true,
-      name: 'b',
-      appId: 'cli_qrnoopen11',
-      tenant: 'feishu',
-    });
     const svc = createAdminService();
     const r = await svc.registerBotByQr({ signal: new AbortController().signal, onQr: () => {} });
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.adminOpenId).toBeUndefined();
-    expect(registerBotFromCredentialsMock).toHaveBeenCalledWith(
-      expect.objectContaining({ appId: 'cli_qrnoopen11', ownerOpenId: undefined }),
-    );
+    expect(r).toMatchObject({ ok: false, code: 'identity_missing' });
+    if (!r.ok) expect(r.reason).toContain('未获取到扫码人的飞书身份');
+    expect(registerBotFromCredentialsMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('runRegistrationWizard · owner 不变量', () => {
+  it('CLI 扫码返回空白 open_id：拒绝返回无人可管理的配置', async () => {
+    registerAppMock.mockResolvedValue({ client_id: 'cli_qrcli11111', client_secret: 'sec', user_info: { open_id: '   ' } });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      await expect(runRegistrationWizard()).rejects.toThrow('未获取到你的飞书身份');
+    } finally {
+      log.mockRestore();
+    }
   });
 });

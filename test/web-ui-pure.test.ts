@@ -39,6 +39,11 @@ describe('ui.ts UI_PURE_JS 内联进 UI_HTML（同一份字符串，零漂移）
     expect(UI_HTML).toContain('1–1440');
     expect(UI_HTML).toContain('运行卡不显示提醒按钮');
   });
+
+  it('添加机器人只保留扫码，不暴露手填表单或 POST /api/bots', () => {
+    expect(UI_HTML).not.toContain('已有飞书应用？手动填 App ID/Secret');
+    expect(UI_HTML).not.toContain("fetch('/api/bots', {");
+  });
 });
 
 describe('parseRoute —— hash 路由（overview / bot）', () => {
@@ -158,6 +163,10 @@ describe('扫码 SSE 事件处理 —— status / error 文案映射', () => {
   });
   it('error：access_denied → 取消/拒绝文案', () => {
     expect(pure.scanErrorText('access_denied')).toContain('取消');
+  });
+  it('error：identity_missing → 明确未保存并要求重新扫码', () => {
+    expect(pure.scanErrorText('identity_missing')).toContain('没有保存');
+    expect(pure.scanErrorText('identity_missing')).toContain('重新扫码');
   });
   it('error：未知 code → 透传 message，无 message 兜底', () => {
     expect(pure.scanErrorText('persist_failed', '写盘失败')).toBe('写盘失败');
