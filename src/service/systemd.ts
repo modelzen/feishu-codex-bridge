@@ -42,6 +42,7 @@ export function buildUnit(): string {
   const nodePath = process.execPath;
   const cliBinPath = resolveCliBinPath();
   const pathEnv = process.env.PATH ?? '';
+  const codexBinEnv = process.env.CODEX_BIN ? `Environment="CODEX_BIN=${esc(process.env.CODEX_BIN)}"\n` : '';
   return `[Unit]
 Description=feishu-codex-bridge bot
 After=network-online.target
@@ -55,6 +56,7 @@ RestartSec=5
 StandardOutput=append:${serviceStdoutPath()}
 StandardError=append:${serviceStderrPath()}
 Environment="PATH=${esc(pathEnv)}"
+${codexBinEnv}
 
 [Install]
 WantedBy=default.target

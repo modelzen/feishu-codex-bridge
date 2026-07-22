@@ -62,6 +62,7 @@ export function buildLauncherCmd(): string {
   return [
     '@echo off',
     `set "PATH=${process.env.PATH ?? ''}"`,
+    ...(process.env.CODEX_BIN ? [`set "CODEX_BIN=${process.env.CODEX_BIN}"`] : []),
     `set "${SERVICE_ENV_FLAG}=1"`,
     `"${process.execPath}" "${resolveCliBinPath()}" run >> "${serviceStdoutPath()}" 2>> "${serviceStderrPath()}"`,
     '',
