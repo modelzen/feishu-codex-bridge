@@ -3,7 +3,7 @@ import type {
   AppPreferences,
   SecretRef,
 } from '../config/schema';
-import { secretKeyForApp } from '../config/schema';
+import { resolveOwner, secretKeyForApp } from '../config/schema';
 import type { BotEntry } from '../config/bots';
 import { botPaths, paths } from '../config/paths';
 import { loadConfig } from '../config/store';
@@ -48,15 +48,23 @@ export class CliRuntimeHost implements BridgeRuntimeHost {
   }
 
   async loadBotSpecs(): Promise<readonly BridgeRuntimeBotSpec[]> {
-    return this.#bots.map(({ entry, config }) => {
+    const specs: BridgeRuntimeBotSpec[] = [];
+    for (const { entry, config } of this.#bots) {
+      const ownerOpenId = runtimeOwner(config);
+      if (!ownerOpenId) {
+        const message = ownerMissingMessage(entry);
+        console.error(`✗ ${message}；该机器人本次保持离线，其余机器人继续启动。`);
+        this.#publishConfigurationFailure(entry.appId, message);
+        continue;
+      }
       const preferences = runtimePreferences(config.preferences);
       const projectsRoot = preferences?.projectsRootDir;
       const dataDir = botPaths(entry.appId).dir;
-      return {
+      specs.push({
         appId: entry.appId,
         accountSecretRef: secretReference(config.accounts.app.secret, entry.appId),
         tenant: entry.tenant,
-        ownerOpenId: requiredOwner(config, entry),
+        ownerOpenId,
         admins: [...(config.preferences?.access?.admins ?? [])],
         ...(preferences === undefined ? {} : { preferences }),
         dataDir,
@@ -66,8 +74,9 @@ export class CliRuntimeHost implements BridgeRuntimeHost {
         fallbackCwd: typeof projectsRoot === 'string' && projectsRoot.trim()
           ? projectsRoot
           : this.#fallbackCwd,
-      };
-    });
+      });
+    }
+    return specs;
   }
 
   async resolveAppSecret(_secretRef: string, appId: string): Promise<string | undefined> {
@@ -89,6 +98,19 @@ export class CliRuntimeHost implements BridgeRuntimeHost {
 
   onRuntimeEvent(event: BotRuntimeEvent): void {
     this.#onRuntimeEvent?.(event);
+  }
+
+  #publishConfigurationFailure(appId: string, message: string): void {
+    try {
+      this.#onRuntimeEvent?.({
+        type: 'status',
+        appId,
+        status: { connection: 'disconnected', lastError: message },
+        at: Date.now(),
+      });
+    } catch {
+      // Diagnostics from one invalid robot cannot prevent healthy robots starting.
+    }
   }
 }
 
@@ -115,10 +137,13 @@ function secretReference(
     : secret.id;
 }
 
-function requiredOwner(config: AppConfig, entry: BotEntry): string {
-  const owner = config.preferences?.access?.ownerOpenId?.trim();
-  if (owner) return owner;
-  throw new Error(
-    `机器人「${entry.name}」缺少 ownerOpenId，请重新扫码注册后再启动。`,
-  );
+function runtimeOwner(config: AppConfig): string | undefined {
+  // Preserve v0.6.10 compatibility: legacy configs predate ownerOpenId and
+  // resolve their first persisted admin as owner without rewriting user data.
+  const owner = resolveOwner(config)?.trim();
+  return owner || undefined;
+}
+
+function ownerMissingMessage(entry: BotEntry): string {
+  return `机器人「${entry.name}」缺少 ownerOpenId，请重新扫码注册后再启动`;
 }
