@@ -1,9 +1,13 @@
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { mkdir, rename } from 'node:fs/promises';
+import { join } from 'node:path';
 import { paths, botDir } from './paths';
 import { loadConfig } from './store';
 import { isComplete, type TenantBrand } from './schema';
+import {
+  readBridgeBotsFile,
+  writeBridgeBotsFile,
+} from '../runtime/data-store';
 
 /** One saved bot. Credentials' secret lives in the keystore (key `app-<appId>`). */
 export interface BotEntry {
@@ -39,22 +43,11 @@ export interface BotsRegistry {
 const EMPTY: BotsRegistry = { version: 1, bots: [] };
 
 export async function loadBots(): Promise<BotsRegistry> {
-  try {
-    const text = await readFile(paths.botsFile, 'utf8');
-    const reg = JSON.parse(text) as BotsRegistry;
-    return { version: 1, current: reg.current, bots: Array.isArray(reg.bots) ? reg.bots : [] };
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { ...EMPTY };
-    throw err;
-  }
+  return readBridgeBotsFile(paths.botsFile);
 }
 
 export async function saveBots(reg: BotsRegistry): Promise<void> {
-  await mkdir(dirname(paths.botsFile), { recursive: true });
-  const tmp = `${paths.botsFile}.tmp-${process.pid}`;
-  await writeFile(tmp, `${JSON.stringify(reg, null, 2)}\n`, 'utf8');
-  await chmod(tmp, 0o600);
-  await rename(tmp, paths.botsFile);
+  await writeBridgeBotsFile(paths.botsFile, reg);
 }
 
 /**

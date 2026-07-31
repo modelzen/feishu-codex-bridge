@@ -98,6 +98,23 @@ afterAll(() => {
 });
 
 describe('AdminService · getDaemonStatus（聚合 service 状态，mock service 模块）', () => {
+  it('桌面宿主状态 override 优先，完全绕过旧 service adapter', async () => {
+    const desktopStatus = {
+      installed: true,
+      running: true,
+      selfHosted: false,
+      pid: 4321,
+      version: 'desktop-1.0.0',
+      supported: true,
+    };
+    const svc = createAdminService({
+      daemonStatus: async () => desktopStatus,
+    });
+
+    await expect(svc.getDaemonStatus()).resolves.toEqual(desktopStatus);
+    expect(statusMock).not.toHaveBeenCalled();
+  });
+
   it('daemon 进程内：注入 daemonStartedAt → uptimeMs 有值、supported=true', async () => {
     statusMock.mockResolvedValue({
       platformName: 'launchd (macOS)',
@@ -175,9 +192,45 @@ describe('AdminService · restartDaemon / applyUpdate（detached helper 注入�
     expect(u.hasUpdate).toBe(true);
     expect(u.latest).toBe('0.4.0');
   });
+
+  it('桌面更新 override 优先，并等待异步动作完成', async () => {
+    const calls: string[] = [];
+    const svc = createAdminService({
+      checkUpdate: async () => ({
+        current: 'desktop-1.0.0',
+        latest: 'desktop-1.1.0',
+        hasUpdate: true,
+        dev: false,
+      }),
+      updateStatus: () => ({
+        phase: 'installing',
+        at: 123,
+      }),
+      clearUpdateStatus: () => calls.push('clear'),
+      applyUpdate: async () => {
+        await Promise.resolve();
+        calls.push('apply');
+      },
+    });
+
+    expect((await svc.checkUpdate()).current).toBe('desktop-1.0.0');
+    expect(svc.updateStatus()?.phase).toBe('installing');
+    await svc.applyUpdate();
+    expect(calls).toEqual(['clear', 'apply']);
+  });
 });
 
 describe('AdminService · setBotEnabled（活跃集 enabled 落盘）', () => {
+  it('桌面宿主 override 优先，不直写 upstream bots.json', async () => {
+    const before = await loadBots();
+    const route = vi.fn(async () => ({ ok: true as const }));
+    const svc = createAdminService({ setBotEnabled: route });
+
+    await expect(svc.setBotEnabled(BOT_B, false)).resolves.toEqual({ ok: true });
+    expect(route).toHaveBeenCalledWith(BOT_B, false);
+    expect(await loadBots()).toEqual(before);
+  });
+
   it('停用一个 bot → bots.json 的 active=false（其余不变）', async () => {
     const svc = createAdminService();
     const r = await svc.setBotEnabled(BOT_B, false);
@@ -204,6 +257,20 @@ describe('AdminService · setBotEnabled（活跃集 enabled 落盘）', () => {
 });
 
 describe('AdminService · deleteBot（删除 + 保护分支）', () => {
+  it('桌面宿主 override 优先，不直删 upstream registry/keystore/目录', async () => {
+    useBotDir(BOT_B);
+    await addProject({ name: 'keep', chatId: 'oc_keep', cwd: '/tmp/keep', blank: false, createdAt: 1 });
+    await setSecret(secretKeyForApp(BOT_B), 'secret-B');
+    const route = vi.fn(async () => ({ ok: true as const }));
+    const svc = createAdminService({ deleteBot: route });
+
+    await expect(svc.deleteBot(BOT_B)).resolves.toEqual({ ok: true });
+    expect(route).toHaveBeenCalledWith(BOT_B);
+    expect((await loadBots()).bots.some((bot) => bot.appId === BOT_B)).toBe(true);
+    expect(await listSecretIds()).toContain(secretKeyForApp(BOT_B));
+    expect(existsSync(botDir(BOT_B))).toBe(true);
+  });
+
   it('唯一 bot 拒删（给清晰提示），注册表/密钥/目录都不动', async () => {
     await saveBots({ version: 1, current: BOT_A, bots: [{ name: 'alpha', appId: BOT_A, tenant: 'feishu', createdAt: 1, active: true }] });
     await setSecret(secretKeyForApp(BOT_A), 'secret-A');

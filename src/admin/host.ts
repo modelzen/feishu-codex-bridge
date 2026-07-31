@@ -1,6 +1,5 @@
 import { readdir, stat } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { arch, platform, release } from 'node:os';
 import { paths } from '../config/paths';
 import { bridgeVersion } from '../core/version';
@@ -13,7 +12,10 @@ import {
   type BackendCatalogEntry,
 } from '../agent';
 import type { BackendDepState } from '../agent/types';
-import type { ServiceStatus } from '../service/common';
+import {
+  resolveCliBinPath as resolveCompatibilityCliBinPath,
+  type ServiceStatus,
+} from '../service/common';
 import type { UpdateCheck } from '../service/update';
 
 /**
@@ -129,7 +131,9 @@ async function dirBytes(dir: string): Promise<number> {
 
 /** 宿主机体检聚合（绝不抛错）。后端探测由调用方（service 层复用 doctorBackends）
  * 单独并发；这里只管 Node/平台/路径/日志体量这部分宿主机域。 */
-export async function collectHostDoctor(logsDir: string = join(paths.appDir, 'logs')): Promise<HostDoctor> {
+export async function collectHostDoctor(
+  logsDir: string = join(paths.hostDataDir ?? paths.appDir, 'logs'),
+): Promise<HostDoctor> {
   return {
     node: process.version,
     platform: platform(),
@@ -225,8 +229,7 @@ export async function doctorBackends(): Promise<BackendDoctorRow[]> {
  * 同布局。detached helper 必须用绝对路径起（脱离本进程后 cwd / PATH 不可依赖）。
  */
 export function resolveCliBinPath(): string {
-  const distDir = dirname(fileURLToPath(import.meta.url));
-  return resolve(distDir, '..', 'bin', 'feishu-codex-bridge.mjs');
+  return resolveCompatibilityCliBinPath();
 }
 
 export type DaemonControlAction = 'restart' | 'update' | 'start' | 'stop';

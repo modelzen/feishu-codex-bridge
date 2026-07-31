@@ -1,11 +1,15 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
-import { dirname } from 'node:path';
 import { paths } from '../config/paths';
 import type { PermissionMode, ReasoningEffort } from '../agent/types';
+import {
+  readBridgeProjectsFile,
+  writeBridgeProjectsFile,
+} from '../runtime/data-store';
 
 /** A project = a Feishu group bound to a fixed working directory. */
 export interface Project {
+  /** Vonvon runtime switch. Explicit false keeps the project manageable but
+   * prevents message/reaction execution. Omitted preserves upstream behavior. */
+  enabled?: boolean;
   /** unique project name (also the group name) */
   name: string;
   /** the bound Feishu group chat_id (oc_xxx) */
@@ -68,6 +72,11 @@ export interface Project {
   defaultEffort?: ReasoningEffort;
 }
 
+/** Only an explicit false disables execution; old upstream records stay live. */
+export function isProjectEnabled(project: Pick<Project, 'enabled'>): boolean {
+  return project.enabled !== false;
+}
+
 /**
  * Default for 免@ (respond without @) when a project hasn't set `noMention`
  * explicitly. On for everything **except** a *joined* single-session group:
@@ -122,13 +131,6 @@ export function turnTier(
   };
 }
 
-interface StoreFile {
-  version: number;
-  projects: Project[];
-}
-
-const FILE_VERSION = 1;
-
 async function read(): Promise<Project[]> {
   return listProjectsIn(paths.projectsFile);
 }
@@ -137,14 +139,7 @@ async function read(): Promise<Project[]> {
  * 专用——daemon 进程内绝不可用 useBotDir 全局切目录，显式路径才安全。文件缺失
  * 视为空注册表（与当前 bot 路径同语义）。 */
 export async function listProjectsIn(file: string): Promise<Project[]> {
-  try {
-    const text = await readFile(file, 'utf8');
-    const parsed = JSON.parse(text) as Partial<StoreFile>;
-    return Array.isArray(parsed.projects) ? parsed.projects : [];
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw err;
-  }
+  return readBridgeProjectsFile(file);
 }
 
 // 同进程内并发的「读-改-写」串行化（addProject/updateProject/removeProject）：既防
@@ -161,11 +156,7 @@ function withLock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 async function write(projects: Project[]): Promise<void> {
-  await mkdir(dirname(paths.projectsFile), { recursive: true });
-  const tmp = `${paths.projectsFile}.tmp-${process.pid}-${randomUUID()}`;
-  const body: StoreFile = { version: FILE_VERSION, projects };
-  await writeFile(tmp, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
-  await rename(tmp, paths.projectsFile);
+  await writeBridgeProjectsFile(paths.projectsFile, projects);
 }
 
 export async function listProjects(): Promise<Project[]> {

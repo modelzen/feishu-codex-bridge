@@ -65,7 +65,9 @@ function inTestEnv(): boolean {
 export const TEST_LOGS_DIR = join(tmpdir(), 'feishu-codex-bridge-test-logs');
 
 function logsDir(): string {
-  return inTestEnv() ? TEST_LOGS_DIR : join(paths.appDir, 'logs');
+  return inTestEnv()
+    ? TEST_LOGS_DIR
+    : join(paths.hostDataDir ?? paths.appDir, 'logs');
 }
 
 function getStream(): WriteStream | null {

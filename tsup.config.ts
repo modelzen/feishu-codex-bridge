@@ -19,7 +19,10 @@ export default defineConfig([
     external,
   },
   {
-    entry: { index: 'src/index.ts' },
+    entry: {
+      index: 'src/index.ts',
+      runtime: 'src/runtime/index.ts',
+    },
     outDir: 'dist',
     format: ['esm'],
     target: 'node20',

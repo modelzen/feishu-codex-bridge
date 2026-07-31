@@ -9,6 +9,10 @@ import { runWeb } from './commands/web';
 import { runDaemonControl } from './commands/daemon-control';
 import { runWinRelaunch } from '../service/win-startup';
 import { secretsGet, secretsSet, secretsList, secretsRemove } from './commands/secrets';
+import {
+  isBridgeRuntimeWorkerProcess,
+  runBridgeRuntimeWorker,
+} from '../runtime/index';
 
 const program = new Command();
 
@@ -168,7 +172,11 @@ program
     await runHookCommand(options.agent, options.bot);
   });
 
-program.parseAsync(process.argv).catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
-  process.exit(1);
-});
+if (isBridgeRuntimeWorkerProcess()) {
+  runBridgeRuntimeWorker();
+} else {
+  program.parseAsync(process.argv).catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });
+}

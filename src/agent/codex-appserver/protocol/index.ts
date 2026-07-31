@@ -16,5 +16,6 @@ export type {
   ClientRequest,
   InitializeParams,
   InitializeResponse,
+  PlanType,
   ServerNotification,
 } from './generated';

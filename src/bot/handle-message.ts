@@ -51,7 +51,6 @@ import {
   RUN_IDLE_TIMEOUT_MIN_SEC,
   COMPLETION_REMINDER_LONG_TASK_MAX_MINUTES,
   COMPLETION_REMINDER_LONG_TASK_MIN_MINUTES,
-  secretKeyForApp,
   canEnableCliBridge,
   getCliBridgePreferences,
   type AppAccess,
@@ -139,8 +138,14 @@ import {
   type DoctorInfo,
 } from '../card/dm-cards';
 import { cliBridgeSettingsSection, CLI } from '../cli-bridge/cards';
-import { inspectCliBridgeHooks, installCliBridgeHooks, resolveBridgeHookCommand } from '../cli-bridge/hooks';
+import {
+  inspectCliBridgeHooks,
+  installCliBridgeHooks,
+  resolveBridgeHookCommand,
+  resolveBridgeRepairHookCommand,
+} from '../cli-bridge/hooks';
 import type { CliBridgeRuntimeHooks } from '../cli-bridge/service';
+import { currentEmbeddedRuntimeHost } from '../core/runtime-context';
 export type { CliBridgeRuntimeHooks };
 import {
   sendCompletionReminderReply,
@@ -148,12 +153,10 @@ import {
 } from './completion-reminder';
 import {
   acquireUpdateLock,
+  checkUpdate,
   currentVersion,
   daemonRunning,
   installLatest,
-  isDevSource,
-  isNewer,
-  latestVersion,
   restartDaemon,
 } from '../service/update';
 import { fetchUsageBundle } from '../agent/usage';
@@ -168,13 +171,14 @@ import { serviceStdoutPath, serviceStderrPath } from '../service/common';
 import { bridgeVersion } from '../core/version';
 import { webConsoleUrl } from '../web/discovery';
 import { paths } from '../config/paths';
-import { getSecret } from '../config/keystore';
+import { resolveAppSecret } from '../config/secret-resolver';
 import { buildScopeGrantUrl, JOIN_GROUP_SCOPES } from '../config/scopes';
 import { validateAppCredentials } from '../utils/feishu-auth';
 import {
   defaultNoMention,
   getProjectByChatId,
   getProjectByName,
+  isProjectEnabled,
   listProjects,
   removeProject,
   turnTier,
@@ -374,8 +378,9 @@ function backendOptionsFor(mode: PermissionMode): SelectOption[] {
       const installed = e.id === DEFAULT_BACKEND_ID || isBackendEntryInstalled(e);
       return { label: installed ? e.displayName : `${e.displayName}（未下载·去控制台下载）`, value: e.id };
     });
-  // 只剩默认 codex（无真实选择）时不渲染后端区，卡片回到「无后端概念」形态。
-  return opts.length > 1 ? opts : [];
+  // 即使只剩默认 Codex，也把它作为静态 Agent 信息展示；这样飞书与桌面端
+  // 的创建流程始终保留同一组“Agent + 会话方式”配置语义。
+  return opts;
 }
 
 /**
@@ -902,6 +907,10 @@ export function createOrchestrator(
     }
 
     const project = await getProjectByChatId(msg.chatId);
+    if (project && !isProjectEnabled(project)) {
+      log.info('intake', 'reject', { reason: 'project_disabled', chatId: msg.chatId.slice(-6) });
+      return;
+    }
     // @门：没 @ 时只在「项目群 + 免@ 适用」才响应。免@默认开,但 multi 仅话题内、
     // single 整群;非项目群一律不响应非 @ 消息。
     if (!msg.mentionedBot && !(project && shouldRespondWithoutMention(project, msg))) return;
@@ -1234,6 +1243,10 @@ export function createOrchestrator(
     project: Project | undefined,
     perm: TurnPerm,
   ): Promise<void> {
+    if (project && !isProjectEnabled(project)) {
+      log.info('intake', 'reject', { reason: 'project_disabled', chatId: msg.chatId.slice(-6) });
+      return;
+    }
     // Capture title material before ingestContext adds sender/quote/file blocks.
     const titleSource = sessionTitleSourceFromMessage(msg, text);
     // Mid-turn: steer (引导) or queue (排队).
@@ -1325,6 +1338,10 @@ export function createOrchestrator(
     summaryText?: string,
     goal?: boolean,
   ): void {
+    if (project && !isProjectEnabled(project)) {
+      log.info('intake', 'reject', { reason: 'project_disabled', chatId: msg.chatId.slice(-6) });
+      return;
+    }
     // A goal title is the already-extracted objective. Ordinary turns retain
     // the SDK content type so merge-forward/media envelopes can be decoded
     // without applying broad regexes to normal user text.
@@ -2425,6 +2442,9 @@ export function createOrchestrator(
   // hook 安装状态要读 ~/.claude、~/.codex，按需缓存：只有进咖啡子卡 / 修复 hooks 才刷新，
   // 切换通知范围等其它轴的 re-render 复用上次结果，免每次都 fs 读。
   let cliHookStatuses: Awaited<ReturnType<typeof inspectCliBridgeHooks>> | undefined;
+  const embeddedHookCommand = currentEmbeddedRuntimeHost()
+    ? resolveBridgeHookCommand()
+    : undefined;
   function renderSettings(): object {
     return buildSettingsCard(cfg);
   }
@@ -2457,7 +2477,13 @@ export function createOrchestrator(
   /** ☕ 咖啡一下 二级卡：本机离开转发那组控件（总开关 / 通知范围 / 转发后端 / 离开保活 /
    *  hooks）独立渲染。进卡 / 修复 hooks 时刷新一次 hook 安装状态，其它轴的改动复用缓存。 */
   async function renderCoffeeSettings(refreshHooks = false): Promise<object> {
-    if (refreshHooks || !cliHookStatuses) cliHookStatuses = await inspectCliBridgeHooks();
+    if (refreshHooks || !cliHookStatuses) {
+      cliHookStatuses = await inspectCliBridgeHooks(
+        embeddedHookCommand === undefined
+          ? {}
+          : { expectedCommand: embeddedHookCommand },
+      );
+    }
     const cliPrefs = getCliBridgePreferences(cfg);
     const section = cliBridgeSettingsSection({
       enabled: cliPrefs.enabled,
@@ -2721,9 +2747,9 @@ export function createOrchestrator(
   const buildDoctorInfo = async (): Promise<DoctorInfo> => {
     const codexProbe = await backend.doctor({ force: true });
     const app = cfg.accounts.app;
-    // 读 keystore 里的 App Secret → 换 token → 查已开通 scope。任一步失败时
+    // 解析 App Secret（桌面嵌入态走进程内 SecretRef）→ 换 token → 查已开通 scope。任一步失败时
     // missingScopes 留 undefined，卡片显示「无法自动检查」而非误报缺失。
-    const secret = await getSecret(secretKeyForApp(app.id)).catch(() => undefined);
+    const secret = await resolveAppSecret(cfg).catch(() => undefined);
     const scopeCheck = secret
       ? await validateAppCredentials(app.id, secret, app.tenant).catch(() => undefined)
       : undefined;
@@ -2776,8 +2802,19 @@ export function createOrchestrator(
       // so the submit callback acks immediately (createProject is slow).
       void (async () => {
         let result;
-        if (!name) result = buildNewProjectFormCard({ cwd: cwdIn, error: '项目名不能为空', backends });
-        else if (!op) result = buildNewProjectFormCard({ name, cwd: cwdIn, error: '无法识别操作者身份', backends });
+        if (!name) result = buildNewProjectFormCard({
+          cwd: cwdIn,
+          error: '项目名不能为空',
+          backend,
+          backends,
+        });
+        else if (!op) result = buildNewProjectFormCard({
+          name,
+          cwd: cwdIn,
+          error: '无法识别操作者身份',
+          backend,
+          backends,
+        });
         else {
           try {
             const p = await createProject(channel, {
@@ -2791,7 +2828,13 @@ export function createOrchestrator(
             log.info('console', 'new-project', { name: p.name, blank: p.blank, backend: p.backend });
             result = buildNewProjectDoneCard(p);
           } catch (err) {
-            result = buildNewProjectFormCard({ name, cwd: cwdIn, error: err instanceof Error ? err.message : String(err), backends });
+            result = buildNewProjectFormCard({
+              name,
+              cwd: cwdIn,
+              error: err instanceof Error ? err.message : String(err),
+              backend,
+              backends,
+            });
           }
         }
         await sendManagedCard(channel, evt.chatId, result).catch((e) =>
@@ -2875,7 +2918,11 @@ export function createOrchestrator(
       try {
         await installCliBridgeHooks({
           agents: { claude: true, codex: true },
-          command: resolveBridgeHookCommand(cfg.accounts.app.id),
+          // Desktop hooks are machine-global. Keep the original CLI's dynamic
+          // current/enabled bot routing instead of pinning the command to the
+          // bot whose DM card happened to trigger repair.
+          command: embeddedHookCommand
+            ?? resolveBridgeRepairHookCommand(cfg.accounts.app.id),
         });
       } catch (err) {
         log.fail('cli-bridge', err, { phase: 'repair-hooks' });
@@ -2972,19 +3019,22 @@ export function createOrchestrator(
         await updateManagedCard(channel, evt.messageId, buildUpdateCard({ phase: 'checking' })).catch(
           () => undefined,
         );
-        const current = currentVersion();
-        const latest = await latestVersion().catch(() => null);
-        const hasUpdate = !!latest && isNewer(latest, current);
-        log.info('console', 'update-check', { current, latest, hasUpdate });
+        const update = await checkUpdate();
+        log.info('console', 'update-check', {
+          current: update.current,
+          latest: update.latest,
+          hasUpdate: update.hasUpdate,
+        });
         await updateManagedCard(
           channel,
           evt.messageId,
-          buildUpdateCard({ phase: 'checked', current, latest, hasUpdate, dev: isDevSource() }),
+          buildUpdateCard({ phase: 'checked', ...update }),
         ).catch((e) => log.fail('console', e, { phase: 'update-check' }));
       })();
     })
-    // 版本更新（执行）：npm i -g 最新版（async spawn），成功后**先发完成卡再**重启
-    // daemon。重启最终会替换掉当前这个 daemon（卡片回调就跑在它里面）：macOS 走
+    // 版本更新（执行）：桌面宿主只重新渲染手动 HTTPS 下载入口并在这里返回；
+    // standalone legacy CLI 才会 npm i -g，成功后**先发完成卡再**重启 daemon。重启最终会替换掉
+    // 当前这个 daemon（卡片回调就跑在它里面）：macOS 走
     // launchctl kickstart -k（本进程被 kill、launchd 复活），Windows 走「树外
     // relauncher」（本进程不自杀，稍后由树外进程 kill+拉新）。两种都得先让完成卡
     // 渲染落地再触发，否则用户看不到结果。
@@ -2992,6 +3042,15 @@ export function createOrchestrator(
       if (!dmAdmin(evt.operator?.openId)) return;
       void (async () => {
         await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
+        const update = await checkUpdate();
+        if ('mode' in update && update.mode === 'manual') {
+          await updateManagedCard(
+            channel,
+            evt.messageId,
+            buildUpdateCard({ phase: 'checked', ...update }),
+          ).catch(() => undefined);
+          return;
+        }
         const from = currentVersion();
         // 跨进程更新锁（B）：与 Web「升级」共用一把锁，防止两个 `npm i -g` 并发装坏全局
         // 目录。拿不到＝已有更新在跑，直接提示「进行中」并退出，不叠跑第二个安装。
@@ -5176,6 +5235,7 @@ export function createOrchestrator(
       const rec = await getSession(sessionKey);
       if (!rec) return;
       const project = await getProjectByChatId(rec.chatId);
+      if (project && !isProjectEnabled(project)) return;
       if (!isChatAllowed(cfg, rec.chatId) || !isUserAllowedInProject(cfg, project, op)) return;
       const flat = (project?.kind ?? 'multi') === 'single';
       // 合成一条等价的「继续」消息复用整条消息管线（steer/queue/goal 提示全部
@@ -5280,17 +5340,20 @@ export function createOrchestrator(
           break;
         }
         case DM.update: {
-          // 只「检查」最新版、无副作用；真正安装仍需结果卡上的「立即更新」（DM.updateDo）
-          // 二次确认。latestVersion 走异步 execFile（绝不能 spawnSync 冻住 event loop）。
+          // 只检查、无副作用。桌面宿主返回手动 HTTPS 下载入口；standalone legacy
+          // CLI 才保留「立即更新」二次确认。
           const { messageId } = await sendDm(buildUpdateCard({ phase: 'checking' }));
-          const current = currentVersion();
-          const latest = await latestVersion().catch(() => null);
-          const hasUpdate = !!latest && isNewer(latest, current);
-          log.info('console', 'update-check', { current, latest, hasUpdate, via: 'menu' });
+          const update = await checkUpdate();
+          log.info('console', 'update-check', {
+            current: update.current,
+            latest: update.latest,
+            hasUpdate: update.hasUpdate,
+            via: 'menu',
+          });
           await updateManagedCard(
             channel,
             messageId,
-            buildUpdateCard({ phase: 'checked', current, latest, hasUpdate, dev: isDevSource() }),
+            buildUpdateCard({ phase: 'checked', ...update }),
           ).catch((e) => log.fail('console', e, { phase: 'update-check', via: 'menu' }));
           break;
         }

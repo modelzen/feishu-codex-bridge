@@ -83,7 +83,7 @@ const COMPLETION_REMINDER_MODES: readonly CompletionReminderMode[] = ['manual', 
 export function createWebServer(opts: WebServerOptions): WebServer {
   const token = opts.token ?? randomUUID();
   const html = opts.html ?? UI_HTML;
-  const logDir = opts.logDir ?? join(paths.appDir, 'logs');
+  const logDir = opts.logDir ?? join(paths.hostDataDir ?? paths.appDir, 'logs');
   const sseCleanups = new Set<() => void>();
   /** 一条挂在某安装 job 上的 SSE 连接（发数据 + 收尾本连接）。 */
   interface InstallConn {

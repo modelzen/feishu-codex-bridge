@@ -97,8 +97,14 @@ async function pinAnnouncement(channel: LarkChannel, chatId: string): Promise<vo
   );
 }
 
-/** Set the project group's announcement, pin it to the top, persist the branch. */
-export async function setAnnouncement(channel: LarkChannel, project: Project): Promise<void> {
+/**
+ * Set and pin a project group's announcement without mutating the compatibility
+ * registry. Desktop project creation uses this after its own store transaction.
+ */
+export async function publishProjectGroupAnnouncement(
+  channel: LarkChannel,
+  project: Project,
+): Promise<string | undefined> {
   const branch = await currentBranch(project.cwd); // null when not a git repo
   await writeAnnouncement(channel, project.chatId, buildAnnouncementLine(project, branch));
   // Pin is best-effort: the announcement content is already written, so a pin
@@ -108,8 +114,14 @@ export async function setAnnouncement(channel: LarkChannel, project: Project): P
   } catch (err) {
     log.fail('project', err, { phase: 'announcement-pin' });
   }
+  return branch ?? undefined;
+}
+
+/** Set the project group's announcement, pin it to the top, persist the branch. */
+export async function setAnnouncement(channel: LarkChannel, project: Project): Promise<void> {
+  const branch = await publishProjectGroupAnnouncement(channel, project);
   // Persist the real branch only; never store a placeholder.
-  await updateProject(project.name, { branch: branch ?? undefined });
+  await updateProject(project.name, { branch });
 }
 
 /**

@@ -5,7 +5,7 @@ import { log } from '../core/logger';
 import { sep } from 'node:path';
 import { createOrchestrator } from './handle-message';
 import { paths } from '../config/paths';
-import { listProjects } from '../project/registry';
+import { isProjectEnabled, listProjects } from '../project/registry';
 import { createCliBridgeService, shouldStartCliBridge } from '../cli-bridge';
 
 /** True when `cwd` is a registered project's working dir (or a subdir of one) —
@@ -18,6 +18,7 @@ async function cwdIsBoundProject(cwd: string): Promise<boolean> {
   const target = strip(cwd);
   const projects = await listProjects().catch(() => []);
   return projects.some((project) => {
+    if (!isProjectEnabled(project)) return false;
     const root = strip(project.cwd);
     return root.length > 0 && (target === root || target.startsWith(root + sep));
   });
@@ -28,7 +29,14 @@ export interface BridgeOptions {
   appSecret: string;
   /** fallback cwd for groups that aren't registered projects. */
   fallbackCwd: string;
+  /** Optional process adapter observer. It must never own bridge control flow. */
+  onLifecycleEvent?: (event: BridgeLifecycleEvent) => void;
 }
+
+export type BridgeLifecycleEvent =
+  | { type: 'error'; error: unknown }
+  | { type: 'reconnecting' }
+  | { type: 'reconnected' };
 
 export interface BridgeHandle {
   channel: LarkChannel;
@@ -138,9 +146,18 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
     log.fail('ws', err, { phase: 'raw-event-tap' });
   }
   channel.on('reject', (evt) => log.info('intake', 'reject', { reason: evt.reason, msgId: evt.messageId }));
-  channel.on('error', (err) => log.fail('ws', err));
-  channel.on('reconnecting', () => log.info('ws', 'reconnecting'));
-  channel.on('reconnected', () => log.info('ws', 'reconnected'));
+  channel.on('error', (err) => {
+    notifyLifecycle(opts, { type: 'error', error: err });
+    log.fail('ws', err);
+  });
+  channel.on('reconnecting', () => {
+    notifyLifecycle(opts, { type: 'reconnecting' });
+    log.info('ws', 'reconnecting');
+  });
+  channel.on('reconnected', () => {
+    notifyLifecycle(opts, { type: 'reconnected' });
+    log.info('ws', 'reconnected');
+  });
 
   await channel.connect();
   // Never let an optional local-agent IPC bind failure (EADDRINUSE/EACCES) tear
@@ -159,4 +176,12 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
     await channel.disconnect().catch((err) => log.fail('ws', err, { phase: 'disconnect' }));
   };
   return { channel, adminExecute: orchestrator.adminExecute, shutdown };
+}
+
+function notifyLifecycle(opts: BridgeOptions, event: BridgeLifecycleEvent): void {
+  try {
+    opts.onLifecycleEvent?.(event);
+  } catch (err) {
+    log.fail('ws', err, { phase: 'lifecycle-observer' });
+  }
 }

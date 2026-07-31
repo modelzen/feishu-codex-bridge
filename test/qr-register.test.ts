@@ -29,6 +29,26 @@ interface RegisterAppOpts {
 }
 
 describe('registerBotByQr · 扫码编排', () => {
+  it('桌面宿主 override 优先，不启动 upstream 注册或写 keystore', async () => {
+    const route = vi.fn(async () => ({
+      ok: false as const,
+      code: 'abort' as const,
+      reason: '由桌面注册控制器取消',
+    }));
+    const svc = createAdminService({ registerBotByQr: route });
+    const opts = {
+      signal: new AbortController().signal,
+      onQr: vi.fn(),
+    };
+
+    await expect(svc.registerBotByQr(opts)).resolves.toEqual({
+      ok: false,
+      code: 'abort',
+      reason: '由桌面注册控制器取消',
+    });
+    expect(route).toHaveBeenCalledWith(opts);
+  });
+
   it('成功：透传 onQr/onStatus，拿明文密钥后委托 registerBotFromCredentials（含 ownerOpenId），done 不含 secret', async () => {
     registerAppMock.mockImplementation((opts: RegisterAppOpts) => {
       opts.onQRCodeReady({ url: 'https://accounts.feishu.cn/scan?c=1', expireIn: 600 });

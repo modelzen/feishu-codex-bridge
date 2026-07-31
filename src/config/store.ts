@@ -1,18 +1,15 @@
-import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { chmod, mkdir, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { paths } from './paths';
 import type { AppConfig, AppPreferences, TenantBrand } from './schema';
 import { secretKeyForApp } from './schema';
+import {
+  readBridgeConfigFile,
+  writeBridgeConfigFile,
+} from '../runtime/data-store';
 
 export async function loadConfig(path: string = paths.configFile): Promise<Partial<AppConfig>> {
-  try {
-    const text = await readFile(path, 'utf8');
-    return JSON.parse(text) as Partial<AppConfig>;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
-    throw err;
-  }
+  return readBridgeConfigFile(path);
 }
 
 /**
@@ -68,13 +65,7 @@ export async function ensureSecretsGetterWrapper(): Promise<string> {
 // 命中被对方写一半的 tmp → JSON 损坏，或丢写）。
 let saveChain: Promise<unknown> = Promise.resolve();
 export function saveConfig(cfg: AppConfig, path: string = paths.configFile): Promise<void> {
-  const run = saveChain.then(async () => {
-    await mkdir(dirname(path), { recursive: true });
-    const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`;
-    await writeFile(tmp, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
-    await chmod(tmp, 0o600);
-    await rename(tmp, path);
-  });
+  const run = saveChain.then(() => writeBridgeConfigFile(path, cfg));
   saveChain = run.then(
     () => undefined,
     () => undefined,

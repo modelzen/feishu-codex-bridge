@@ -1,8 +1,8 @@
 import { appendFileSync, createReadStream, statSync } from 'node:fs';
 import { appendFile, mkdir, readFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { paths } from '../config/paths';
+import { compatibilityCliBinPath } from '../core/runtime-context';
 
 /**
  * Platform-agnostic snapshot of the background service, produced by whichever
@@ -66,8 +66,7 @@ export function appendServiceErr(tag: string, line: string, filePath: string = s
  * service definitions, which need an absolute ExecStart.
  */
 export function resolveCliBinPath(): string {
-  const distDir = dirname(fileURLToPath(import.meta.url));
-  return resolve(distDir, '..', 'bin', 'feishu-codex-bridge.mjs');
+  return compatibilityCliBinPath();
 }
 
 /**

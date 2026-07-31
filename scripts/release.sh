@@ -47,6 +47,7 @@ step "typecheck / test / build"
 npm run typecheck
 [ "${RELEASE_SKIP_TEST:-0}" = 1 ] || npm test
 npm run build
+npm run verify:package
 
 # ── 选一个 npm 上还不存在的版本号 ───────────────────────
 LOCAL=$(node -p "require('./package.json').version")

@@ -1,5 +1,11 @@
 import { join } from 'node:path';
-import { botDir, paths, useBotDir } from '../config/paths';
+import {
+  botDir,
+  configurePathRoots,
+  paths,
+  useBotDir,
+  type PathRoots,
+} from '../config/paths';
 import { activeBots, currentBot, findBot, loadBots, type BotEntry, type BotsRegistry } from '../config/bots';
 import { loadConfig } from '../config/store';
 import { getCliBridgePreferences, isComplete, type AppConfig } from '../config/schema';
@@ -38,7 +44,16 @@ export async function selectCliBridgeHookBot(
   return firstEnabled ?? current ?? candidates[0];
 }
 
-export async function runHookCommand(agent: string, bot?: string): Promise<void> {
+export type HookPathRoots = Pick<
+  PathRoots,
+  'dataDir' | 'legacyAssetsDir' | 'writableAssetsDir'
+>;
+
+export async function runHookCommand(
+  agent: string,
+  bot?: string,
+  roots?: HookPathRoots,
+): Promise<void> {
   if (agent !== 'claude' && agent !== 'codex') {
     process.stderr.write(`Unsupported hook agent: ${agent}\n`);
     process.exitCode = 2;
@@ -48,8 +63,13 @@ export async function runHookCommand(agent: string, bot?: string): Promise<void>
   // running daemon listens on. Installed hooks include --bot when repaired from a
   // bot daemon; older hooks fall back to the current enabled active bot.
   try {
-    const selected = await selectCliBridgeHookBot(await loadBots(), { requested: bot });
-    if (selected) useBotDir(selected.appId);
+    if (roots) configurePathRoots(roots);
+    if (roots && bot?.trim()) {
+      useBotDir(bot.trim());
+    } else {
+      const selected = await selectCliBridgeHookBot(await loadBots(), { requested: bot });
+      if (selected) useBotDir(selected.appId);
+    }
   } catch {
     if (bot?.trim()) useBotDir(bot.trim());
     // ignore: fall through with the default path

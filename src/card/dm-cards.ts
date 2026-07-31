@@ -201,10 +201,13 @@ export function buildDmMenuCard(opts: { webConsoleUrl?: string; version?: string
   );
 }
 
-/** State for the version-update card across its phases (check → install → done). */
+/** State for legacy install phases and the desktop host's manual-release handoff. */
 export interface UpdateCardState {
   phase: 'checking' | 'checked' | 'updating' | 'done' | 'error';
+  mode?: 'manual';
+  state?: 'unpublished' | 'available' | 'current' | 'unavailable';
   current?: string;
+  compatVersion?: string;
   latest?: string | null;
   /** checked phase: handler-computed `isNewer(latest, current)` */
   hasUpdate?: boolean;
@@ -218,23 +221,26 @@ export interface UpdateCardState {
   willRestart?: boolean;
   /** error phase: tail of npm output */
   message?: string;
+  releasePageUrl?: string;
+  dmgUrl?: string;
+  critical?: boolean;
 }
 
 const backToMenu = () => actions([button('⬅️ 菜单', { a: DM.menu })]);
 
 /**
- * Version-update console card. A single builder renders every phase so the same
- * card updates in place: 查询中 → 查询结果(有/无更新/源码态) → 更新中 → 完成/失败.
- * The 「立即更新」button (checked + hasUpdate) carries DM.updateDo.
+ * Version-update console card. Desktop checks stop at a manual HTTPS handoff;
+ * standalone legacy CLI checks retain their original install phases.
  */
 export function buildUpdateCard(state: UpdateCardState): CardObject {
   switch (state.phase) {
     case 'checking':
-      return card([md('⏳ 正在查询最新版本…'), note('从 npm registry 拉取版本信息，请稍候。')], {
+      return card([md('⏳ 正在查询最新版本…'), note('正在读取发布通道信息，请稍候。')], {
         header: { title: '⬆️ 版本更新', template: 'turquoise' },
       });
 
     case 'checked': {
+      if (state.mode === 'manual') return buildManualUpdateCard(state);
       const cur = state.current ?? '?';
       if (!state.latest) {
         return card(
@@ -308,6 +314,83 @@ export function buildUpdateCard(state: UpdateCardState): CardObject {
         ],
         { header: { title: '⬆️ 版本更新', template: 'red' } },
       );
+  }
+}
+
+function buildManualUpdateCard(state: UpdateCardState): CardObject {
+  const current = state.current ?? '?';
+  const versionLines = [
+    md(`桌面版本：**v${current}**`),
+    ...(state.compatVersion
+      ? [note(`原版兼容内核：v${state.compatVersion}`)]
+      : []),
+  ];
+  if (state.state === 'available' && state.latest) {
+    const downloadUrl = safeHttpsUrl(state.dmgUrl) ?? safeHttpsUrl(state.releasePageUrl);
+    return card(
+      [
+        ...versionLines,
+        md(state.critical
+          ? `⚠️ 发现重要桌面更新：**v${state.latest}**`
+          : `发现桌面新版：**v${state.latest}** 🎉`),
+        note(state.message ?? '请手动下载并安装签名 DMG；Vonvon Bridge 不会自动修改本机应用。'),
+        ...(downloadUrl
+          ? [
+              actions([
+                linkButton(
+                  state.dmgUrl && downloadUrl === safeHttpsUrl(state.dmgUrl)
+                    ? '⬇️ 下载签名 DMG'
+                    : '🌐 打开下载页',
+                  downloadUrl,
+                  'primary',
+                ),
+                button('⬅️ 菜单', { a: DM.menu }),
+              ]),
+            ]
+          : [note('下载入口尚未发布，请稍后重试。'), backToMenu()]),
+      ],
+      { header: { title: '⬆️ Vonvon Bridge 更新', template: state.critical ? 'red' : 'blue' } },
+    );
+  }
+  if (state.state === 'current') {
+    return card(
+      [
+        ...versionLines,
+        md(state.message ?? `当前桌面版本 v${current} 与发布通道一致。`),
+        backToMenu(),
+      ],
+      { header: { title: '⬆️ Vonvon Bridge 更新', template: 'green' } },
+    );
+  }
+  if (state.state === 'unavailable') {
+    return card(
+      [
+        ...versionLines,
+        md(state.message ?? '暂时无法检查桌面更新，请稍后重试。'),
+        actions([button('🔄 重试', { a: DM.update }), button('⬅️ 菜单', { a: DM.menu })]),
+      ],
+      { header: { title: '⬆️ Vonvon Bridge 更新', template: 'orange' } },
+    );
+  }
+  return card(
+    [
+      ...versionLines,
+      md(state.message ?? '桌面更新通道尚未发布，当前为测试构建。'),
+      backToMenu(),
+    ],
+    { header: { title: '⬆️ Vonvon Bridge 更新', template: 'orange' } },
+  );
+}
+
+function safeHttpsUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password
+      ? url.toString()
+      : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -633,38 +716,53 @@ export function buildDoctorCard(i: DoctorInfo): CardObject {
 /**
  * Interactive new-project form: project name + optional CWD + **backend picker**
  * + submit/cancel. The backend is chosen here, at creation, and fixed afterwards
- * (no switching). `backends` lists only the downloaded + permission-compatible
- * options (computed by the handler via {@link projectCreatableBackends}); when
- * just one (codex baseline), it's shown as a static note instead of a dropdown.
+ * (no switching). `backends` lists visible permission-compatible options; an
+ * unavailable install stays labelled so the user can discover it and finish
+ * setup in the desktop app. When just one option remains, it is shown as a
+ * static note instead of a dropdown.
  */
 export function buildNewProjectFormCard(
-  opts: { name?: string; cwd?: string; error?: string; backends?: SelectOption[] } = {},
+  opts: {
+    name?: string;
+    cwd?: string;
+    error?: string;
+    backend?: string;
+    backends?: SelectOption[];
+  } = {},
 ): CardObject {
   const elements = [];
   if (opts.error) elements.push(md(`❌ **创建失败**：${opts.error}`));
   const backends = opts.backends ?? [];
   const formItems: CardElement[] = [
+    note('**基础信息**'),
     input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
     input({ name: 'cwd', label: '文件夹路径（选填，留空自动新建）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
+    note('**项目配置**'),
   ];
   if (backends.length > 1) {
     formItems.push(
-      note('🧠 后端 Agent（创建后**固定不可切换**；标注「未下载」的需先去 Web「后端 Agent」页下载，选它会提示）'),
-      selectMenu({ name: 'backend', placeholder: '选择后端 Agent', options: backends, initial: backends[0]?.value }),
+      note('🧠 Agent（创建后**固定不可切换**；标注「未下载」的需先到桌面端“运行环境”安装）'),
+      selectMenu({
+        name: 'backend',
+        placeholder: '选择 Agent',
+        options: backends,
+        initial: opts.backend ?? backends[0]?.value,
+      }),
     );
   } else if (backends.length === 1) {
-    formItems.push(note(`🧠 后端 Agent：**${backends[0]!.label}**（创建后固定）`));
+    formItems.push(note(`🧠 Agent：**${backends[0]!.label}**（创建后固定）`));
   }
   formItems.push(
-    note('选群类型(直接点对应按钮创建)：👥 多话题群 = @我开话题、每话题独立会话；💬 单会话群 = 整群一个会话、连续上下文。'),
+    note('**会话方式**'),
+    note('👥 **多话题**：@我开启话题，每个话题都是独立会话（推荐）。\n💬 **单会话**：整个群共享一段连续上下文，适合单一长期任务。'),
     actions([
-      submitButton('👥 创建·多话题群', { a: DM.newProjectSubmit, kind: 'multi' }, 'primary', 'submit_multi'),
-      submitButton('💬 创建·单会话群', { a: DM.newProjectSubmit, kind: 'single' }, 'primary', 'submit_single'),
+      submitButton('👥 创建多话题项目', { a: DM.newProjectSubmit, kind: 'multi' }, 'primary', 'submit_multi'),
+      submitButton('💬 创建单会话项目', { a: DM.newProjectSubmit, kind: 'single' }, 'default', 'submit_single'),
     ]),
     actions([button('⬅️ 菜单', { a: DM.menu })]),
   );
   elements.push(
-    md('填项目名（必填）。**文件夹路径留空** = 自动在默认位置新建一个空白项目；**填绝对路径** = 用电脑上已有的文件夹。'),
+    md('填写基础信息，再选择 Agent 与会话方式。**文件夹路径留空**会在默认位置自动新建空白项目；填写绝对路径则使用电脑上的已有文件夹。'),
     form('new_project', formItems),
   );
   return card(elements, { header: { title: '➕ 新建项目', template: 'turquoise' } });
@@ -684,22 +782,25 @@ export function buildJoinGroupFormCard(
   if (opts.error) elements.push(md(`❌ **绑定失败**：${opts.error}`));
   const backends = opts.backends ?? [];
   const formItems: CardElement[] = [
+    note('**基础信息**'),
     input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
     input({ name: 'cwd', label: '文件夹路径（选填，留空自动新建）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
+    note('**项目配置**'),
   ];
   if (backends.length > 1) {
     formItems.push(
-      note('🧠 后端 Agent（绑定后**固定不可切换**）。默认 **Codex** 以「只读」档绑定（外部群安全）。'),
-      selectMenu({ name: 'backend', placeholder: '选择后端 Agent', options: backends, initial: backends[0]?.value }),
+      note('🧠 Agent（绑定后**固定不可切换**）。默认 **Codex** 以“只读”档绑定，降低外部群风险。'),
+      selectMenu({ name: 'backend', placeholder: '选择 Agent', options: backends, initial: backends[0]?.value }),
     );
   } else if (backends.length === 1) {
-    formItems.push(note(`🧠 后端 Agent：**${backends[0]!.label}**（绑定后固定）`));
+    formItems.push(note(`🧠 Agent：**${backends[0]!.label}**（绑定后固定）`));
   }
   formItems.push(
-    note('选群类型(直接点对应按钮创建)：👥 多话题群 = @我开话题、每话题独立会话；💬 单会话群 = 整群一个会话、连续上下文（默认不免@）。'),
+    note('**会话方式**'),
+    note('👥 **多话题**：@我开启话题，每个话题都是独立会话（推荐）。\n💬 **单会话**：整个群共享一段连续上下文；绑定已有群时默认需要 @。'),
     actions([
-      submitButton('👥 绑定·多话题群', { a: DM.joinGroupSubmit, kind: 'multi', chatId: opts.chatId }, 'primary', 'submit_multi'),
-      submitButton('💬 绑定·单会话群', { a: DM.joinGroupSubmit, kind: 'single', chatId: opts.chatId }, 'primary', 'submit_single'),
+      submitButton('👥 绑定为多话题项目', { a: DM.joinGroupSubmit, kind: 'multi', chatId: opts.chatId }, 'primary', 'submit_multi'),
+      submitButton('💬 绑定为单会话项目', { a: DM.joinGroupSubmit, kind: 'single', chatId: opts.chatId }, 'default', 'submit_single'),
     ]),
   );
   elements.push(

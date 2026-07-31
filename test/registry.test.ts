@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { defaultNoMention } from '../src/project/registry';
+import { defaultNoMention, isProjectEnabled } from '../src/project/registry';
+
+describe('isProjectEnabled', () => {
+  it('keeps upstream records enabled unless top-level enabled is explicitly false', () => {
+    expect(isProjectEnabled({})).toBe(true);
+    expect(isProjectEnabled({ enabled: true })).toBe(true);
+    expect(isProjectEnabled({ enabled: false })).toBe(false);
+  });
+});
 
 describe('defaultNoMention', () => {
   // 免@ defaults on everywhere EXCEPT a joined single-session group.

@@ -1,9 +1,11 @@
 import { createRequire } from 'node:module';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { paths } from '../config/paths';
+import { runtimeRequireAnchor } from '../core/runtime-context';
 import type { BackendCatalogEntry } from './catalog';
+import { legacyBackendTombstonePath } from './backend-tombstone';
 
 /**
  * 按需后端依赖的加载器（npm-ondemand 包，库类 / bin 类；通用基础设施，当前内置后端未用）。
@@ -37,6 +39,53 @@ function userAnchor(): string {
   return join(paths.backendsDir, '__backend_anchor__.cjs');
 }
 
+function legacyAnchor(): string | undefined {
+  return paths.legacyBackendsDir === paths.backendsDir
+    ? undefined
+    : join(paths.legacyBackendsDir, '__legacy_backend_anchor__.cjs');
+}
+
+function managedAnchor(): string | undefined {
+  return paths.managedBackendsDir
+    ? join(paths.managedBackendsDir, '__managed_backend_anchor__.cjs')
+    : undefined;
+}
+
+function privateAnchors(pkg: string): string[] {
+  const managed = managedAnchor();
+  const legacy = legacyAnchor();
+  return [
+    ...(managed ? [managed] : []),
+    ...paths.systemNodeModulesDirs.map((root) => (
+      join(dirname(root), '__system_backend_anchor__.cjs')
+    )),
+    userAnchor(),
+    ...(legacy && !isLegacyBackendDisabled(pkg) ? [legacy] : []),
+  ];
+}
+
+/**
+ * Desktop-only package tombstone. Standalone upstream mode has no managed
+ * root, so the original fallback order remains byte-for-byte effective.
+ */
+export function isLegacyBackendDisabled(pkg: string): boolean {
+  if (
+    paths.managedBackendsDir === undefined
+    || paths.legacyBackendsDir === paths.backendsDir
+  ) {
+    return false;
+  }
+  try {
+    lstatSync(legacyBackendTombstonePath(paths.managedBackendsDir, pkg));
+    return true;
+  } catch (error) {
+    // Missing is the only affirmative "enabled" state. If the managed marker
+    // cannot be inspected, fail closed instead of unexpectedly exposing the
+    // read-only legacy package again.
+    return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+  }
+}
+
 /** Node 的 ESM「找不到模块」错误码族（不同 Node 版本/路径写法可能给不同码）。 */
 const NOT_FOUND_CODES = new Set(['ERR_MODULE_NOT_FOUND', 'MODULE_NOT_FOUND', 'ERR_PACKAGE_PATH_NOT_EXPORTED']);
 
@@ -64,14 +113,17 @@ export async function loadBackendDep<T = unknown>(pkg: string): Promise<T> {
     // ——那是真坏，不该被误判为「未安装·可下载」。
     if (!isNotFound(err)) throw err;
   }
-  // ② 用户私装目录（生产默认路径）。
-  let resolved: string;
-  try {
-    resolved = createRequire(userAnchor()).resolve(pkg);
-  } catch {
-    throw new BackendNotInstalledError(pkg);
+  // ② Vonvon 托管目录，再回退原版用户私装目录。
+  for (const anchor of privateAnchors(pkg)) {
+    try {
+      const resolved = resolveExisting(anchor, pkg);
+      if (!resolved) continue;
+      return (await import(pathToFileURL(resolved).href)) as T;
+    } catch (err) {
+      if (!isNotFound(err)) throw err;
+    }
   }
-  return (await import(pathToFileURL(resolved).href)) as T;
+  throw new BackendNotInstalledError(pkg);
 }
 
 /**
@@ -83,37 +135,49 @@ export async function loadBackendDep<T = unknown>(pkg: string): Promise<T> {
 export function isBackendDepInstalled(pkg: string): boolean {
   // ① bridge 自身。
   try {
-    createRequire(import.meta.url).resolve(pkg);
+    createRequire(runtimeRequireAnchor()).resolve(pkg);
     return true;
   } catch {
     /* fall through to user dir */
   }
-  // ② 用户私装目录。
-  try {
-    createRequire(userAnchor()).resolve(pkg);
-    return true;
-  } catch {
-    return false;
+  // ② Vonvon 托管目录与原版用户私装目录。
+  for (const anchor of privateAnchors(pkg)) {
+    try {
+      if (resolveExisting(anchor, pkg)) return true;
+    } catch {
+      // Continue through fixed private roots.
+    }
   }
+  return false;
 }
 
 /**
- * 用户私装目录里某个 npm bin 的绝对路径（npm 装包时生成 node_modules/.bin/<name>[.cmd]）。
+ * 有效私装目录里某个 npm bin 的绝对路径（npm 装包时生成 node_modules/.bin/<name>[.cmd]）。
  * bin 类后端被 **spawn** 而非 import —— 已装判定/命令解析走这里，
  * 不走 {@link isBackendDepInstalled}（bin-only 包通常无 main 入口，require.resolve 必失败）。
  * 命中需 existsSync 复验（卸载/移动自动失效）。找不到 → null。
  */
-export function backendsBinPath(binName: string): string | null {
-  const dir = join(paths.backendsDir, 'node_modules', '.bin');
+export function backendsBinPath(binName: string, pkg?: string): string | null {
+  const roots = [
+    ...(paths.managedBackendsDir ? [paths.managedBackendsDir] : []),
+    paths.backendsDir,
+    ...(paths.legacyBackendsDir === paths.backendsDir || (pkg && isLegacyBackendDisabled(pkg))
+      ? []
+      : [paths.legacyBackendsDir]),
+  ];
   // Windows：cross-spawn 认 .cmd shim；POSIX：.bin/<name> 是带 shebang 的可执行软链。
-  const candidates =
-    process.platform === 'win32' ? [join(dir, `${binName}.cmd`), join(dir, binName)] : [join(dir, binName)];
+  const candidates = roots.flatMap((root) => {
+    const dir = join(root, 'node_modules', '.bin');
+    return process.platform === 'win32'
+      ? [join(dir, `${binName}.cmd`), join(dir, binName)]
+      : [join(dir, binName)];
+  });
   return candidates.find((p) => existsSync(p)) ?? null;
 }
 
 /** 一个 bin 类后端是否已装进用户私装目录（.bin 存在即装了）。绝不抛错。 */
-export function isBackendBinInstalled(binName: string): boolean {
-  return backendsBinPath(binName) !== null;
+export function isBackendBinInstalled(binName: string, pkg?: string): boolean {
+  return backendsBinPath(binName, pkg) !== null;
 }
 
 /**
@@ -126,32 +190,39 @@ export function isBackendBinInstalled(binName: string): boolean {
 export function isBackendEntryInstalled(entry: BackendCatalogEntry): boolean {
   const { kind, binName, pkg } = entry.dep;
   if (kind === 'external-cli') return false;
-  if (binName) return isBackendBinInstalled(binName);
+  if (binName) return isBackendBinInstalled(binName, pkg);
   return pkg ? isBackendDepInstalled(pkg) : false;
 }
 
 /**
- * 一个后端是否装在**用户私装目录**（而非 bridge 自身 node_modules / dev devDep）。
- * 「卸载」只对用户私装目录里的包有意义（uninstallBackendDep 只 rm backendsDir），所以
- * canUninstall 用它判定，避免在 dev/worktree 下让用户「卸载」一个其实在仓库 node_modules
- * 里、点了也删不掉的包。bin 类查 .bin（本就 user-dir-only），库类查 userAnchor resolve。
+ * 一个后端是否可由当前宿主管理/卸载（而非 bridge 自身 node_modules / dev devDep）。
+ * 纯上游模式保持原语义，只检查 backendsDir。桌面模式检查 managed copy；如果只有
+ * 尚未禁用的只读 legacy copy，也返回 true，让 Web 的「卸载」写 tombstone 而不删除
+ * 旧源。bin 类查 .bin，库类查 require.resolve 后再复验解析目标仍存在。
  */
 export function isBackendInstalledInUserDir(entry: BackendCatalogEntry): boolean {
   const { binName, pkg } = entry.dep;
-  if (binName) return isBackendBinInstalled(binName);
-  if (!pkg) return false;
-  try {
-    createRequire(userAnchor()).resolve(pkg);
-    return true;
-  } catch {
-    return false;
+  if (paths.managedBackendsDir !== undefined) {
+    if (binName && backendBinExists(paths.managedBackendsDir, binName)) return true;
+    if (pkg && backendPackageResolves(paths.managedBackendsDir, pkg)) return true;
+    if (paths.legacyBackendsDir === paths.backendsDir || !pkg || isLegacyBackendDisabled(pkg)) {
+      return false;
+    }
+    return binName
+      ? backendBinExists(paths.legacyBackendsDir, binName)
+      : backendPackageResolves(paths.legacyBackendsDir, pkg);
   }
+  if (binName) {
+    return backendBinExists(paths.backendsDir, binName);
+  }
+  if (!pkg) return false;
+  return backendPackageResolves(paths.backendsDir, pkg);
 }
 
 /**
- * 已装后端的版本号（读其 package.json 的 version）。先查用户私装目录（按需下载落点），
- * 再查 bridge 自身 node_modules（dev/worktree）。读不到 → null。绝不抛错。bin 类与库类
- * 都适用（都是 node_modules/<pkg>/package.json）。供后端管理页展示「当前版本」用。
+ * 已装后端的有效版本号（读其 package.json 的 version）。依次检查 managed、桌面
+ * writable、未被 tombstone 的 legacy，最后检查 bridge 自身 node_modules
+ *（dev/worktree）。读不到 → null。绝不抛错。
  */
 export function installedBackendVersion(pkg: string): string | null {
   const readVer = (file: string): string | null => {
@@ -163,14 +234,54 @@ export function installedBackendVersion(pkg: string): string | null {
     }
   };
   // ① 用户私装目录。
+  const inManaged = paths.managedBackendsDir
+    ? join(paths.managedBackendsDir, 'node_modules', ...pkg.split('/'), 'package.json')
+    : undefined;
+  const managedVersion = inManaged ? readVer(inManaged) : null;
+  if (managedVersion) return managedVersion;
   const inUser = join(paths.backendsDir, 'node_modules', ...pkg.split('/'), 'package.json');
   const v1 = readVer(inUser);
   if (v1) return v1;
+  if (
+    paths.legacyBackendsDir !== paths.backendsDir
+    && !isLegacyBackendDisabled(pkg)
+  ) {
+    const inLegacy = join(paths.legacyBackendsDir, 'node_modules', ...pkg.split('/'), 'package.json');
+    const legacyVersion = readVer(inLegacy);
+    if (legacyVersion) return legacyVersion;
+  }
+  for (const root of paths.systemNodeModulesDirs) {
+    const systemVersion = readVer(join(root, ...pkg.split('/'), 'package.json'));
+    if (systemVersion) return systemVersion;
+  }
   // ② bridge 自身（dev/worktree）：用 createRequire 解析包的 package.json 路径。
   try {
-    const resolved = createRequire(import.meta.url).resolve(`${pkg}/package.json`);
+    const resolved = createRequire(runtimeRequireAnchor()).resolve(`${pkg}/package.json`);
     return readVer(resolved);
   } catch {
     return null;
   }
+}
+
+function backendPackageResolves(root: string, pkg: string): boolean {
+  try {
+    return resolveExisting(join(root, '__backend_anchor__.cjs'), pkg) !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+function backendBinExists(root: string, binName: string): boolean {
+  const dir = join(root, 'node_modules', '.bin');
+  const candidates = process.platform === 'win32'
+    ? [join(dir, `${binName}.cmd`), join(dir, binName)]
+    : [join(dir, binName)];
+  return candidates.some((candidate) => existsSync(candidate));
+}
+
+function resolveExisting(anchor: string, pkg: string): string | undefined {
+  const resolved = createRequire(anchor).resolve(pkg);
+  // Node caches successful resolution paths. An uninstall can remove the
+  // target while resolve() still returns that stale path in this process.
+  return existsSync(resolved) ? resolved : undefined;
 }

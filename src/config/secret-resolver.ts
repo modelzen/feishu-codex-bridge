@@ -18,6 +18,20 @@ const ENV_TEMPLATE_RE = /^\$\{([A-Z][A-Z0-9_]{0,127})\}$/;
 const DEFAULT_PROVIDER = 'default';
 const DEFAULT_EXEC_TIMEOUT_MS = 5_000;
 const DEFAULT_EXEC_MAX_OUTPUT = 64 * 1024;
+const runtimeFileSecrets = new Map<string, string>();
+
+/**
+ * Process-only secret injection for hosts that persist encrypted credentials
+ * outside the upstream keystore. The config still contains a non-secret file
+ * reference, while upstream diagnostics that call resolveAppSecret keep
+ * working for the lifetime of the bot process.
+ */
+export function provideRuntimeFileSecret(id: string, value: string): () => void {
+  runtimeFileSecrets.set(id, value);
+  return () => {
+    if (runtimeFileSecrets.get(id) === value) runtimeFileSecrets.delete(id);
+  };
+}
 
 export async function resolveAppSecret(cfg: AppConfig): Promise<string> {
   const appId = cfg.accounts.app.id;
@@ -72,6 +86,8 @@ function resolveEnvRef(ref: SecretRef, pc: ProviderConfig | undefined): string {
 }
 
 async function resolveFileRef(ref: SecretRef, pc: ProviderConfig | undefined): Promise<string> {
+  const runtime = runtimeFileSecrets.get(ref.id);
+  if (runtime !== undefined) return runtime;
   const path = pc?.path ? join(pc.path, ref.id) : ref.id;
   return (await readFile(path, 'utf8')).trim();
 }

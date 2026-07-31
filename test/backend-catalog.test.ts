@@ -1,4 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -14,7 +21,9 @@ import {
 import { backendIds, createBackend } from '../src/agent';
 import {
   BackendNotInstalledError,
+  installedBackendVersion,
   isBackendDepInstalled,
+  isBackendInstalledInUserDir,
   loadBackendDep,
 } from '../src/agent/backend-loader';
 import { buildInstallCommand, stripVersion } from '../src/agent/installer';
@@ -98,15 +107,27 @@ describe('可见 catalog 与注册派生（codex + claude-agent）', () => {
 
 describe('backend-loader：按需依赖加载（三路径）', () => {
   const origBackendsDir = paths.backendsDir;
+  const originalLegacyBackendsDir = paths.legacyBackendsDir;
+  const originalManagedBackendsDir = paths.managedBackendsDir;
+  const originalSystemNodeModulesDirs = paths.systemNodeModulesDirs;
   let userDir: string;
+  let legacyDir: string;
 
   beforeEach(() => {
     userDir = mkdtempSync(join(tmpdir(), 'backends-'));
+    legacyDir = mkdtempSync(join(tmpdir(), 'legacy-backends-'));
     paths.backendsDir = userDir;
+    paths.legacyBackendsDir = legacyDir;
+    paths.managedBackendsDir = undefined;
+    paths.systemNodeModulesDirs = [];
   });
   afterEach(() => {
     paths.backendsDir = origBackendsDir;
+    paths.legacyBackendsDir = originalLegacyBackendsDir;
+    paths.managedBackendsDir = originalManagedBackendsDir;
+    paths.systemNodeModulesDirs = originalSystemNodeModulesDirs;
     rmSync(userDir, { recursive: true, force: true });
+    rmSync(legacyDir, { recursive: true, force: true });
   });
 
   it('① bridge 自身 node_modules 命中：bare import（dev/worktree 模式，不碰用户目录）', async () => {
@@ -130,6 +151,153 @@ describe('backend-loader：按需依赖加载（三路径）', () => {
     expect(isBackendDepInstalled(pkgName)).toBe(true);
     const mod = await loadBackendDep<{ marker: string }>(pkgName);
     expect(mod.marker).toBe('from-user-dir');
+  });
+
+  it('②a desktop-selected system node_modules root remains importable', async () => {
+    const systemPrefix = mkdtempSync(join(tmpdir(), 'system-prefix-'));
+    const systemRoot = join(systemPrefix, 'node_modules');
+    try {
+      paths.systemNodeModulesDirs = [systemRoot];
+      const pkgName = 'fcb-fake-system-pkg';
+      const pkgDir = join(systemRoot, pkgName);
+      mkdirSync(pkgDir, { recursive: true });
+      writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({
+        name: pkgName,
+        version: '3.2.1',
+        main: 'index.mjs',
+      }));
+      writeFileSync(join(pkgDir, 'index.mjs'), 'export const marker = "from-system";\n');
+
+      expect(isBackendDepInstalled(pkgName)).toBe(true);
+      expect(installedBackendVersion(pkgName)).toBe('3.2.1');
+      await expect(loadBackendDep<{ marker: string }>(pkgName))
+        .resolves.toMatchObject({ marker: 'from-system' });
+    } finally {
+      rmSync(systemPrefix, { recursive: true, force: true });
+    }
+  });
+
+  it('②b Vonvon 托管目录优先于原版用户私装目录', async () => {
+    const managedDir = mkdtempSync(join(tmpdir(), 'managed-backends-'));
+    paths.managedBackendsDir = managedDir;
+    const pkgName = 'fcb-fake-managed-pkg';
+    for (const [root, marker] of [[managedDir, 'managed'], [userDir, 'legacy']] as const) {
+      const pkgDir = join(root, 'node_modules', pkgName);
+      mkdirSync(pkgDir, { recursive: true });
+      writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({
+        name: pkgName,
+        version: '1.0.0',
+        main: 'index.mjs',
+      }));
+      writeFileSync(join(pkgDir, 'index.mjs'), `export const marker = "${marker}";\n`);
+    }
+
+    const mod = await loadBackendDep<{ marker: string }>(pkgName);
+    expect(mod.marker).toBe('managed');
+    rmSync(managedDir, { recursive: true, force: true });
+  });
+
+  it('②c 原版后端目录只作为最后一级只读解析回退', async () => {
+    const pkgName = 'fcb-fake-legacy-readonly-pkg';
+    const pkgDir = join(legacyDir, 'node_modules', pkgName);
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({
+      name: pkgName,
+      version: '1.0.0',
+      main: 'index.mjs',
+    }));
+    writeFileSync(join(pkgDir, 'index.mjs'), 'export const marker = "from-legacy-readonly";\n');
+
+    expect(isBackendDepInstalled(pkgName)).toBe(true);
+    const mod = await loadBackendDep<{ marker: string }>(pkgName);
+    expect(mod.marker).toBe('from-legacy-readonly');
+  });
+
+  it('桌面持久禁用记录会隐藏只存在于旧源的后端，而不修改旧包', async () => {
+    const managedDir = mkdtempSync(join(tmpdir(), 'managed-backends-'));
+    try {
+      paths.managedBackendsDir = managedDir;
+      const pkgName = 'fcb-fake-disabled-legacy-pkg';
+      const pkgDir = join(legacyDir, 'node_modules', pkgName);
+      mkdirSync(pkgDir, { recursive: true });
+      writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({
+        name: pkgName,
+        version: '1.2.3',
+        main: 'index.mjs',
+      }));
+      writeFileSync(join(pkgDir, 'index.mjs'), 'export const marker = "legacy-must-stay";\n');
+      const originalPackage = readFileSync(join(pkgDir, 'package.json'), 'utf8');
+      const entry = {
+        dep: { kind: 'npm-ondemand', pkg: pkgName },
+      } as Parameters<typeof isBackendInstalledInUserDir>[0];
+      expect(isBackendDepInstalled(pkgName)).toBe(true);
+      expect(installedBackendVersion(pkgName)).toBe('1.2.3');
+      expect(isBackendInstalledInUserDir(entry)).toBe(true);
+
+      const tombstoneDir = join(managedDir, '.legacy-backend-tombstones-v1');
+      const tombstone = join(
+        tombstoneDir,
+        `${createHash('sha256').update(pkgName).digest('hex')}.disabled`,
+      );
+      mkdirSync(tombstoneDir, { recursive: true });
+      writeFileSync(join(tombstoneDir, '.pending-crashed-write'), 'partial');
+      expect(isBackendDepInstalled(pkgName)).toBe(true);
+      writeFileSync(tombstone, 'disabled\n', { mode: 0o600 });
+
+      expect(isBackendDepInstalled(pkgName)).toBe(false);
+      expect(installedBackendVersion(pkgName)).toBeNull();
+      expect(isBackendInstalledInUserDir(entry)).toBe(false);
+      await expect(loadBackendDep(pkgName)).rejects.toBeInstanceOf(BackendNotInstalledError);
+
+      const managedPackage = join(managedDir, 'node_modules', pkgName);
+      mkdirSync(managedPackage, { recursive: true });
+      writeFileSync(join(managedPackage, 'package.json'), JSON.stringify({
+        name: pkgName,
+        version: '2.0.0',
+        main: 'index.mjs',
+      }));
+      writeFileSync(join(managedPackage, 'index.mjs'), 'export const marker = "managed";\n');
+      expect(isBackendDepInstalled(pkgName)).toBe(true);
+      expect(installedBackendVersion(pkgName)).toBe('2.0.0');
+      expect(isBackendInstalledInUserDir(entry)).toBe(true);
+      await expect(loadBackendDep<{ marker: string }>(pkgName))
+        .resolves.toMatchObject({ marker: 'managed' });
+
+      rmSync(managedPackage, { recursive: true, force: true });
+      expect(isBackendDepInstalled(pkgName)).toBe(false);
+      expect(installedBackendVersion(pkgName)).toBeNull();
+      expect(isBackendInstalledInUserDir(entry)).toBe(false);
+      await expect(loadBackendDep(pkgName)).rejects.toBeInstanceOf(BackendNotInstalledError);
+      expect(readFileSync(join(pkgDir, 'package.json'), 'utf8')).toBe(originalPackage);
+    } finally {
+      rmSync(managedDir, { recursive: true, force: true });
+    }
+  });
+
+  it('纯上游单根模式不启用桌面 tombstone 语义', () => {
+    paths.managedBackendsDir = undefined;
+    paths.legacyBackendsDir = userDir;
+    const pkgName = 'fcb-fake-upstream-single-root-pkg';
+    const pkgDir = join(userDir, 'node_modules', pkgName);
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({
+      name: pkgName,
+      version: '3.0.0',
+      main: 'index.mjs',
+    }));
+    writeFileSync(join(pkgDir, 'index.mjs'), 'export const marker = "upstream";\n');
+    const tombstoneDir = join(userDir, '.legacy-backend-tombstones-v1');
+    mkdirSync(tombstoneDir, { recursive: true });
+    writeFileSync(
+      join(
+        tombstoneDir,
+        `${createHash('sha256').update(pkgName).digest('hex')}.disabled`,
+      ),
+      'disabled\n',
+    );
+
+    expect(isBackendDepInstalled(pkgName)).toBe(true);
+    expect(installedBackendVersion(pkgName)).toBe('3.0.0');
   });
 
   it('③ 两处都没有：抛 BackendNotInstalledError（携带包名）', async () => {

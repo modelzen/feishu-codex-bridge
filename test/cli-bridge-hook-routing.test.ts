@@ -1,7 +1,20 @@
-import { describe, expect, it } from 'vitest';
+import { rmSync } from 'node:fs';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, describe, expect, it } from 'vitest';
 import { selectCliBridgeHookBot } from '../src/cli-bridge';
-import type { BotEntry, BotsRegistry } from '../src/config/bots';
+import { loadBots, type BotEntry, type BotsRegistry } from '../src/config/bots';
+import { configurePathRoots } from '../src/config/paths';
 import type { AppConfig } from '../src/config/schema';
+
+const directories: string[] = [];
+
+afterAll(() => {
+  for (const directory of directories) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 const bots: BotEntry[] = [
   { name: 'alpha', appId: 'app_alpha', tenant: 'feishu', createdAt: 1, active: true },
@@ -54,6 +67,36 @@ describe('cli bridge hook bot routing', () => {
     const selected = await selectCliBridgeHookBot(registry(), {
       loadConfigForBot: loader({ app_alpha: false, app_beta: true }),
     });
+    expect(selected?.appId).toBe('app_beta');
+  });
+
+  it('loads the host-root registry and per-bot configs for an embedded global hook', async () => {
+    const hostDataDir = await mkdtemp(join(tmpdir(), 'vonvon-hook-host-'));
+    const legacyAssetsDir = await mkdtemp(join(tmpdir(), 'vonvon-hook-legacy-'));
+    const writableAssetsDir = await mkdtemp(join(tmpdir(), 'vonvon-hook-assets-'));
+    directories.push(hostDataDir, legacyAssetsDir, writableAssetsDir);
+    configurePathRoots({
+      dataDir: hostDataDir,
+      hostDataDir,
+      legacyAssetsDir,
+      writableAssetsDir,
+    });
+    await writeFile(join(hostDataDir, 'bots.json'), JSON.stringify({
+      version: 1,
+      current: 'app_alpha',
+      bots,
+    }));
+    for (const [appId, enabled] of [['app_alpha', false], ['app_beta', true]] as const) {
+      const botDataDir = join(hostDataDir, 'bots', appId);
+      await mkdir(botDataDir, { recursive: true });
+      await writeFile(
+        join(botDataDir, 'config.json'),
+        JSON.stringify(config(appId, enabled)),
+      );
+    }
+
+    const selected = await selectCliBridgeHookBot(await loadBots());
+
     expect(selected?.appId).toBe('app_beta');
   });
 });

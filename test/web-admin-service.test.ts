@@ -378,6 +378,44 @@ describe('createAdminService · getSetupStatus（初始化 checklist 聚合）',
     expect(s.eventConfigUrl).toContain('/app/cli_setupbot/event');
   });
 
+  it('桌面宿主 secret resolver 可解析 process-only SecretRef', async () => {
+    mkdirSync(botPaths(SETUP_BOT).dir, { recursive: true });
+    writeFileSync(
+      botPaths(SETUP_BOT).configFile,
+      JSON.stringify({
+        accounts: {
+          app: {
+            id: SETUP_BOT,
+            secret: { source: 'file', id: 'desktop-secret-ref' },
+            tenant: 'feishu',
+          },
+        },
+      }),
+    );
+    vi.stubGlobal(
+      'fetch',
+      stubFetch({
+        grantedScopes: [],
+        eventEvents: ['im.message.receive_v1'],
+      }),
+    );
+    const resolveBotSecret = vi.fn(async () => 'desktop-plaintext-secret');
+    const svc = createAdminService({ resolveBotSecret });
+
+    const s = await svc.getSetupStatus(SETUP_BOT);
+
+    expect(resolveBotSecret).toHaveBeenCalledWith(
+      SETUP_BOT,
+      expect.objectContaining({
+        accounts: expect.objectContaining({
+          app: expect.objectContaining({ id: SETUP_BOT }),
+        }),
+      }),
+    );
+    expect(s.credentials.ok).toBe(true);
+    expect(s.event.state).toBe('ok');
+  });
+
   it('缺 scope + 事件未发布：missingRequired 非空、event=unpublished', async () => {
     writeCompleteConfig();
     vi.stubGlobal('fetch', stubFetch({ grantedScopes: ['im:resource'], eventEvents: [], published: false }));

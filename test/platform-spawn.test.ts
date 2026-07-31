@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { delimiter, dirname } from 'node:path';
+import { appServerChildEnvironment } from '../src/agent/codex-appserver/app-server-client';
 import { mergeProcessEnv } from '../src/platform/spawn';
 
 describe('mergeProcessEnv', () => {
@@ -24,5 +26,26 @@ describe('mergeProcessEnv', () => {
   it('keeps base entries untouched when no overrides are given', () => {
     const base = { FOO: 'a', BAR: 'b' };
     expect(mergeProcessEnv(base)).toEqual(base);
+  });
+});
+
+describe('appServerChildEnvironment', () => {
+  it('puts the managed CLI directory first so its sibling Node resolves the npm shebang', () => {
+    const executable = '/app/Vonvon Bridge.app/Contents/Resources/managed/node_modules/.bin/codex';
+    const environment = appServerChildEnvironment(
+      executable,
+      { PATH: ['/usr/bin', '/bin'].join(delimiter), HOME: '/tmp/home' },
+      { FEISHU_TEST: '1' },
+    );
+
+    expect(environment.PATH?.split(delimiter)[0]).toBe(dirname(executable));
+    expect(environment.PATH?.split(delimiter)).toEqual([
+      dirname(executable),
+      '/usr/bin',
+      '/bin',
+    ]);
+    expect(environment.HOME).toBe('/tmp/home');
+    expect(environment.FEISHU_TEST).toBe('1');
+    expect(environment.FEISHU_CODEX_BRIDGE).toBe('1');
   });
 });

@@ -2,10 +2,10 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { homedir, userInfo } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import {
   ensureLogFiles,
+  resolveCliBinPath,
   serviceStderrPath,
   serviceStdoutPath,
   type ServiceStatus,
@@ -22,11 +22,6 @@ interface LaunchctlResult {
 
 export function launchAgentPlistPath(): string {
   return join(homedir(), 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`);
-}
-
-function resolveCliBinPath(): string {
-  const distDir = dirname(fileURLToPath(import.meta.url));
-  return resolve(distDir, '..', 'bin', 'feishu-codex-bridge.mjs');
 }
 
 function escapeXml(value: string): string {

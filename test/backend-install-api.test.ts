@@ -12,7 +12,7 @@ import type { BackendProbe } from '../src/agent/types';
 // 分支验证委托逻辑——它们不对应任何真实后端，只是 catalog 派生机制的最小夹具。
 
 // vi.mock 会被 hoist 到文件顶部 → 共享常量也得 hoist（vi.hoisted）才能被工厂引用。
-const { CATALOG, doctorResults } = vi.hoisted(() => {
+const { CATALOG, doctorResults, backendDiskState } = vi.hoisted(() => {
   const doctorResults: Record<string, BackendProbe> = {
     'codex-appserver': { ok: true, version: '1.2.3' },
     'fake-lib': { ok: false, version: null, hint: '未安装，点下载', depState: 'not-installed', installable: true },
@@ -62,7 +62,11 @@ const { CATALOG, doctorResults } = vi.hoisted(() => {
       blurb: 'bin 类按需装夹具',
     },
   ];
-  return { CATALOG, doctorResults };
+  const backendDiskState = {
+    canUninstall: false,
+    installedVersion: null as string | null,
+  };
+  return { CATALOG, doctorResults, backendDiskState };
 });
 
 vi.mock('../src/agent', () => ({
@@ -80,14 +84,25 @@ vi.mock('../src/agent', () => ({
   isInstallable: (entry: { dep: { kind: string } }) => entry.dep.kind === 'npm-ondemand',
   effectiveDefaultBackend: async () => 'codex-appserver',
   installBackendDep: vi.fn(),
-  isBackendInstalledInUserDir: () => false,
-  installedBackendVersion: () => null,
+  isBackendInstalledInUserDir: () => backendDiskState.canUninstall,
+  installedBackendVersion: () => backendDiskState.installedVersion,
   latestNpmVersion: async () => null,
 }));
 
 import { createAdminService, NotWiredYetError } from '../src/admin/service';
 
-afterEach(() => vi.clearAllMocks());
+afterEach(() => {
+  vi.clearAllMocks();
+  backendDiskState.canUninstall = false;
+  backendDiskState.installedVersion = null;
+  doctorResults['fake-lib'] = {
+    ok: false,
+    version: null,
+    hint: '未安装，点下载',
+    depState: 'not-installed',
+    installable: true,
+  };
+});
 
 describe('listBackendCatalog · 状态聚合', () => {
   it('聚合 catalog + 三态 depState/installable/version/approxSize + 默认标记', async () => {
@@ -124,6 +139,52 @@ describe('listBackendCatalog · 状态聚合', () => {
       installable: true,
       approxSizeMB: 65,
     });
+  });
+
+  it('installed/version/canUninstall 使用同一有效后端状态，禁用后同时回到未安装', async () => {
+    backendDiskState.canUninstall = true;
+    backendDiskState.installedVersion = '1.2.3';
+    doctorResults['fake-lib'] = {
+      ok: true,
+      version: '1.2.3',
+      depState: 'installed',
+    };
+    const svc = createAdminService();
+
+    await expect(svc.listBackendCatalog()).resolves.toEqual(expect.objectContaining({
+      entries: expect.arrayContaining([
+        expect.objectContaining({
+          id: 'fake-lib',
+          depState: 'installed',
+          installable: false,
+          version: '1.2.3',
+          installedVersion: '1.2.3',
+          canUninstall: true,
+        }),
+      ]),
+    }));
+
+    backendDiskState.canUninstall = false;
+    backendDiskState.installedVersion = null;
+    doctorResults['fake-lib'] = {
+      ok: false,
+      version: null,
+      hint: '未安装，点下载',
+      depState: 'not-installed',
+      installable: true,
+    };
+    await expect(svc.listBackendCatalog()).resolves.toEqual(expect.objectContaining({
+      entries: expect.arrayContaining([
+        expect.objectContaining({
+          id: 'fake-lib',
+          depState: 'not-installed',
+          installable: true,
+          version: null,
+          installedVersion: null,
+          canUninstall: false,
+        }),
+      ]),
+    }));
   });
 });
 
@@ -180,5 +241,19 @@ describe('installBackend · installer 委托 + 守门', () => {
     await expect(svc.installBackend('fake-lib')).rejects.toBeInstanceOf(NotWiredYetError);
     // bin 类同样是 installable（npm-ondemand bin 类）→ 同样走 501 引导起 daemon
     await expect(svc.installBackend('fake-bin')).rejects.toBeInstanceOf(NotWiredYetError);
+  });
+});
+
+describe('uninstallBackend · desktop disable route', () => {
+  it('允许当前有效的 managed/legacy 后端委托桌面卸载或 tombstone 路由', async () => {
+    backendDiskState.canUninstall = true;
+    const uninstaller = vi.fn(async () => true);
+    const svc = createAdminService({ uninstallBackend: uninstaller });
+
+    await expect(svc.uninstallBackend('fake-lib')).resolves.toEqual({
+      ok: true,
+      message: '已卸载「假后端（库类）」。',
+    });
+    expect(uninstaller).toHaveBeenCalledWith('@example/fake-lib');
   });
 });

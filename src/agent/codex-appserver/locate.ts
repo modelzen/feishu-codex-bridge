@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { extname, join } from 'node:path';
 import { paths } from '../../config/paths';
 import { spawnProcess, spawnProcessSync } from '../../platform/spawn';
+import { appServerChildEnvironment } from './app-server-client';
 
 const IS_WIN = process.platform === 'win32';
 
@@ -15,9 +16,11 @@ const versionCache = new Map<string, string>();
 /**
  * Resolve the codex CLI binary, in priority order:
  *   1. $CODEX_BIN (explicit override)
- *   2. PATH (`codex`, via `where`/`which`)
- *   3. bridge private install (~/.feishu-codex-bridge/codex-cli/node_modules/.bin/codex)
- *   4. macOS Codex.app bundled binary
+ *   2. Vonvon-managed Codex
+ *   3. PATH (`codex`, via `where`/`which`)
+ *   4. macOS Homebrew locations (Finder launches with a minimal PATH)
+ *   5. bridge private install (~/.feishu-codex-bridge/codex-cli/node_modules/.bin/codex)
+ *   6. macOS Codex.app bundled binary
  * Returns null if none found.
  *
  * On Windows an npm-installed bin is a `codex.cmd`/`codex.exe` shim, never a
@@ -34,8 +37,18 @@ function locateBin(): string | null {
   const env = process.env.CODEX_BIN;
   if (env && existsSync(env)) return env;
 
+  if (paths.managedCodexBin && existsSync(paths.managedCodexBin)) {
+    return paths.managedCodexBin;
+  }
+
   const onPath = which('codex');
   if (onPath) return onPath;
+
+  if (process.platform === 'darwin') {
+    for (const candidate of ['/opt/homebrew/bin/codex', '/usr/local/bin/codex']) {
+      if (existsSync(candidate)) return candidate;
+    }
+  }
 
   for (const cand of execCandidates(paths.codexCliBinDir, 'codex')) {
     if (existsSync(cand)) return cand;
@@ -91,7 +104,10 @@ export function codexVersion(bin: string, opts?: { force?: boolean }): string | 
   let out: string | null;
   try {
     // cross-spawn so a Windows `.cmd` shim runs (avoids execFile EINVAL).
-    const res = spawnProcessSync(bin, ['--version'], { encoding: 'utf8' });
+    const res = spawnProcessSync(bin, ['--version'], {
+      encoding: 'utf8',
+      env: appServerChildEnvironment(bin),
+    });
     out = res.status === 0 && typeof res.stdout === 'string' ? res.stdout.trim() : null;
   } catch {
     out = null;
@@ -112,7 +128,10 @@ export async function codexVersionAsync(bin: string, opts?: { force?: boolean })
     let child;
     try {
       // 同 codexVersion：cross-spawn 跑 Windows `.cmd` shim（裸 execFile 会 EINVAL）。
-      child = spawnProcess(bin, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
+      child = spawnProcess(bin, ['--version'], {
+        env: appServerChildEnvironment(bin),
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
     } catch {
       resolve(null);
       return;

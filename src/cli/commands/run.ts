@@ -1,57 +1,75 @@
 import { ensureOnboarded, announceEventsWhenLive } from '../../bot/onboarding';
-import { startBridge } from '../../bot/bridge';
-import { runSupervisor } from '../../bot/supervisor';
 import { acquireSingleInstanceLock, BridgeAlreadyRunningError } from '../../core/single-instance';
+import { acquireHostRuntimeLease, RuntimeAlreadyOwnedError, type HostRuntimeLease } from '../../core/runtime-lock';
 import { clearServicePid, recordServicePid } from '../../service/win-startup';
-import { activeBots, loadBots } from '../../config/bots';
+import {
+  activeBots,
+  findBot,
+  loadBots,
+  type BotEntry,
+} from '../../config/bots';
 import { log } from '../../core/logger';
 import { AdminWriteError } from '../../admin/ops';
-import { createAdminIpcResponder } from '../../admin/ipc';
 import { createAdminService } from '../../admin/service';
 import { installBackendDep, uninstallBackendDep } from '../../agent';
 import { spawnDaemonControl } from './daemon-control';
 import { mountWebConsole, type MountedWebConsole } from '../../web/mount';
+import {
+  startBridgeRuntime,
+  type RunningBridgeRuntime,
+} from '../../runtime/index';
+import {
+  CliRuntimeHost,
+  type PreparedCliBot,
+} from '../runtime-host';
 
 /**
- * `run` — foreground long-connection bot(s).
+ * CLI host for the same public Runtime embedded by Vonvon Bridge.
  *
- * Dispatch:
- *   - `run --bot <name>` (explicit selector) → run that ONE bot inline.
- *   - `run` with a single active bot (or a legacy single-bot install) → run it
- *     inline, exactly as before. This keeps the proven npx single-process path.
- *   - `run` with multiple active bots (`bot use` picked a set) → hand off to the
- *     multi-process supervisor, one child process per bot.
- *
- * Inline runs onboard first (scan-QR if no bot is configured yet — "init if not
- * initialized"), take the per-bot single-instance lock, then bring up the
- * bridge. SIGINT/SIGTERM trigger a graceful teardown that closes every codex
- * session (no orphan app-servers) and drops the WS before exiting.
+ * Terminal, daemon, and Web-console concerns stay here. Runtime owns one
+ * worker per robot, readiness, restart policy, and administrative routing.
  */
 export async function runRun(botName?: string): Promise<void> {
-  // Explicit selector always runs exactly that one bot inline (this is also how
-  // the supervisor launches each child: `run --bot <appId>`).
-  if (botName) {
-    await runSingle(botName);
-    return;
+  let hostLease: HostRuntimeLease | undefined;
+  if (!process.send) {
+    try {
+      hostLease = acquireHostRuntimeLease({
+        owner: { kind: 'cli', product: 'feishu-codex-bridge' },
+      });
+    } catch (error) {
+      if (error instanceof RuntimeAlreadyOwnedError) {
+        clearServicePid();
+        console.error(`✗ ${error.message}`);
+        log.info('run', 'runtime-already-owned', {
+          owner: error.owner.kind,
+          pid: error.owner.pid,
+        });
+        process.exitCode = 1;
+        return;
+      }
+      throw error;
+    }
   }
 
-  // No selector: bring up the active set. 0/1 → inline (preserve the simple
-  // single-process path, incl. first-run onboarding); ≥2 → supervisor.
-  const active = activeBots(await loadBots());
-  // 零 bot + 非交互（典型：用户把一句话发给 codex/claude，它非交互地 run，没 TTY 没法
-  // 终端扫码）→ 起「引导控制台」：不连任何 bot，只挂可写 Web 控制台让用户在浏览器里扫码
-  // 创建第一个机器人（registerBotByQr 自给自足，不需要在跑的 bot）。TTY 仍走终端扫码向导。
-  if (active.length === 0 && !process.stdout.isTTY) {
-    await runOnboardingConsole();
-    return;
+  try {
+    const registry = await loadBots();
+    const selected = botName
+      ? selectedBot(registry, botName)
+      : activeBots(registry);
+    if (selected.length === 0 && !botName && !process.stdout.isTTY) {
+      await runOnboardingConsole();
+      return;
+    }
+    const prepared = await prepareBots(selected, botName);
+    if (prepared.length === 0) {
+      process.exitCode = 1;
+      return;
+    }
+    await runPublicRuntime(prepared);
+  } finally {
+    hostLease?.release();
   }
-  if (active.length > 1) {
-    await runSupervisor(active);
-    return;
-  }
-  await runSingle(active[0]?.name);
 }
-
 /**
  * 零 bot 引导守护：还没有任何机器人时，不报错退出，而是只起一个**可写**的 Web 控制台，
  * 用户在浏览器里扫码创建第一个机器人即可（registerBotByQr 不依赖任何在跑的 bot）。创建后
@@ -124,132 +142,119 @@ async function runOnboardingConsole(): Promise<void> {
   await new Promise<never>(() => {});
 }
 
-/** Run a single bot inline in this process. `botName` undefined → the implicit
- *  current/default bot (with first-run onboarding allowed). */
-async function runSingle(botName?: string): Promise<void> {
-  const ready = await ensureOnboarded({ allowCreate: !botName, bot: botName });
-  if (!ready) {
-    process.exitCode = 1;
+function selectedBot(
+  registry: Awaited<ReturnType<typeof loadBots>>,
+  nameOrAppId: string,
+): BotEntry[] {
+  const bot = findBot(registry, nameOrAppId);
+  return bot === undefined ? [] : [bot];
+}
+
+async function prepareBots(
+  selected: readonly BotEntry[],
+  explicitName: string | undefined,
+): Promise<PreparedCliBot[]> {
+  if (selected.length === 0) {
+    const ready = await ensureOnboarded({
+      allowCreate: explicitName === undefined,
+      ...(explicitName === undefined ? {} : { bot: explicitName }),
+    });
+    if (!ready) return [];
+    const registry = await loadBots();
+    const entry = findBot(registry, ready.cfg.accounts.app.id);
+    if (!entry) return [];
+    return [{ entry, config: ready.cfg, initialSecret: ready.secret }];
+  }
+
+  const prepared: PreparedCliBot[] = [];
+  for (const entry of selected) {
+    const ready = await ensureOnboarded({ bot: entry.appId });
+    if (!ready) continue;
+    prepared.push({
+      entry,
+      config: ready.cfg,
+      initialSecret: ready.secret,
+    });
+  }
+  return prepared;
+}
+
+async function runPublicRuntime(prepared: readonly PreparedCliBot[]): Promise<void> {
+  recordServicePid();
+  console.log(`\n正在启动 ${prepared.length} 个机器人（公共 Bridge Runtime）：`);
+  for (const bot of prepared) {
+    console.log(`  • ${bot.entry.name}  (${bot.entry.appId})  [${bot.entry.tenant}]`);
+  }
+  console.log('私聊我 `/new <名>` 建项目；在项目群里 @我 干活。Ctrl+C 退出。\n');
+
+  const runtime = await startBridgeRuntime(new CliRuntimeHost({ bots: prepared }));
+  for (const ready of prepared) {
+    void announceEventsWhenLive({
+      cfg: ready.config,
+      secret: ready.initialSecret,
+    });
+  }
+
+  const startedAt = Date.now();
+  const webConsole = await mountRuntimeWebConsole(runtime, startedAt);
+  printWebConsole(webConsole);
+  await waitForRuntimeStop(runtime, webConsole);
+}
+
+async function mountRuntimeWebConsole(
+  runtime: RunningBridgeRuntime,
+  startedAt: number,
+): Promise<MountedWebConsole | undefined> {
+  return await mountWebConsole(
+    createAdminService({
+      executeWrite: async (botId, operation) => {
+        if (!runtime.status(botId)) {
+          throw new AdminWriteError(`机器人「${botId}」不在当前活跃集中。`);
+        }
+        await runtime.executeAdmin(botId, operation);
+      },
+      liveStatus: async (botId) => runtime.status(botId),
+      daemonStartedAt: startedAt,
+      restartDaemon: () => spawnDaemonControl('restart'),
+      applyUpdate: () => spawnDaemonControl('update'),
+      stopDaemon: () => spawnDaemonControl('stop'),
+      installBackend: installBackendDep,
+      uninstallBackend: uninstallBackendDep,
+    }),
+  );
+}
+
+function printWebConsole(webConsole: MountedWebConsole | undefined): void {
+  if (!webConsole) return;
+  if (process.stdout.isTTY) {
+    console.log(`🌐 Web 控制台：${webConsole.url}`);
+    console.log('   仅本机可访问（127.0.0.1）；URL 含 token 勿外传。也可随时 `feishu-codex-bridge web` 重新打开。\n');
     return;
   }
-  const { cfg, secret } = ready;
+  console.log(
+    `🌐 Web 控制台已内嵌启动（127.0.0.1:${webConsole.port}）：` +
+    '运行 `feishu-codex-bridge web` 获取登录链接。',
+  );
+}
 
-  // Refuse to run alongside another bridge for the same app — two long
-  // connections split card callbacks and make buttons flaky (see module doc).
-  let releaseLock: () => void;
-  try {
-    releaseLock = acquireSingleInstanceLock(cfg.accounts.app.id);
-  } catch (err) {
-    if (err instanceof BridgeAlreadyRunningError) {
-      // startNow (Windows service) eagerly wrote our pid to service.pid before we
-      // lost the lock — drop it so it doesn't linger as a dead pid (no-op unless
-      // service.pid still points at us; the live winner keeps its own).
-      clearServicePid();
-      console.error(`✗ ${err.message}`);
-      log.info('run', 'already-running', { pid: err.pid });
-      process.exitCode = 1;
-      return;
+async function waitForRuntimeStop(
+  runtime: RunningBridgeRuntime,
+  webConsole: MountedWebConsole | undefined,
+): Promise<void> {
+  await new Promise<void>((resolve) => {
+    let stopping = false;
+    const stop = (signal: NodeJS.Signals): void => {
+      if (stopping) return;
+      stopping = true;
+      console.log(`\n收到 ${signal}，正在优雅退出（关闭所有 Agent 会话）…`);
+      void (webConsole?.close() ?? Promise.resolve())
+        .catch(() => undefined)
+        .then(() => runtime.stop())
+        .catch((error) => log.fail('run', error, { phase: 'shutdown' }))
+        .finally(resolve);
+    };
+    for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+      process.once(signal, () => stop(signal));
     }
-    throw err;
-  }
-
-  // If launched as the Windows background service, publish our PID so
-  // `status`/`stop` can find us (no-op for a foreground run / other platforms /
-  // a supervised child, whose service env flag the supervisor strips).
-  recordServicePid();
-
-  const fallbackCwd = process.env.FEISHU_CODEX_CWD || process.cwd();
-  console.log('\n正在启动长连接 bot…');
-  console.log('私聊我 `/new <名>` 建项目；在项目群里 @我 干活。Ctrl+C 退出。\n');
-  const handle = await startBridge({ cfg, appSecret: secret, fallbackCwd });
-  // 长连接已在线（事件页保存的硬前置）→ 事件未订阅时自动开配置深链 + 轮询版本 API，
-  // 配置生效后播报「事件已生效」。fire-and-forget，自身绝不 throw。
-  void announceEventsWhenLive(ready);
-
-  // ── Web 控制台 / supervisor IPC（按进程形态二选一）────────────────────────
-  let webConsole: MountedWebConsole | undefined;
-  if (process.send) {
-    // supervisor 子进程（'ipc' stdio）：控制台由 supervisor 聚合挂载，本进程只
-    // 接写请求——在进程内执行（registry withLock + 共享校验 + 驱逐 LIVE 会话，
-    // 这正是写操作必须 IPC 转发、不能 supervisor 文件直写的原因）。status 请求
-    // 回报真实 WS 连接状态，替代锁文件探测。
-    const respond = createAdminIpcResponder(
-      async (op) => {
-        if (op.kind === 'status') {
-          return { connection: handle.channel.getConnectionStatus?.()?.state ?? 'unknown' };
-        }
-        await handle.adminExecute(op);
-        return { done: true };
-      },
-      (msg) => void process.send?.(msg),
-    );
-    process.on('message', respond);
-  } else {
-    // 独立 daemon（单 bot inline）：进程内挂全局控制台。本 bot 的写/实时状态走
-    // 进程内 orchestrator；其他已注册 bot 仍可只读快照（写需该 bot 进程在跑——
-    // 多 bot 写请用 `bot use` 选多个后由 supervisor 聚合）。
-    const ownAppId = cfg.accounts.app.id;
-    const startedAt = Date.now();
-    webConsole = await mountWebConsole(
-      createAdminService({
-        executeWrite: async (botId, op) => {
-          if (botId !== ownAppId) {
-            throw new AdminWriteError(
-              '该机器人不归本进程管：当前是单 bot 运行模式，只能改本 bot 的项目。多 bot 请 `bot use` 勾选后重启，由 supervisor 聚合管理。',
-            );
-          }
-          await handle.adminExecute(op);
-        },
-        liveStatus: async (botId) =>
-          botId === ownAppId
-            ? {
-                running: true,
-                pid: process.pid,
-                startedAt,
-                connection: handle.channel.getConnectionStatus?.()?.state ?? 'unknown',
-              }
-            : undefined,
-        daemonStartedAt: startedAt,
-        // 重启 / 升级 / 停止走 detached helper：本进程被 service stop 杀掉后由 helper 续命。
-        restartDaemon: () => spawnDaemonControl('restart'),
-        applyUpdate: () => spawnDaemonControl('update'),
-        stopDaemon: () => spawnDaemonControl('stop'),
-        // 按需后端安装在 daemon 进程内直跑（owns runtime，装完即能解析加载）。
-        installBackend: installBackendDep,
-        uninstallBackend: uninstallBackendDep,
-      }),
-    );
-    if (webConsole) {
-      if (process.stdout.isTTY) {
-        // 含 token 的 URL 只在前台 TTY 打印；后台 daemon 的 stdout 会被 launchd/
-        // systemd 重定向落盘——token 绝不进日志，后台改用 `web` 命令经 0600 发现
-        // 文件跳转。
-        console.log(`🌐 Web 控制台：${webConsole.url}`);
-        console.log('   仅本机可访问（127.0.0.1）；URL 含 token 勿外传。也可随时 `feishu-codex-bridge web` 重新打开。\n');
-      } else {
-        console.log(`🌐 Web 控制台已内嵌启动（127.0.0.1:${webConsole.port}）：运行 \`feishu-codex-bridge web\` 获取登录链接。`);
-      }
-    }
-  }
-
-  let stopping = false;
-  const stop = (sig: NodeJS.Signals): void => {
-    if (stopping) return;
-    stopping = true;
-    console.log(`\n收到 ${sig}，正在优雅退出（关闭所有 codex 会话）…`);
-    void (webConsole?.close() ?? Promise.resolve())
-      .catch(() => undefined)
-      .then(() => handle.shutdown())
-      .catch((err) => log.fail('run', err, { phase: 'shutdown' }))
-      .finally(() => {
-        releaseLock();
-        process.exit(0);
-      });
-  };
-  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
-    process.once(sig, () => stop(sig));
-  }
-
-  // keep the process alive; the WS connection drives everything.
-  await new Promise<never>(() => {});
+  });
 }

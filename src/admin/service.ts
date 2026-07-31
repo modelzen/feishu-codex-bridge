@@ -416,19 +416,42 @@ export interface AdminServiceDeps {
   /** 实时运行状态（daemon 进程内：本进程 channel / 子进程 IPC）。返回 undefined
    * 或缺省 → 回退锁文件探测（该 bot 不归本 daemon 管，如未激活的 bot）。 */
   liveStatus?: (botId: string) => Promise<BotLiveStatus | undefined>;
+  /**
+   * Resolve one bot's app secret in the owning host. Desktop configs contain
+   * process-only SecretRefs, so the parent Web host must not fall back to the
+   * upstream keystore when this adapter is present.
+   */
+  resolveBotSecret?: (botId: string, config: AppConfig) => Promise<string>;
+  /**
+   * Desktop-owned registration route. When present, QR registration never
+   * writes the upstream keystore/config/registry directly.
+   */
+  registerBotByQr?: AdminService['registerBotByQr'];
+  /** Desktop-owned registry mutations; keep desktop-index and runtime in sync. */
+  setBotEnabled?: AdminService['setBotEnabled'];
+  deleteBot?: AdminService['deleteBot'];
   /** daemon 进程启动时刻（内嵌 web 注入）；只读预览不传 → uptime 缺省。 */
   daemonStartedAt?: number;
+  /** Desktop-owned lifecycle snapshot; bypasses launchd/systemd/task probes. */
+  daemonStatus?: () => Promise<DaemonStatus>;
   /**
    * 重启 daemon 的真正执行器（detached helper，见 cli/commands/daemon-control）。
    * 缺省 = 只读预览（无 daemon 在跑），restartDaemon/applyUpdate 抛 NotWiredYetError。
    */
-  restartDaemon?: () => void;
-  /** 升级（npm i -g + 重启）的执行器（detached helper）。缺省同上抛 NotWiredYetError。 */
-  applyUpdate?: () => void;
+  restartDaemon?: () => void | Promise<void>;
+  /**
+   * Host-owned update action. The desktop host must route this to its updater;
+   * absence produces 501 and never runs the upstream global npm updater.
+   */
+  applyUpdate?: () => void | Promise<void>;
+  /** Desktop-owned update availability/status adapters. */
+  checkUpdate?: () => Promise<UpdateCheck>;
+  updateStatus?: () => UpdateStatus | null;
+  clearUpdateStatus?: () => void;
   /** 启动后台服务的执行器（detached helper，service install）。只读预览注入，缺省抛 NotWiredYetError。 */
-  startDaemon?: () => void;
+  startDaemon?: () => void | Promise<void>;
   /** 停止后台服务的执行器（detached helper，service uninstall）。daemon 进程注入，缺省抛 NotWiredYetError。 */
-  stopDaemon?: () => void;
+  stopDaemon?: () => void | Promise<void>;
   /**
    * 只读预览标记（仅 {@link createReadonlyAdminService} 置 true）。置 true 时扫码注册机器人
    * （registerBotByQr，属写操作）一律 NotWiredYetError——「没启动只读」：加机器人
@@ -458,6 +481,12 @@ export interface AdminServiceDeps {
  * 不自己解析 JSON；不碰全局 currentBotDir）；写路径与实时状态由 deps 注入。
  */
 export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
+  function resolveSecret(botId: string, config: AppConfig): Promise<string> {
+    return deps.resolveBotSecret
+      ? deps.resolveBotSecret(botId, config)
+      : resolveAppSecret(config);
+  }
+
   async function projectsWithCounts(botId: string): Promise<AdminProject[]> {
     const files = botPaths(botId);
     const projects = await listProjectsIn(files.projectsFile);
@@ -603,7 +632,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
         const cfg = await loadConfig(botPaths(botId).configFile);
         if (!isComplete(cfg)) return { state: 'unchecked', reason: '配置缺失（该 bot 尚未完成初始化）' };
         const { app } = cfg.accounts;
-        const secret = await resolveAppSecret(cfg);
+        const secret = await resolveSecret(botId, cfg);
         return await diagnoseEventSubscription(app.id, secret, app.tenant);
       } catch (err) {
         return { state: 'unchecked', reason: err instanceof Error ? err.message : String(err) };
@@ -667,7 +696,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       // ①③④ 都要密钥——解析一次，三段共用（探活拿 scope、事件诊断各打各的只读 API）。
       let secret: string | undefined;
       try {
-        secret = await resolveAppSecret(cfg);
+        secret = await resolveSecret(botId, cfg);
       } catch (err) {
         return {
           ...base,
@@ -704,6 +733,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     },
 
     async registerBotByQr(opts): Promise<QrRegisterResult | QrRegisterFailure> {
+      if (deps.registerBotByQr) return deps.registerBotByQr(opts);
       // 「没启动只读」：只读预览不许扫码加机器人——必须先有 daemon 在跑。
       if (deps.readonlyPreview) throw new NotWiredYetError('➕ 添加机器人');
       // ① 扫码会话：透传 onQr/onStatus 给上层做 SSE；signal 取消 → SDK reject code='abort'。
@@ -798,7 +828,8 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       if (!isBackendInstalledInUserDir(entry)) {
         return { ok: false, message: `「${entry.displayName}」并未装在用户目录，无需卸载。` };
       }
-      // 卸载（rm + 清 package.json 条目）owns runtime → 只读预览无注入 → 501。
+      // 有效卸载 owns runtime：桌面会先持久禁用只读 legacy fallback，再删除 managed
+      // copy；纯上游仍是 rm + 清 package.json。只读预览无注入 → 501。
       if (!deps.uninstallBackend) throw new NotWiredYetError(`🗑️ 卸载「${entry.displayName}」`);
       const ok = await deps.uninstallBackend(entry.dep.pkg);
       return ok
@@ -816,6 +847,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     },
 
     async getDaemonStatus(): Promise<DaemonStatus> {
+      if (deps.daemonStatus) return deps.daemonStatus();
       // service manager 状态在「未支持平台」会抛——按 undefined 降级（toDaemonStatus
       // 据此置 supported=false，UI 把重启按钮置灰引导前台 run）。
       let status;
@@ -831,22 +863,23 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       // 不能在 web 进程里直执行（会杀自己）：daemon 内注入 detached helper；只读
       // 预览无 daemon 在跑 → 引导先起 daemon。
       if (!deps.restartDaemon) throw new NotWiredYetError('🔁 重启 daemon');
-      deps.restartDaemon();
+      await deps.restartDaemon();
     },
 
     async startDaemon(): Promise<void> {
       // 只读预览注入 spawnDaemonControl('start')；daemon 进程自身在跑、无需「启动」→ 未注入 501。
       if (!deps.startDaemon) throw new NotWiredYetError('▶️ 启动 daemon');
-      deps.startDaemon();
+      await deps.startDaemon();
     },
 
     async stopDaemon(): Promise<void> {
       // daemon 进程注入 spawnDaemonControl('stop')（detached，停自己安全）；只读预览无 daemon → 501。
       if (!deps.stopDaemon) throw new NotWiredYetError('⏹ 停止 daemon');
-      deps.stopDaemon();
+      await deps.stopDaemon();
     },
 
     checkUpdate(): Promise<UpdateCheck> {
+      if (deps.checkUpdate) return deps.checkUpdate();
       return checkUpdateImpl().catch(() => ({
         current: bridgeVersion(),
         latest: null,
@@ -856,14 +889,16 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     },
 
     updateStatus(): UpdateStatus | null {
+      if (deps.updateStatus) return deps.updateStatus();
       return readUpdateStatus();
     },
 
     async applyUpdate(): Promise<void> {
       if (!deps.applyUpdate) throw new NotWiredYetError('⬆️ 升级');
       // 清掉上一次的结果，之后 Web 轮询读到的状态才确定属于本次升级（helper 会重写）。
-      clearUpdateStatus();
-      deps.applyUpdate();
+      if (deps.clearUpdateStatus) deps.clearUpdateStatus();
+      else clearUpdateStatus();
+      await deps.applyUpdate();
     },
 
     async hostDoctor(): Promise<AdminHostDoctor> {
@@ -872,6 +907,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     },
 
     async setBotEnabled(appId: string, enabled: boolean): Promise<BotMutationResult> {
+      if (deps.setBotEnabled) return deps.setBotEnabled(appId, enabled);
       const reg = await loadBots();
       if (!reg.bots.some((b) => b.appId === appId)) {
         return { ok: false, reason: `机器人「${appId}」不存在。` };
@@ -892,6 +928,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     },
 
     async deleteBot(appId: string): Promise<BotMutationResult> {
+      if (deps.deleteBot) return deps.deleteBot(appId);
       const reg = await loadBots();
       const target = reg.bots.find((b) => b.appId === appId);
       if (!target) return { ok: false, reason: `机器人「${appId}」不存在。` };

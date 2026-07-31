@@ -189,4 +189,7 @@ npm test            # vitest
 
 ## 📄 License
 
-[MIT](LICENSE) © modelzen
+[GNU AGPL v3 only](LICENSE) © modelzen
+
+If AGPL-3.0-only does not fit your closed-source distribution or integration,
+see [commercial licensing](COMMERCIAL-LICENSE.md).

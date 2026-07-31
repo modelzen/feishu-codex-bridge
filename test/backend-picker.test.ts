@@ -92,6 +92,11 @@ describe('buildNewProjectFormCard 的后端选择（创建时选定）', () => {
     const json = JSON.stringify(buildNewProjectFormCard({ backends: codexOnly }));
     expect(json).not.toContain('select_static');
     expect(json).toContain('Codex App Server');
+    expect(json).toContain('基础信息');
+    expect(json).toContain('项目配置');
+    expect(json).toContain('会话方式');
+    expect(json).toContain('创建多话题项目');
+    expect(json).toContain('创建单会话项目');
   });
 
   it('多个可选后端 → 渲染 select_static 下拉（name=backend，预选第一个 codex）+ 固定文案', () => {
@@ -103,6 +108,16 @@ describe('buildNewProjectFormCard 的后端选择（创建时选定）', () => {
     expect(json).toContain('固定不可切换');
     // 预选第一个（codex）
     expect(json).toContain('"initial_option":"codex-appserver"');
+  });
+
+  it('创建失败后的新卡保留用户选中的 Agent', () => {
+    const multi = [...codexOnly, { label: '其它后端', value: 'other-backend' }];
+    const json = JSON.stringify(buildNewProjectFormCard({
+      backend: 'other-backend',
+      backends: multi,
+      error: '目录不存在',
+    }));
+    expect(json).toContain('"initial_option":"other-backend"');
   });
 
   it('未传 backends → 不渲染后端选择块（向后兼容）', () => {

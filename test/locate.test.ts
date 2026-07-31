@@ -1,8 +1,9 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { codexVersion, codexVersionAsync, resolveCodexBin } from '../src/agent/codex-appserver/locate';
+import { paths } from '../src/config/paths';
 
 // locate 模块级缓存（QW-9）：bin/版本只在成功时缓存、force 强制重探、同步与
 // 异步版本探测共享一份缓存。版本 fixture 是 POSIX shebang 脚本——Windows 上
@@ -42,6 +43,39 @@ afterAll(() => {
 });
 
 describe('resolveCodexBin 缓存', () => {
+  it.skipIf(
+    process.platform !== 'darwin' || !existsSync('/opt/homebrew/bin/codex'),
+  )('在 Finder 启动的精简 PATH 下仍能识别 Homebrew Codex', () => {
+    const previousPath = process.env.PATH;
+    const previousManagedCodexBin = paths.managedCodexBin;
+    const previousCodexCliBinDir = paths.codexCliBinDir;
+    process.env.PATH = '/usr/bin:/bin';
+    paths.managedCodexBin = undefined;
+    paths.codexCliBinDir = join(dir, 'missing-private-install');
+    try {
+      expect(withCodexBinEnv('', () => resolveCodexBin({ force: true }))).toBe(
+        '/opt/homebrew/bin/codex',
+      );
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      paths.managedCodexBin = previousManagedCodexBin;
+      paths.codexCliBinDir = previousCodexCliBinDir;
+    }
+  });
+
+  it('优先识别 Vonvon 桌面托管的 Codex', () => {
+    const managed = join(dir, 'managed-codex');
+    writeFileSync(managed, '');
+    const previous = paths.managedCodexBin;
+    paths.managedCodexBin = managed;
+    try {
+      expect(withCodexBinEnv('', () => resolveCodexBin({ force: true }))).toBe(managed);
+    } finally {
+      paths.managedCodexBin = previous;
+    }
+  });
+
   it('命中后不重探；force 重探；缓存路径消失则自动失效', () => {
     const a = join(dir, 'codex-a');
     const b = join(dir, 'codex-b');
@@ -60,6 +94,30 @@ describe('resolveCodexBin 缓存', () => {
 });
 
 describe.skipIf(process.platform === 'win32')('codexVersion / codexVersionAsync 缓存', () => {
+  it('uses a managed CLI sibling Node even when the host PATH has no Node.js', async () => {
+    const isolatedDirectory = join(dir, 'managed-bin');
+    const node = join(isolatedDirectory, 'node');
+    const bin = join(isolatedDirectory, 'codex');
+    mkdirSync(isolatedDirectory, { recursive: true });
+    writeFileSync(node, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`, {
+      mode: 0o755,
+    });
+    writeFileSync(
+      bin,
+      '#!/usr/bin/env node\nprocess.stdout.write("managed-codex 10.0.0\\n");\n',
+      { mode: 0o755 },
+    );
+    const previousPath = process.env.PATH;
+    process.env.PATH = '/usr/bin:/bin';
+    try {
+      expect(codexVersion(bin, { force: true })).toBe('managed-codex 10.0.0');
+      expect(await codexVersionAsync(bin, { force: true })).toBe('managed-codex 10.0.0');
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
   it('成功结果缓存且同步/异步共享；force 重新 spawn', async () => {
     const bin = fakeBin('codex-ok', 'echo "fake-codex 9.9.9"');
 

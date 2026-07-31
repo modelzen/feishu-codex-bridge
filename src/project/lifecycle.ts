@@ -1,7 +1,7 @@
 import { mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { paths } from '../config/paths';
 import { log } from '../core/logger';
@@ -9,7 +9,10 @@ import { addProject, getProjectByChatId, getProjectByName, type Project } from '
 import type { PermissionMode } from '../agent/types';
 import { isBackendEntryInstalled } from '../agent';
 import { catalogById, isInstallable, projectCreatableBackends } from '../agent/catalog';
-import { setAnnouncement } from './announcement';
+import {
+  createProjectGroup,
+  finalizeCreatedProjectGroup,
+} from './group-provisioning';
 import { onboardGroup } from './onboarding';
 
 /**
@@ -105,14 +108,34 @@ export function resolveProjectsRootDir(configured?: unknown): string {
   }
   const value = configured.trim();
   if (!value) return paths.projectsRootDir;
-  if (value === '~') return homedir();
-  if (value.startsWith('~/') || value.startsWith('~\\')) {
-    return resolve(homedir(), value.slice(2));
+  let resolved: string;
+  if (value === '~') resolved = homedir();
+  else if (value.startsWith('~/') || value.startsWith('~\\')) {
+    resolved = resolve(homedir(), value.slice(2));
+  } else {
+    if (!isAbsolute(value)) {
+      throw new Error('配置 preferences.projectsRootDir 必须是绝对路径或以 ~ 开头');
+    }
+    resolved = resolve(value);
   }
-  if (!isAbsolute(value)) {
-    throw new Error('配置 preferences.projectsRootDir 必须是绝对路径或以 ~ 开头');
+
+  // Embedded desktop deliberately splits legacy compatibility assets from
+  // writable assets. An imported CLI preference may still explicitly point at
+  // the old default (`~/.feishu-codex-bridge/projects`); never let that stale
+  // value turn the read-only fallback into a blank-project write target.
+  if (
+    paths.writableAssetsDir !== paths.legacyAssetsDir
+    && isWithinDirectory(resolved, paths.legacyAssetsDir)
+  ) {
+    return paths.projectsRootDir;
   }
-  return resolve(value);
+  return resolved;
+}
+
+function isWithinDirectory(candidate: string, directory: string): boolean {
+  const relation = relative(resolve(directory), resolve(candidate));
+  return relation === ''
+    || (!isAbsolute(relation) && relation !== '..' && !relation.startsWith(`..${sep}`));
 }
 
 /**
@@ -131,27 +154,11 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
   // 1. resolve cwd
   const { cwd, blank } = await resolveCwd(name, input.existingPath, input.projectsRootDir);
 
-  // 2. create the bound group — bot stays as owner (no owner_id passed); the
-  //    creator is invited as a member here, then promoted to admin in 2b so the
-  //    two share every day-to-day permission. The owner (bot) keeps only
-  //    disband / transfer / manage-admins to itself — those can't be shared
-  //    because Feishu allows exactly one owner.
-  const res = await channel.rawClient.im.v1.chat.create({
-    params: { user_id_type: 'open_id' },
-    data: { name, user_id_list: [input.ownerOpenId] },
+  // 2. create the bound group and promote the creator to group admin.
+  const chatId = await createProjectGroup(channel, {
+    name,
+    ownerOpenId: input.ownerOpenId,
   });
-  const chatId = (res.data as { chat_id?: string } | undefined)?.chat_id;
-  if (!chatId) throw new Error(`建群失败：${JSON.stringify(res).slice(0, 200)}`);
-
-  // 2b. promote the creator to group admin. Only the owner (our bot) may do
-  //     this; best-effort — the group is usable even if it fails.
-  await channel.rawClient.im.v1.chatManagers
-    .addManagers({
-      path: { chat_id: chatId },
-      params: { member_id_type: 'open_id' },
-      data: { manager_ids: [input.ownerOpenId] },
-    })
-    .catch((err) => log.fail('project', err, { phase: 'add-manager' }));
 
   // 3. register
   const project: Project = {
@@ -171,8 +178,7 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
 
   // 4. group announcement (top banner) + onboarding (welcome card / Pin / tab),
   //    both best-effort — a group is usable even if these fail.
-  await setAnnouncement(channel, project).catch((err) => log.fail('project', err, { phase: 'announcement' }));
-  await onboardGroup(channel, project).catch((err) => log.fail('project', err, { phase: 'onboard' }));
+  await finalizeCreatedProjectGroup(channel, project);
   return project;
 }
 

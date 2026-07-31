@@ -1,4 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { delimiter, dirname, isAbsolute } from 'node:path';
 import { mergeProcessEnv, spawnProcess } from '../../platform/spawn';
 import { log } from '../../core/logger';
 import type { ServerNotification } from './protocol';
@@ -61,6 +62,27 @@ export interface AppServerClientOptions {
   clientName?: string;
 }
 
+export function appServerChildEnvironment(
+  executable: string,
+  base: NodeJS.ProcessEnv = process.env,
+  overrides: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv {
+  const merged = mergeProcessEnv(base, {
+    ...overrides,
+    FEISHU_CODEX_BRIDGE: '1',
+  });
+  const inheritedPath = Object.entries(merged)
+    .find(([key]) => key.toLowerCase() === 'path')?.[1] ?? '';
+  const executableDirectory = isAbsolute(executable) ? dirname(executable) : undefined;
+  const pathEntries = [
+    executableDirectory,
+    ...inheritedPath.split(delimiter),
+  ].filter((entry): entry is string => Boolean(entry));
+  return mergeProcessEnv(merged, {
+    PATH: [...new Set(pathEntries)].join(delimiter),
+  });
+}
+
 /**
  * One `codex app-server --listen stdio://` child process, speaking JSON-RPC 2.0
  * over newline-delimited JSON. One client = one thread/session (per design:
@@ -97,7 +119,7 @@ export class AppServerClient {
     // streams are non-null, so the cast to *WithoutNullStreams is sound.
     const child = spawnProcess(this.opts.bin, ['app-server', '--listen', 'stdio://'], {
       cwd: this.opts.cwd,
-      env: mergeProcessEnv(process.env, { ...this.opts.env, FEISHU_CODEX_BRIDGE: '1' }),
+      env: appServerChildEnvironment(this.opts.bin, process.env, this.opts.env),
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as ChildProcessWithoutNullStreams;
     this.child = child;

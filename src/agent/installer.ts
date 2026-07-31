@@ -206,7 +206,9 @@ export async function installBackendDep(
 
   // npm exit 0 仍要校验（半装、exports 缺失、平台二进制没拉到都可能 exit 0）。bin 类
   // 查 .bin 存在性，库类查 require.resolve（dispatch 见 backend-loader）。
-  const verifyOk = opts?.binName ? isBackendBinInstalled(opts.binName) : isBackendDepInstalled(bareName);
+  const verifyOk = opts?.binName
+    ? isBackendBinInstalled(opts.binName, bareName)
+    : isBackendDepInstalled(bareName);
   if (!verifyOk) {
     await rollback(bareName);
     log.warn('agent', 'backend-install-unverified', { pkg });

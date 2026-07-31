@@ -1,7 +1,12 @@
-import { closeSync, existsSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { closeSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { join } from 'node:path';
 import { paths } from '../config/paths';
+import {
+  currentEmbeddedRuntimeHost,
+  isRuntimeCheckout,
+  UPSTREAM_BRIDGE_VERSION,
+  UPSTREAM_PACKAGE_NAME,
+} from '../core/runtime-context';
 import { spawnProcess } from '../platform/spawn';
 import { getServiceAdapter, isServiceRunning } from './adapter';
 
@@ -18,27 +23,12 @@ const NPM = 'npm';
  * checkout. We read package.json from here for both the current version and the
  * canonical package name (so a rename can't drift the npm target).
  */
-function pkgRoot(): string {
-  return resolve(dirname(fileURLToPath(import.meta.url)), '..');
-}
-
-function pkgJson(): { name?: string; version?: string } {
-  try {
-    return JSON.parse(readFileSync(join(pkgRoot(), 'package.json'), 'utf8')) as {
-      name?: string;
-      version?: string;
-    };
-  } catch {
-    return {};
-  }
-}
-
 export function currentVersion(): string {
-  return pkgJson().version ?? '0.0.0';
+  return UPSTREAM_BRIDGE_VERSION;
 }
 
 export function packageName(): string {
-  return pkgJson().name ?? '@modelzen/feishu-codex-bridge';
+  return UPSTREAM_PACKAGE_NAME;
 }
 
 /**
@@ -47,7 +37,7 @@ export function packageName(): string {
  * steer the user to `git pull && npm i` instead.
  */
 export function isDevSource(): boolean {
-  return existsSync(join(pkgRoot(), '.git'));
+  return isRuntimeCheckout();
 }
 
 /** semver-ish compare: is `a` strictly newer than `b`? (major.minor.patch) */
@@ -63,6 +53,7 @@ export function isNewer(a: string, b: string): boolean {
 
 /** Latest published version on the configured registry, or null if unreachable. */
 export async function latestVersion(): Promise<string | null> {
+  if (currentEmbeddedRuntimeHost()) return null;
   const v = await new Promise<string | null>((resolveP) => {
     const child = spawnProcess(NPM, ['view', packageName(), 'version'], {
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -85,14 +76,38 @@ export async function latestVersion(): Promise<string | null> {
   return v && /^\d+\.\d+\.\d+/.test(v) ? v : null;
 }
 
-export interface UpdateCheck {
+export interface LegacyUpdateCheck {
   current: string;
   latest: string | null;
   hasUpdate: boolean;
   dev: boolean;
 }
 
+export type DesktopReleaseState =
+  | 'unpublished'
+  | 'available'
+  | 'current'
+  | 'unavailable';
+
+export interface DesktopManualUpdateCheck extends LegacyUpdateCheck {
+  mode: 'manual';
+  state: DesktopReleaseState;
+  compatVersion: string;
+  dev: false;
+  message: string;
+  channel?: 'stable' | 'beta';
+  releasePageUrl?: string;
+  dmgUrl?: string;
+  critical?: boolean;
+  minimumMacOS?: string;
+  sha256?: string;
+}
+
+export type UpdateCheck = LegacyUpdateCheck | DesktopManualUpdateCheck;
+
 export async function checkUpdate(): Promise<UpdateCheck> {
+  const embeddedHost = currentEmbeddedRuntimeHost();
+  if (embeddedHost?.checkUpdate) return await embeddedHost.checkUpdate();
   const current = currentVersion();
   const latest = await latestVersion();
   return { current, latest, hasUpdate: !!latest && isNewer(latest, current), dev: isDevSource() };
@@ -111,6 +126,12 @@ export interface InstallResult {
  * it, output is captured and the tail returned for surfacing in a card.
  */
 export async function installLatest(opts: { inherit?: boolean } = {}): Promise<InstallResult> {
+  if (currentEmbeddedRuntimeHost()) {
+    return {
+      ok: false,
+      message: 'Vonvon Bridge 桌面版由桌面应用管理更新，不会改写旧版全局 CLI。',
+    };
+  }
   const target = `${packageName()}@latest`;
   return await new Promise<InstallResult>((resolveP) => {
     const child = spawnProcess(NPM, ['install', '-g', target], {
@@ -263,6 +284,7 @@ export function clearUpdateStatus(): void {
  * macOS, Task Scheduler on Windows); false on platforms without a service.
  */
 export function daemonRunning(): boolean {
+  if (currentEmbeddedRuntimeHost()) return true;
   return isServiceRunning();
 }
 
@@ -272,5 +294,10 @@ export function daemonRunning(): boolean {
  * terminates the caller — send any "done" UI before calling it.
  */
 export async function restartDaemon(): Promise<void> {
+  const embedded = currentEmbeddedRuntimeHost();
+  if (embedded) {
+    await embedded.requestRestart();
+    return;
+  }
   await getServiceAdapter().restart();
 }

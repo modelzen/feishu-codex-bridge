@@ -1,8 +1,11 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
-import { dirname } from 'node:path';
 import { paths } from '../config/paths';
-import { DEFAULT_BACKEND_ID, type ReasoningEffort } from '../agent/types';
+import type { ReasoningEffort } from '../agent/types';
+import {
+  BRIDGE_SESSIONS_SCHEMA_VERSION,
+  readBridgeSessionsFile,
+  writeBridgeSessionsFile,
+  type BridgeSessionsFile,
+} from '../runtime/data-store';
 
 /**
  * A persisted session = one Feishu topic (thread) bound to a codex thread.
@@ -91,55 +94,16 @@ export interface SessionTitleJob {
   updatedAt: number;
 }
 
-interface StoreFile {
-  version: number;
-  sessions: SessionRecord[];
-  titleJobs: SessionTitleJob[];
-}
+type StoreFile = BridgeSessionsFile;
 
 // v3：在 sessions 绑定外新增按 backend+sessionId 去重的持久 titleJobs。
 // 旧 v1/v2 读入时 titleJobs=[]，不静默回填历史会话。
-const FILE_VERSION = 3;
-
-/** v1 文件的旧字段名（`codexThread` + `Id`）。拼接而非字面量，是为了让「全链改名
- * 后 grep 旧名 = 0」的判据可机械验证 —— 这里是全仓唯一还认得旧名的地方。 */
-const LEGACY_V1_SESSION_FIELD = 'codexThread' + 'Id';
-
-/** 旧记录读入迁移：v1 的旧会话 id 字段 → sessionId；缺 backend 回填默认 codex
- * 后端（v1 时代只有它）。原地落盘格式只在下次写盘时才换新（read 不回写），
- * 所以迁移必须幂等且每次 read 都跑。 */
-function migrate(raw: Record<string, unknown>): SessionRecord {
-  const rec = raw as unknown as SessionRecord;
-  if (typeof rec.sessionId !== 'string') {
-    const legacy = raw[LEGACY_V1_SESSION_FIELD];
-    if (typeof legacy === 'string') (rec as { sessionId: string }).sessionId = legacy;
-  }
-  if (typeof rec.backend !== 'string') (rec as { backend: string }).backend = DEFAULT_BACKEND_ID;
-  return rec;
-}
-
 function emptyStore(): StoreFile {
-  return { version: FILE_VERSION, sessions: [], titleJobs: [] };
+  return { version: BRIDGE_SESSIONS_SCHEMA_VERSION, sessions: [], titleJobs: [] };
 }
 
 async function readStoreIn(file: string): Promise<StoreFile> {
-  try {
-    const text = await readFile(file, 'utf8');
-    const parsed = JSON.parse(text) as Partial<StoreFile>;
-    const sessions = Array.isArray(parsed.sessions)
-      ? (parsed.sessions as unknown as Record<string, unknown>[]).map(migrate)
-      : [];
-    // v1/v2 deliberately migrate to an EMPTY ledger: the feature only owns
-    // bridge-created sessions registered after the upgrade.
-    const titleJobs =
-      typeof parsed.version === 'number' && parsed.version >= 3 && Array.isArray(parsed.titleJobs)
-        ? (parsed.titleJobs as SessionTitleJob[])
-        : [];
-    return { version: FILE_VERSION, sessions, titleJobs };
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return emptyStore();
-    throw err;
-  }
+  return readBridgeSessionsFile(file);
 }
 
 async function read(): Promise<StoreFile> {
@@ -167,11 +131,7 @@ function withLock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 async function write(store: StoreFile): Promise<void> {
-  await mkdir(dirname(paths.sessionsFile), { recursive: true });
-  const tmp = `${paths.sessionsFile}.tmp-${process.pid}-${randomUUID()}`;
-  const body: StoreFile = { version: FILE_VERSION, sessions: store.sessions, titleJobs: store.titleJobs };
-  await writeFile(tmp, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
-  await rename(tmp, paths.sessionsFile);
+  await writeBridgeSessionsFile(paths.sessionsFile, store);
 }
 
 export async function listSessions(): Promise<SessionRecord[]> {

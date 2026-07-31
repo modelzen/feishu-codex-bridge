@@ -1,6 +1,6 @@
 {
   "name": "@modelzen/feishu-codex-bridge",
-  "version": "0.6.10",
+  "version": "0.7.0",
   "description": "Bridge Feishu/Lark messenger with local Codex via app-server (project=group, thread=session)",
   "type": "module",
   "bin": {
@@ -10,13 +10,18 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "import": "./dist/runtime.js"
     }
   },
   "files": [
     "dist",
     "bin",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "COMMERCIAL-LICENSE.md"
   ],
   "scripts": {
     "build": "tsup",
@@ -24,6 +29,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "start": "node bin/feishu-codex-bridge.mjs run",
+    "verify:package": "node scripts/verify-package.mjs",
+    "release:metadata": "node scripts/release-metadata.mjs",
     "prepare": "npm run build",
     "release": "bash scripts/release.sh"
   },
@@ -55,7 +62,7 @@
     "bot"
   ],
   "author": "modelzen",
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "homepage": "https://github.com/modelzen/feishu-codex-bridge#readme",
   "repository": {
     "type": "git",
