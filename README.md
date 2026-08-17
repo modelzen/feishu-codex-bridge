@@ -173,6 +173,10 @@ npm test            # vitest
 
 `git clone https://github.com/modelzen/feishu-codex-bridge.git && cd feishu-codex-bridge && npm i`（`prepare` 自动构建），前台跑 `npm start`。架构与实现见 [`docs/design/feishu-codex-bridge-design.md`](docs/design/feishu-codex-bridge-design.md) 与 [`docs/design/implementation-plan.md`](docs/design/implementation-plan.md)。
 
+`@modelzen/feishu-codex-bridge/runtime` 公开任务消息的
+`OneSecond → Typing → 清除` 反馈生命周期与 reaction 意图判断，供 DSH 等宿主复用
+而不复制这段飞书交互状态机。
+
 ---
 
 ## 💬 文档 & 交流

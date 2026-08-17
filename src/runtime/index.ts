@@ -38,6 +38,17 @@ export {
 } from '../kernel/start-bot';
 export type { AdminWriteOp } from '../admin/ops';
 export {
+  classifyReaction,
+  CONTINUE_EMOJIS,
+  createRunReaction,
+  STOP_EMOJIS,
+  type MessageReactionPort,
+  type ReactionIntent,
+  type RunReaction,
+  type RunReactionErrorContext,
+  type RunReactionOptions,
+} from './run-reaction';
+export {
   buildEmbeddedBridgeHookCommand,
   inspectCliBridgeHooks,
   installCliBridgeHooks,

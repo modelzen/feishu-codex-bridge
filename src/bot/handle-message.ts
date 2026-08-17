@@ -148,6 +148,20 @@ import type { CliBridgeRuntimeHooks } from '../cli-bridge/service';
 import { currentEmbeddedRuntimeHost } from '../core/runtime-context';
 export type { CliBridgeRuntimeHooks };
 import {
+  classifyReaction,
+  CONTINUE_EMOJIS,
+  createRunReaction,
+  STOP_EMOJIS,
+  type ReactionIntent,
+  type RunReaction,
+} from '../runtime/run-reaction';
+export {
+  classifyReaction,
+  CONTINUE_EMOJIS,
+  STOP_EMOJIS,
+  type ReactionIntent,
+} from '../runtime/run-reaction';
+import {
   sendCompletionReminderReply,
   type CompletionReminderReplyInput,
 } from './completion-reminder';
@@ -486,14 +500,6 @@ interface ActiveState {
   isGoal?: boolean;
 }
 
-/** Message-reaction lifecycle controller (see {@link runReaction}). */
-interface RunReaction {
-  /** the run acquired a concurrency slot and is now running → Typing */
-  started: () => void;
-  /** the run ended (complete / ⏹ / timeout / error) → DONE */
-  done: () => void;
-}
-
 export interface Orchestrator {
   onMessage: (msg: NormalizedMessage) => Promise<void>;
   /** `comment` event handler: @bot in a cloud-doc comment → reply in-thread. */
@@ -555,24 +561,6 @@ export function parseGoalTrigger(text: string): string | null {
     .replace(/\s+/g, ' ')
     .trim();
   return objective.length > 0 ? objective : null;
-}
-
-// ── M-6 Reaction 入站：零打字驱动 ────────────────────────────────────
-/** 运行中卡片上「⏹ 类」表情 → 终止。飞书 reaction 面板没有 ⏹，取语义最近的
- * OK（👌「到此为止」，synthesis 验收用例）与 DONE（✅）。 */
-export const STOP_EMOJIS: ReadonlySet<string> = new Set(['OK', 'DONE']);
-/** 终态卡片上 👍 → 续轮（等价于在话题里发一句「继续」）。 */
-export const CONTINUE_EMOJIS: ReadonlySet<string> = new Set(['THUMBSUP']);
-export type ReactionIntent = 'stop' | 'continue';
-
-/**
- * Reaction → 意图的纯决策（exported for tests）：运行中的 run/排队卡只认
- * STOP_EMOJIS（👍 在运行中无意义，忽略）；终态卡只认 CONTINUE_EMOJIS（终态卡
- * 没有可终止的东西）。其余 emoji 一律 null —— 群友的日常表情不该有副作用。
- */
-export function classifyReaction(emojiType: string, running: boolean): ReactionIntent | null {
-  if (running) return STOP_EMOJIS.has(emojiType) ? 'stop' : null;
-  return CONTINUE_EMOJIS.has(emojiType) ? 'continue' : null;
 }
 
 /**
@@ -837,10 +825,9 @@ export function createOrchestrator(
       return undefined;
     }
   }
-  function removeReaction(messageId: string, reactionId: string): void {
-    void channel.rawClient.im.v1.messageReaction
-      .delete({ path: { message_id: messageId, reaction_id: reactionId } })
-      .catch((err) => log.fail('card', err, { phase: 'reaction-del' }));
+  async function removeReaction(messageId: string, reactionId: string): Promise<void> {
+    await channel.rawClient.im.v1.messageReaction
+      .delete({ path: { message_id: messageId, reaction_id: reactionId } });
   }
 
   /**
@@ -851,31 +838,18 @@ export function createOrchestrator(
    * `chain` so each step removes the prior emoji first.
    */
   function runReaction(messageId: string, queued: boolean): RunReaction {
-    let chain: Promise<string | undefined> = addReaction(messageId, queued ? 'OneSecond' : 'Typing');
-    let phase = queued ? 0 : 1; // 0 = waiting(OneSecond), 1 = running(Typing), 2 = done(cleared)
-    const swap = (emoji: string): void => {
-      chain = chain.then(async (prevId) => {
-        if (prevId) removeReaction(messageId, prevId);
-        return addReaction(messageId, emoji);
-      });
-    };
-    return {
-      started: () => {
-        if (phase < 1) {
-          phase = 1;
-          swap('Typing');
-        }
+    return createRunReaction({
+      messageId,
+      queued,
+      port: {
+        add: ({ messageId: target, emojiType }) => addReaction(target, emojiType),
+        remove: ({ messageId: target, reactionId }) => removeReaction(target, reactionId),
       },
-      done: () => {
-        if (phase < 2) {
-          phase = 2;
-          chain = chain.then((prevId) => {
-            if (prevId) removeReaction(messageId, prevId);
-            return undefined;
-          });
-        }
-      },
-    };
+      onError: (error, context) => log.fail('card', error, {
+        phase: context.phase === 'add' ? 'reaction-add' : 'reaction-del',
+        ...(context.emojiType === undefined ? {} : { emoji: context.emojiType }),
+      }),
+    });
   }
 
   // ── inbound messages ──────────────────────────────────────────────
