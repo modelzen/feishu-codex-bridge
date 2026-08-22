@@ -1,8 +1,8 @@
 # DeepSeek Harness 后端设计规格
 
-> 状态：设计评审
+> 状态：设计评审（2026-08-22 修订：模型层由 DeepSeek-only 改为 `dsh-llm-pi-ai` 多 provider 路线，依据见 [dsh-backend-research.md](./dsh-backend-research.md)）
 > 日期：2026-08-20
-> 目标版本：DeepSeek Harness `0.1.0-rc.8`
+> 目标版本：DeepSeek Harness `0.1.0-rc.8`（实现前以 `0.1.1-rc.2` 重新验证包闭包后裁定最终锁定版本）
 > 后端标识：`dsh-sdk`
 
 ## 1. 决策摘要
@@ -94,7 +94,7 @@ DshBackend (one runtime per active Feishu thread)
 dsh-jsonrpc-agent
       |
       +-- generated Bridge profile
-      +-- DeepSeek LLM adapter
+      +-- pi-ai 多 provider LLM adapter
       +-- native tools and sandbox
       +-- JSONL persistence under the bot state directory
 ```
@@ -151,6 +151,8 @@ DSH 仍处于 developer preview，npm 的 `latest` 与预发布标签可能不�
 @deepseek-ai/dsh-agent-spine-demo@0.1.0-rc.8
 ```
 
+2026-08-22 核验：上述四包在 npm `0.1.1-rc.2` 均已发布；`dsh-llm-pi-ai` 在 rc.7 / rc.8 / 0.1.1-rc.2 均锁 `@earendil-works/pi-ai ^0.82.1`，provider 目录不随 dsh 版本变化。最终锁定 rc.8 还是 0.1.1-rc.2，由下述安装探针实测后裁定。
+
 实现前的安装探针必须在空目录中验证这组包能够解析生成配置所引用的全部插件。若 npm 包依赖闭包已包含其中某个包，可以减少显式安装项，但所有直接使用的包仍须保持同一精确版本，且不得改用浮动 tag。
 
 ### 5.3 安装器扩展
@@ -175,7 +177,7 @@ Bridge 在私有后端目录生成版本化 profile。profile 只组合 DSH 官�
 
 - SDK JSON-RPC server
 - official local credentials provider
-- DeepSeek LLM adapter
+- 通用多 provider LLM adapter（`dsh-llm-pi-ai`，经目录路由覆盖 MiniMax / Kimi / GLM / DeepSeek 等；不装载 `dsh-llm-deepseek`）
 - agent spine
 - local subprocess
 - sandbox policy、sandboxed bash 与 sandboxed filesystem
@@ -205,10 +207,10 @@ FEISHU_CODEX_BRIDGE=1
 
 约束如下：
 
-- `DEEPSEEK_API_KEY` 由 DSH 官方 credentials provider 按其既有优先级解析，包括继承环境和 `$DSH_HOME/.credentials.yaml`；Bridge 不打开、不复制、不打印、不持久化该值。
+- 各 provider 的 API key（`MOONSHOT_API_KEY`、`ZAI_CODING_CN_API_KEY`、`MINIMAX_API_KEY`、`DEEPSEEK_API_KEY` 等，路由与 env 名映射见研究报告 §4.2）由 DSH 官方 credentials provider 按其既有优先级解析，包括继承环境和 `$DSH_HOME/.credentials.yaml`；Bridge 不打开、不复制、不打印、不持久化任何 key 值。
 - `DSH_SESSION_ROOT` 按机器人实例隔离，避免多个飞书机器人意外共享历史。
 - 项目 `cwd` 在 session 创建时固化，并在恢复时再次校验。
-- `FEISHU_CODEX_BRIDGE_DSH_EFFORT` 是 Bridge 私有变量，由生成的 profile 映射到 DeepSeek adapter 的 `reasoningEffort`；它不是上游 JSON-RPC 字段。
+- `FEISHU_CODEX_BRIDGE_DSH_EFFORT` 是 Bridge 私有变量，由生成的 profile 映射到 DeepSeek adapter 的 `reasoningEffort`；它不是上游 JSON-RPC 字段；对不支持分档 effort 的模型（见 §10），该值只折叠为推理开/关。
 - stdout 只承载 JSON-RPC；stderr 单独捕获并做长度限制，避免协议污染和无限日志增长。
 
 ## 7. 会话生命周期
@@ -285,7 +287,7 @@ DSH rc.8 的初始化配置是进程级配置。话题设置在两轮之间发�
 
 | 情况 | 用户可见结果 |
 |---|---|
-| 缺少 `DEEPSEEK_API_KEY` | 明确提示配置 DeepSeek API key，不显示环境内容 |
+| 缺少所选 provider 的 API key | 明确提示配置对应 provider 的 key（如 `MOONSHOT_API_KEY`），不显示环境内容 |
 | 后端未安装或版本不符 | 提示在后端管理中安装或修复 DSH |
 | initialize 失败 | `agent_start_failed`，附安全裁剪后的 DSH 原因 |
 | prompt RPC 失败 | `error_during_execution`，保留会话供下次恢复 |
@@ -330,23 +332,28 @@ supportedModes = ['full']
 
 ## 10. 模型与推理强度
 
-首个版本声明 DSH 官方 rc.8 的 DeepSeek 模型：
+首个版本声明 pi-ai 目录路由中的静态模型清单，id 形如 `<route>/<model>`（与研究报告 §4.2 核验的目录数据一致）：
 
-- `deepseek-v4-flash`，默认
-- `deepseek-v4-pro`
+- `moonshotai-cn/kimi-k3`，暂定默认（三家旗舰的最终默认在 P2 实测后裁定）
+- `moonshotai-cn/kimi-k2.7-code`
+- `zai-coding-cn/glm-5.2`
+- `zai-coding-cn/glm-5.1`
+- `minimax/MiniMax-M3`
+- `minimax/MiniMax-M2.7`
+- `deepseek/deepseek-v4-flash`
+- `deepseek/deepseek-v4-pro`
 
-Bridge effort 映射：
+推理强度支持逐模型差异显著（研究报告 §4.3），`supportedEfforts` 必须逐模型如实声明，不做后端级统一映射：
 
-| Bridge | DSH |
+| 模型 | supportedEfforts |
 |---|---|
-| `none` | `off` |
-| `low` | `low` |
-| `high` | `high` |
-| `max` | `max` |
+| kimi-k3、glm-5.2、glm-5.1 | `none` / `low` / `high` / `max`，映射到 provider 的 effort 分档 |
+| kimi-k2.7-code、MiniMax-M3、MiniMax-M2.7 | 仅 `none` / `high`（推理关/开两态） |
+| deepseek-v4-flash / deepseek-v4-pro | `none` / `low` / `high` / `max` |
 
-DSH 不声明支持 Bridge 的 `minimal`、`medium`、`xhigh` 或 `ultra`。UI 只展示当前后端明确支持的值，避免静默降级。
+DSH 后端不声明支持 Bridge 的 `minimal`、`medium`、`xhigh` 或 `ultra`。UI 只展示当前模型明确支持的值，避免静默降级。
 
-模型和 effort 列表集中在 DSH 后端定义中。后续 DSH 升级时，通过单独 PR 更新精确运行版本和对应模型能力。
+模型和 effort 列表集中在 DSH 后端定义中，与精确运行版本一同锁定。后续 DSH 或 pi-ai 升级时，通过单独 PR 更新精确版本和对应模型能力。
 
 ## 11. 权限与安全边界
 
