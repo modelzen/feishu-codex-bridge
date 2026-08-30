@@ -42,6 +42,7 @@ import {
   isBackendInstalledInUserDir,
   installedBackendVersion,
   latestNpmVersion,
+  stripVersion,
   type BackendCatalogEntry,
   type InstallResult,
   type InstallProgress,
@@ -442,14 +443,14 @@ export interface AdminServiceDeps {
    * 推进度 / 模拟失败，不真跑 npm。
    */
   installBackend?: (
-    pkg: string,
+    pkg: string | readonly string[],
     onProgress?: InstallProgress,
     signal?: AbortSignal,
     opts?: { binName?: string },
   ) => Promise<InstallResult>;
   /** 卸载执行器（rm 用户私装目录里的包 + 清 package.json 条目）。daemon 进程注入
    * {@link uninstallBackendDep}；只读预览不注入 → uninstallBackend 抛 NotWiredYetError。 */
-  uninstallBackend?: (pkg: string) => Promise<boolean>;
+  uninstallBackend?: (pkg: string | readonly string[]) => Promise<boolean>;
 }
 
 /**
@@ -771,9 +772,20 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
           tail: `「${entry.displayName}」不支持一键下载。手动安装：${entry.dep.installCmd ?? entry.dep.detectHint}`,
         };
       }
-      // 更新 = 装 @latest（无视 catalog 的 version pin，取 npm 最新）；普通下载用 pin（有的话）。
-      const spec = opts?.update ? 'latest' : entry.dep.version;
-      const pkg = spec ? `${entry.dep.pkg}@${spec}` : entry.dep.pkg!;
+      // 包集合普通下载完全按 catalog 的精确 specs；更新时以主包 registry 版本为共同
+      // 版本，避免各内部包的 prerelease dist-tag 不同步。单包保持历史 @latest 语义。
+      let pkg: string | readonly string[];
+      if (entry.dep.installSpecs?.length) {
+        if (opts?.update) {
+          const target = (await latestNpmVersion(entry.dep.pkg!)) ?? 'latest';
+          pkg = entry.dep.installSpecs.map((spec) => `${stripVersion(spec)}@${target}`);
+        } else {
+          pkg = entry.dep.installSpecs;
+        }
+      } else {
+        const spec = opts?.update ? 'latest' : entry.dep.version;
+        pkg = spec ? `${entry.dep.pkg}@${spec}` : entry.dep.pkg!;
+      }
       const verb = opts?.update ? '🔄 更新' : '⬇️ 下载';
       // install/update 是 daemon 注入态能力（owns runtime）；只读预览无注入 → 501 引导起 daemon。
       if (!deps.installBackend) throw new NotWiredYetError(`${verb}「${entry.displayName}」`);
@@ -800,7 +812,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       }
       // 卸载（rm + 清 package.json 条目）owns runtime → 只读预览无注入 → 501。
       if (!deps.uninstallBackend) throw new NotWiredYetError(`🗑️ 卸载「${entry.displayName}」`);
-      const ok = await deps.uninstallBackend(entry.dep.pkg);
+      const ok = await deps.uninstallBackend(entry.dep.installSpecs ?? entry.dep.pkg);
       return ok
         ? { ok: true, message: `已卸载「${entry.displayName}」。` }
         : { ok: false, message: `卸载「${entry.displayName}」失败（可能仍被占用），可稍后重试。` };

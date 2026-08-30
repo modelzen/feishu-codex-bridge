@@ -14,7 +14,7 @@ import { DEFAULT_BACKEND_ID, type PermissionMode } from './types';
 export type AgentFamily = 'codex' | 'claude' | (string & {});
 
 /** 后端进程的接入方式（仅描述/分组用，不参与运行路由）。 */
-export type BackendAccess = 'app-server' | 'sdk' | 'acp';
+export type BackendAccess = 'app-server' | 'sdk' | 'acp' | 'jsonrpc';
 
 /**
  * 依赖类型 —— 决定「装哪 / 怎么检测 / 能不能一键按需装」。
@@ -40,6 +40,11 @@ export interface BackendDep {
   binName?: string;
   /** pin 版本（npm-ondemand，避免漂移）；undefined ⇒ latest。 */
   version?: string;
+  /**
+   * 一个后端需要原子安装的完整 npm 包集合（每项可带精确版本）。未声明时沿用
+   * `pkg` + `version` 的单包行为；声明时 `pkg` 仍是版本展示与安装态判断的主包。
+   */
+  installSpecs?: readonly string[];
   /** 体积提示 MB（Web 下载确认用，给用户预期）。 */
   approxSizeMB?: number;
   /** 检测/装法的一句话提示（external-cli 探不到、npm-external 未装时给用户）。 */

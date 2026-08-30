@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { spawnProcess } from '../platform/spawn';
 import { paths } from '../config/paths';
 import { log } from '../core/logger';
-import { isBackendDepInstalled, isBackendBinInstalled } from './backend-loader';
+import { isBackendDepInstalled, isBackendBinInstalled, installedBackendVersion } from './backend-loader';
 import { fixNativeHelperPerms } from './native-helpers';
 
 /**
@@ -100,16 +100,17 @@ export async function ensureBackendsDir(): Promise<void> {
  * package.json 条目，避免下次装别的又把它带回）。
  */
 export function buildInstallCommand(
-  pkg: string,
+  pkg: string | readonly string[],
   opts: { prefix?: string; cacheDir?: string } = {},
 ): { command: string; args: string[] } {
   const prefix = opts.prefix ?? paths.backendsDir;
   const cacheDir = opts.cacheDir ?? paths.npmCacheDir;
+  const specs = normalizeSpecs(pkg);
   return {
     command: NPM,
     args: [
       'install',
-      pkg,
+      ...specs,
       '--prefix',
       prefix,
       '--include=optional',
@@ -134,18 +135,21 @@ export function buildInstallCommand(
  *   node_modules/.bin 存在性而非 require.resolve（bin-only 包无 main 入口，resolve 必失败）。
  */
 export async function installBackendDep(
-  pkg: string,
+  pkg: string | readonly string[],
   onProgress?: InstallProgress,
   signal?: AbortSignal,
   opts?: { binName?: string },
 ): Promise<InstallResult> {
-  // 包名去掉版本后缀（@scope/name@1.2.3 → @scope/name）用于回滚定位 + 校验。
-  const bareName = stripVersion(pkg);
+  const specs = normalizeSpecs(pkg);
+  const bareNames = specs.map(stripVersion);
+  if (specs.length === 0) {
+    return { ok: false, code: null, aborted: false, tail: '没有可安装的后端包' };
+  }
   try {
     await ensureBackendsDir();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    log.fail('agent', err, { phase: 'backend-install-mkdir', pkg });
+    log.fail('agent', err, { phase: 'backend-install-mkdir', pkg: specs });
     return { ok: false, code: null, aborted: false, tail: `创建后端目录失败：${msg}` };
   }
 
@@ -153,8 +157,8 @@ export async function installBackendDep(
     return { ok: false, code: null, aborted: true, tail: '安装已取消' };
   }
 
-  const { command, args } = buildInstallCommand(pkg);
-  log.info('agent', 'backend-install-start', { pkg });
+  const { command, args } = buildInstallCommand(specs);
+  log.info('agent', 'backend-install-start', { pkg: specs });
 
   const result = await new Promise<InstallResult>((resolve) => {
     let child;
@@ -199,22 +203,30 @@ export async function installBackendDep(
 
   // 取消 / 退出码非零 → 回滚半装子目录（避免 resolve 假阳性放行一个加载会炸的包）。
   if (!result.ok) {
-    await rollback(bareName);
-    log.warn('agent', 'backend-install-failed', { pkg, code: result.code, aborted: result.aborted });
+    await rollbackMany(bareNames);
+    log.warn('agent', 'backend-install-failed', { pkg: specs, code: result.code, aborted: result.aborted });
     return result;
   }
 
   // npm exit 0 仍要校验（半装、exports 缺失、平台二进制没拉到都可能 exit 0）。bin 类
-  // 查 .bin 存在性，库类查 require.resolve（dispatch 见 backend-loader）。
-  const verifyOk = opts?.binName ? isBackendBinInstalled(opts.binName) : isBackendDepInstalled(bareName);
+  // 查 .bin 存在性，库类查 require.resolve（dispatch 见 backend-loader）。包集合还要逐个
+  // 查 package.json 版本，避免其中一个直接依赖缺失却被主入口掩盖。
+  const packagesOk =
+    specs.length === 1
+      ? opts?.binName
+        ? true
+        : isBackendDepInstalled(bareNames[0]!)
+      : bareNames.every((name) => installedBackendVersion(name) !== null);
+  const binOk = opts?.binName ? isBackendBinInstalled(opts.binName) : true;
+  const verifyOk = packagesOk && binOk;
   if (!verifyOk) {
-    await rollback(bareName);
-    log.warn('agent', 'backend-install-unverified', { pkg });
+    await rollbackMany(bareNames);
+    log.warn('agent', 'backend-install-unverified', { pkg: specs });
     return {
       ok: false,
       code: result.code,
       aborted: false,
-      tail: `${result.tail}\n\n安装后校验失败：「${bareName}」装好了但${opts?.binName ? '.bin 里找不到可执行' : '解析不到'}（可能半装/平台二进制缺失），已回滚。`,
+      tail: `${result.tail}\n\n安装后校验失败：「${bareNames.join('、')}」的包集合或入口不完整（可能半装/平台二进制缺失），已回滚。`,
     };
   }
 
@@ -222,14 +234,19 @@ export async function installBackendDep(
   // failed）。在 verify 通过后跑——绝不抛错，不影响安装结果。
   await fixNativeHelperPerms().catch(() => undefined);
 
-  log.info('agent', 'backend-install-done', { pkg });
+  log.info('agent', 'backend-install-done', { pkg: specs });
   return result;
 }
 
 /** 卸载一个按需后端依赖（省空间 / 重装前清理）。绝不抛错。 */
-export async function uninstallBackendDep(pkg: string): Promise<boolean> {
-  await rollback(stripVersion(pkg));
-  return !isBackendDepInstalled(stripVersion(pkg));
+export async function uninstallBackendDep(pkg: string | readonly string[]): Promise<boolean> {
+  const bareNames = normalizeSpecs(pkg).map(stripVersion);
+  await rollbackMany(bareNames);
+  return bareNames.every((name) => installedBackendVersion(name) === null);
+}
+
+async function rollbackMany(bareNames: readonly string[]): Promise<void> {
+  for (const bareName of bareNames) await rollback(bareName);
 }
 
 /** rm -rf backendsDir/node_modules/<pkg> + 从 package.json 移除条目 + 删 package-lock.json
@@ -268,4 +285,8 @@ export function stripVersion(pkg: string): string {
   const at = pkg.lastIndexOf('@');
   // scoped 包以 @ 开头（lastIndexOf>0 才是版本分隔符）；非 scoped 的 at>0 也是版本分隔符。
   return at > 0 ? pkg.slice(0, at) : pkg;
+}
+
+function normalizeSpecs(pkg: string | readonly string[]): string[] {
+  return typeof pkg === 'string' ? [pkg] : [...pkg];
 }

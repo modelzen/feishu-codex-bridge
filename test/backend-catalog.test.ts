@@ -165,6 +165,18 @@ describe('installer：命令构建（不真跑 npm）', () => {
     expect(args[args.indexOf('--cache') + 1]).toBe(paths.npmCacheDir);
   });
 
+  it('buildInstallCommand：一条 npm 命令可原子安装多个精确包', () => {
+    const { args } = buildInstallCommand(['@scope/runtime@1.2.3', '@scope/protocol@1.2.3'], {
+      prefix: '/u/backends',
+      cacheDir: '/u/npm-cache',
+    });
+    expect(args.slice(0, 3)).toEqual([
+      'install',
+      '@scope/runtime@1.2.3',
+      '@scope/protocol@1.2.3',
+    ]);
+  });
+
   it('stripVersion：scoped/非 scoped 都正确去版本', () => {
     expect(stripVersion('@scope/some-ondemand-pkg@0.3.175')).toBe('@scope/some-ondemand-pkg');
     expect(stripVersion('@scope/some-ondemand-pkg')).toBe('@scope/some-ondemand-pkg');
