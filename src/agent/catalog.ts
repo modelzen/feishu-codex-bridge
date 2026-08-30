@@ -1,4 +1,10 @@
 import { DEFAULT_BACKEND_ID, type PermissionMode } from './types';
+import {
+  DSH_BIN_NAME,
+  DSH_INSTALL_SPECS,
+  DSH_MAIN_PACKAGE,
+  DSH_VERSION,
+} from './dsh/constants';
 
 /**
  * 后端 catalog —— 后端的「元数据 + 管理面驱动」单一真源（依赖类型/体积/检测/安装/
@@ -118,6 +124,24 @@ export const BACKEND_CATALOG: readonly BackendCatalogEntry[] = [
     // 必须与 ClaudeAgentBackend.supportedModes 完全一致（单测强制）。
     supportedModes: ['qa', 'write', 'full'],
     blurb: 'Claude Code（SDK 内置，复用本机登录；qa/write 走 OS 沙箱，能力较 Codex 精简）',
+  },
+  {
+    id: 'dsh-sdk',
+    agentFamily: 'dsh',
+    displayName: 'DeepSeek Harness',
+    access: 'jsonrpc',
+    dep: {
+      kind: 'npm-ondemand',
+      pkg: DSH_MAIN_PACKAGE,
+      binName: DSH_BIN_NAME,
+      version: DSH_VERSION,
+      installSpecs: DSH_INSTALL_SPECS,
+      approxSizeMB: 285,
+      detectHint: `按需下载 DSH ${DSH_VERSION} 运行包（约 285MB）`,
+      installCmd: `由 Bridge 私装精确版本 ${DSH_VERSION}（零 sudo）`,
+    },
+    supportedModes: ['full'],
+    blurb: '实验性多模型 DSH JSON-RPC 后端（仅 full；使用各 provider API key）',
   },
 ];
 
