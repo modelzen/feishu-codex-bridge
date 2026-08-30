@@ -16,7 +16,7 @@ import {
  * catalog（设计 §3.5）。Web 后端页 / DM picker / doctor / 按需下载按钮全自动出现。
  */
 
-/** 底层 agent 家族（picker 按此分组；当前仅 Codex 组；string 为未来 agent 预留）。 */
+/** 底层 agent 家族（picker 按此分组；string 交叉类型允许后续家族免改公共类型）。 */
 export type AgentFamily = 'codex' | 'claude' | (string & {});
 
 /** 后端进程的接入方式（仅描述/分组用，不参与运行路由）。 */
@@ -28,7 +28,7 @@ export type BackendAccess = 'app-server' | 'sdk' | 'acp' | 'jsonrpc';
  *   'npm-ondemand'  npm 包，按需装到用户私装目录（库类 / bin 类两形态）。
  *                   **唯一可一键下载的类型。** 库类（无 binName）走 import + require.resolve；
  *                   bin 类（有 binName）被 spawn、走 node_modules/.bin 路径（见 backend-loader）。
- *                   当前内置后端均非此类（codex 是 external-cli），保留以备将来挂新后端。
+ *                   Claude（库类）与 DSH（bin 类）均通过此路径按需管理。
  *   'npm-external'  外部 npm 包，用户自管（当前内置后端无此类，保留给未来不便按需装的包）。
  */
 export type DepKind = 'external-cli' | 'npm-ondemand' | 'npm-external';

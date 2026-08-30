@@ -1,7 +1,7 @@
 # DSH 后端接入研究报告：多 provider 路线与远程机部署
 
-> 状态：研究结论
-> 日期：2026-08-22
+> 状态：研究结论已转化为首版实现
+> 日期：2026-08-22；实现复验：2026-08-31
 > 关联设计：[dsh-backend-design.md](./dsh-backend-design.md)（2026-08-20，本报告对其提出修订）
 > 部署形态：Bridge 运行于远程机，DSH 作为 Bridge 的本地子进程后端（同机）
 
@@ -10,7 +10,7 @@
 1. **可行，且架构无需推翻。** 既有设计文档定义的 `dsh-sdk` 后端（SDK JSON-RPC stdio 子进程、每话题一进程一稳定 sessionId、JSONL 持久化恢复、仅 `full` 模式）经本次逐项核验依然成立，可直接作为实现蓝本。
 2. **模型层从 DeepSeek-only 改为多 provider。** 设计文档假设 `dsh-llm-deepseek` + `DEEPSEEK_API_KEY`；实际需求是 MiniMax / Kimi（Moonshot）/ GLM（智谱）的 API key。核验确认官方通用适配器 `@deepseek-ai/dsh-llm-pi-ai` 内建这三家的目录路由——端点、协议、模型清单、思维链方言全部预置，**接入零代码**，只需配置 route + 把 API key 写入 `$DSH_HOME/.credentials.yaml`。
 3. **订阅认证（ChatGPT/Claude/Grok）可作为可选第二阶段。** 第三方插件 `dsh-plugin-subscriptions` 的 OAuth 流程依赖 127.0.0.1 回环 + 浏览器，无头远程机需 auth.json 迁移或手动粘贴回调码；API key 路线对无头服务器严格更优，应为主路线。
-4. **版本锁定需从 rc.8 重新评估。** npm 最新已到 `0.1.1-rc.2`，本次核验确认全部四个关键包（`dsh`、`dsh-sdk-jsonrpc-server`、`dsh-sdk-jsonrpc-demo`、`dsh-agent-spine-demo`）在该版本齐全；`dsh-llm-pi-ai` 在 rc.7 / rc.8 / 0.1.1-rc.2 均锁 `@earendil-works/pi-ai ^0.82.1`，provider 目录不随 dsh 版本变化。最终锁哪个版本留待实现前用安装探针裁定（设计文档 §5.2 的探针流程）。
+4. **版本已裁定为 `0.1.1-rc.2`。** 2026-08-31 空目录安装探针确认生产 profile 直接引用的 19 个包均能以该精确版本共存；真实 `dsh-jsonrpc-agent` 完成 keyless `initialize` / `shutdown`，且未打开 TCP listener。Bridge 不跟随浮动 prerelease tag，后续升级单独评审。
 
 ## 2. 本机 DSH 部署现状盘点（2026-08-22）
 
@@ -81,7 +81,7 @@ ZAI_CODING_CN_API_KEY: xxxx
 MINIMAX_API_KEY: xxxx
 ```
 
-要点：harness 自行解析 `apiKeyEnv` 引用并按请求传递，**凭据不落入 `process.env`**；Bridge 侧沿用设计文档既有承诺——不打开、不复制、不打印、不持久化任何 key 值。
+要点：harness 自行解析 `apiKeyEnv` 引用；凭据可来自继承环境或 credentials 文件。Bridge 只传递配置中的变量名，不打开 credentials 文件，不读取、复制、打印或持久化 key 值。
 
 ### 4.5 Bridge 生成 profile 的配置样例
 
@@ -140,18 +140,19 @@ DeepSeek 官方 API 在 pi-ai 目录中同样存在（`deepseek` 路由，openai
 | 订阅插件第三方 + OAuth 无头障碍 | 不可控 | 降为 P4 可选，主路线 API key |
 | 远程机环境未核实（OS/Node/网络可达性） | 部署清单假设失效 | §6 前置验证步骤 |
 
-开放问题（实现前裁定）：
+实现裁定：
 
-- **版本锁定**：rc.8 还是 0.1.1-rc.2——两者包闭包均齐全，用设计文档 §5.2 安装探针在空目录实测后定，倾向取更新的 0.1.1-rc.2（修 bug 多、距离稳定版更近）
-- **`listModels()` 静态 vs 动态**：v1 建议静态编码（三家旗舰 + 常用款，id 形如 `<route>/<model>`），与精确版本一同锁定；动态读 profile 配置留待用户自定义 provider 需求出现后再做
+- **版本锁定**：`0.1.1-rc.2`，19 个直接包统一精确版本；真实 keyless profile 冒烟通过。
+- **`listModels()`**：v1 静态编码 8 条已核验 route/model，与运行版本一同锁定；动态自定义 provider 留待后续需求。
+- **曝光策略**：Catalog 可见、按需安装、永不作为默认后端；`full` 之外的项目不会显示或启动 DSH。
 
 ## 8. 实施计划
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| **P1 代码落地** | `src/agent/dsh/{backend,thread,event-map}.ts`；REGISTRY + BACKEND_CATALOG 双注册（`hidden: true` 灰度）；安装器 `installSpecs` 多包扩展；JSON-RPC 假服务 fixture + 单元/生命周期测试 | 设计文档 §12–13 全部条目；现有 Codex/Claude 测试不回归 |
+| **P1 代码落地（完成）** | `src/agent/dsh/{backend,thread,event-map}.ts`；REGISTRY + BACKEND_CATALOG 双注册；安装器 `installSpecs` 多包扩展；JSON-RPC 假服务 fixture + 单元/生命周期测试 | 设计文档 §12–13 的自动化条目；现有 Codex/Claude 测试不回归 |
 | **P2 本机冒烟** | 本 Mac 用真实 Kimi/GLM/MiniMax key，测试群跑通：流式、工具调用展示、中止、Bridge 重启后同话题恢复、模型/effort 切换 | 设计文档 §13 条目 4–7、10 |
 | **P3 远程机部署** | 按 §6 清单部署远程机，真实消息冒烟 | 远程机上 P2 同款场景全过 |
-| **P4 可选** | 订阅插件接入（auth.json 迁移方案）；catalog 取消 `hidden` 对用户开放 | 独立评审 |
+| **P4 可选** | 订阅插件接入（auth.json 迁移方案） | 独立评审 |
 
-P1 易漏项备忘（源自对 Bridge 现有两后端的逐文件核对）：子进程 env 带 `FEISHU_CODEX_BRIDGE=1`（防 cli-bridge 自转发）；system prompt 追加 `BRIDGE_DEVELOPER_INSTRUCTIONS`；用 `src/platform/spawn.ts` 的 `spawnProcess`（`detached: true`）+ `killProcessGroup`，不裸用 child_process；`AgentRun.lastActivity()` 每收到一条原始消息即刷新（否则 120s idle watchdog 会杀长静默轮次）；`AgentInput.images` 非空时发 prompt 前显式报错。
+P1 易漏项备忘（源自对当时 Bridge 两个既有后端的逐文件核对）：子进程 env 带 `FEISHU_CODEX_BRIDGE=1`（防 cli-bridge 自转发）；system prompt 追加 `BRIDGE_DEVELOPER_INSTRUCTIONS`；用 `src/platform/spawn.ts` 的 `spawnProcess`（`detached: true`）+ `killProcessGroup`，不裸用 child_process；`AgentRun.lastActivity()` 每收到一条原始消息即刷新（否则 120s idle watchdog 会杀长静默轮次）；`AgentInput.images` 非空时发 prompt 前显式报错。

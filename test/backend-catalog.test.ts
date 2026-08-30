@@ -22,7 +22,7 @@ import { paths } from '../src/config/paths';
 
 /**
  * 棒A 地基：catalog↔REGISTRY 配对、按需加载器三路径、installer 命令构建（不真跑
- * npm）、智能默认规则、ensureAnyAgent 放行。当前内置后端仅 codex（claude 系已移除）。
+ * npm）、智能默认规则与创建过滤；覆盖 codex、Claude 和 DSH 三条注册路径。
  */
 
 describe('catalog ↔ REGISTRY 配对（防漏注册）', () => {

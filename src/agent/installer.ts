@@ -8,7 +8,7 @@ import { isBackendDepInstalled, isBackendBinInstalled, installedBackendVersion }
 import { fixNativeHelperPerms } from './native-helpers';
 
 /**
- * 按需后端依赖的安装执行器（npm-ondemand 包；通用基础设施，当前内置后端未用）。
+ * 按需后端依赖的安装执行器（npm-ondemand 包；Claude / DSH 共用）。
  *
  * 装到用户私装目录 {@link paths.backendsDir}（永远用户可写，零 sudo/brew——见
  * design/backend-catalog-ondemand.md §2.2 方案A）。流程：

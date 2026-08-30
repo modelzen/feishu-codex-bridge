@@ -1,5 +1,11 @@
 # 开发日志（DEVLOG）
 
+## #3 · 2026-08-31 · DSH 后端完成首版实现并锁定 rc.2
+- **落地**：新增可见但非默认的 `dsh-sdk` 后端；通过官方 JSON-RPC stdio 运行 `dsh-jsonrpc-agent`，同一飞书话题复用一个进程和稳定 `sessionId`，模型 / effort 切换或 Bridge 恢复时换进程但保留会话历史。
+- **版本裁定**：空目录安装探针确认 19 个直接引用包均可精确锁定为 `0.1.1-rc.2`；真实 keyless profile 冒烟完成 `initialize` / `shutdown`，且子进程未监听 TCP 端口。复验命令：`node scripts/check-dsh-profile.mjs <backend-install-dir>`。
+- **安全边界**：首版仅 `full`，`qa` / `write` 在启动前 fail closed；固定 native tools、关闭 telemetry、禁止 Code/PTC，不实现图片、goal、steer、compact、审批或历史选择器。provider key 由 DSH credentials provider 解析，Bridge 不读取 key 值。
+- **验证**：协议传输、事件去重、安装回滚、跨 runtime 恢复、并发拒绝、中止与进程组回收均有独立 harness；真实 provider prompt 留给维护者在独立测试机器人中人工验证。
+
 ## #2 · 2026-08-22 · DSH 后端模型层改走 pi-ai 多 provider 路线
 - **背景**：dsh-backend-design.md 假设 DeepSeek 官方 adapter + `DEEPSEEK_API_KEY`，但实际可用的是 MiniMax / Kimi / GLM 的 API key（另有 Grok 等订阅认证）；部署目标为远程机上 Bridge + 同机 DSH 子进程。
 - **决策**：统一采用官方通用适配器 `@deepseek-ai/dsh-llm-pi-ai`（内建 MiniMax/Kimi/GLM/DeepSeek 目录路由，零代码接入），API key 走 `$DSH_HOME/.credentials.yaml`；订阅插件 `dsh-plugin-subscriptions` 降为 P4 可选。设计文档已就地修订（§4/§5.2/§6/§8.3/§10）。

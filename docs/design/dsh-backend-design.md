@@ -1,8 +1,8 @@
 # DeepSeek Harness 后端设计规格
 
-> 状态：设计评审（2026-08-22 修订：模型层由 DeepSeek-only 改为 `dsh-llm-pi-ai` 多 provider 路线，依据见 [dsh-backend-research.md](./dsh-backend-research.md)）
-> 日期：2026-08-20
-> 目标版本：DeepSeek Harness `0.1.0-rc.8`（实现前以 `0.1.1-rc.2` 重新验证包闭包后裁定最终锁定版本）
+> 状态：首版实现完成，待 Draft PR 评审（2026-08-31）
+> 日期：2026-08-20；实现复验：2026-08-31
+> 锁定版本：DeepSeek Harness `0.1.1-rc.2`
 > 后端标识：`dsh-sdk`
 
 ## 1. 决策摘要
@@ -16,7 +16,7 @@ feishu-codex-bridge 将以一个独立的 `AgentBackend` 接入 DeepSeek Harness
 - 会话历史由 DSH JSONL 持久化；Bridge 重启或子进程被中止后，使用同一 `sessionId` 恢复。
 - 仅支持 `full` 权限模式。Bridge 不声称 DSH 已提供与现有 `qa` / `write` 模式等价的隔离。
 - 强制使用 DSH native tools，禁用 Code/PTC 工具模式。
-- 运行依赖按需安装到 Bridge 私有后端目录，并精确锁定 `0.1.0-rc.8`。
+- 运行依赖按需安装到 Bridge 私有后端目录，并把全部直接引用包精确锁定为 `0.1.1-rc.2`。
 - 首个版本不实现 DSH Web、ACP、历史会话选择器、运行中 steer、交互审批或图片输入。
 
 ## 2. 背景与目标
@@ -43,23 +43,21 @@ feishu-codex-bridge 将以一个独立的 `AgentBackend` 接入 DeepSeek Harness
 
 ## 3. 上游能力核验
 
-本设计基于 DSH 官方 `dsh-v0.1.0-rc.8` 标签，而非浮动的 npm `latest` 标签：
+最终实现基于 DSH 官方 `dsh-v0.1.1-rc.2` 标签，而非浮动的 npm `latest` 标签：
 
-- [DeepSeek Harness rc.8 源码](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.0-rc.8)
-- [Headless CLI](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.0-rc.8/examples/headless-agent)
-- [ACP Agent](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.0-rc.8/examples/acp-agent)
-- [SDK JSON-RPC Protocol](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.0-rc.8/packages/sdk/protocol)
-- [SDK JSON-RPC Server](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.0-rc.8/packages/sdk/server)
-- [JSON-RPC Agent Example](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.0-rc.8/examples/jsonrpc-agent)
-- [DeepSeek LLM Adapter](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.0-rc.8/packages/llm/llm-deepseek)
-- [Session Persistence](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.0-rc.8/packages/session/session-persistence)
+- [DeepSeek Harness rc.2 源码](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.1-rc.2)
+- [SDK JSON-RPC Protocol](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.1-rc.2/packages/sdk/protocol)
+- [SDK JSON-RPC Server](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.1-rc.2/packages/sdk/server)
+- [JSON-RPC Agent Example](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.1-rc.2/examples/jsonrpc-agent)
+- [pi-ai LLM Adapter](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.1-rc.2/packages/llm/llm-pi-ai)
+- [Session Persistence](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.1.1-rc.2/packages/session/session-persistence)
 
 ### 3.1 协议选择
 
 | 方案 | 结论 | 原因 |
 |---|---|---|
 | Headless CLI | 不采用 | 一次命令创建一次任务，只输出最终答案，不能承载 Bridge 的多轮流式会话 |
-| ACP | 不采用 | rc.8 仅支持新会话；不支持 load、list、resume、delete 或 fork，Bridge 重启后无法可靠续接 |
+| ACP | 不采用 | 无法满足 Bridge 以既有稳定 `sessionId` 跨进程恢复的首版要求 |
 | Web API | 不采用 | 引入额外 Web 运行时和未认证本地端口，协议面过大且不是 Bridge 所需的最小集成面 |
 | SDK JSON-RPC stdio | 采用 | 官方协议提供稳定 `sessionId`、流式事件和 JSONL 持久化，且无需开放网络端口 |
 
@@ -142,18 +140,19 @@ Catalog 新增以下记录：
 
 ### 5.2 精确依赖集合
 
-DSH 仍处于 developer preview，npm 的 `latest` 与预发布标签可能不同步，因此安装器必须使用精确版本：
+DSH 仍处于 developer preview，npm 的 `latest` 与预发布标签可能不同步，因此安装器必须使用精确版本。最终实现把主包、JSON-RPC runtime 及生成 profile 直接命名的全部插件统一锁定为：
 
 ```text
-@deepseek-ai/dsh@0.1.0-rc.8
-@deepseek-ai/dsh-sdk-jsonrpc-demo@0.1.0-rc.8
-@deepseek-ai/dsh-sdk-jsonrpc-server@0.1.0-rc.8
-@deepseek-ai/dsh-agent-spine-demo@0.1.0-rc.8
+@deepseek-ai/dsh@0.1.1-rc.2
+@deepseek-ai/dsh-sdk-jsonrpc-demo@0.1.1-rc.2
+@deepseek-ai/dsh-sdk-jsonrpc-server@0.1.1-rc.2
+@deepseek-ai/dsh-agent-spine-demo@0.1.1-rc.2
+@deepseek-ai/dsh-llm-pi-ai@0.1.1-rc.2
+# credentials / sandbox / subprocess / native tools / persistence /
+# checkpoint / token-meter / compaction plugins: all 0.1.1-rc.2
 ```
 
-2026-08-22 核验：上述四包在 npm `0.1.1-rc.2` 均已发布；`dsh-llm-pi-ai` 在 rc.7 / rc.8 / 0.1.1-rc.2 均锁 `@earendil-works/pi-ai ^0.82.1`，provider 目录不随 dsh 版本变化。最终锁定 rc.8 还是 0.1.1-rc.2，由下述安装探针实测后裁定。
-
-实现前的安装探针必须在空目录中验证这组包能够解析生成配置所引用的全部插件。若 npm 包依赖闭包已包含其中某个包，可以减少显式安装项，但所有直接使用的包仍须保持同一精确版本，且不得改用浮动 tag。
+完整 19 包清单以 `src/agent/dsh/constants.ts` 的 `DSH_PACKAGES` 为单一真源。2026-08-31 在空目录实际安装后，`scripts/check-dsh-profile.mjs` 逐包读回 `package.json`，确认 19/19 均为 `0.1.1-rc.2`；同一脚本加载生产 profile，完成 keyless `initialize` / `shutdown`，并确认进程未监听 TCP 端口。实测安装树约 284MB，因此管理页提示约 285MB。
 
 ### 5.3 安装器扩展
 
@@ -188,7 +187,7 @@ Bridge 在私有后端目录生成版本化 profile。profile 只组合 DSH 官�
 - context compaction
 - native tools
 
-profile 位于后端依赖目录旁，使 DSH Loader 可以从同一 `node_modules` 解析裸包名。profile 内容由 Bridge 管理，用户升级 DSH 版本时可按模板版本重建。agent spine 的 `workspaceContext` 和 skills 在首版关闭，避免未请求的工作区预扫描和能力扩张；文件只在模型明确调用 native tools 时读取。
+profile 位于 `~/.feishu-codex-bridge/backends/dsh-sdk/cordis.yml`，紧邻私装依赖目录，使 DSH Loader 可以从同一 `node_modules` 解析裸包名。profile 内容由 Bridge 管理，体检 / 启动时按模板原子重建。agent spine 的 `workspaceContext` 和 skills 在首版关闭，避免未请求的工作区预扫描和能力扩张；文件只在模型明确调用 native tools 时读取。
 
 ### 6.2 进程环境
 
@@ -208,7 +207,7 @@ FEISHU_CODEX_BRIDGE=1
 约束如下：
 
 - 各 provider 的 API key（`MOONSHOT_API_KEY`、`ZAI_CODING_CN_API_KEY`、`MINIMAX_API_KEY`、`DEEPSEEK_API_KEY` 等，路由与 env 名映射见研究报告 §4.2）由 DSH 官方 credentials provider 按其既有优先级解析，包括继承环境和 `$DSH_HOME/.credentials.yaml`；Bridge 不打开、不复制、不打印、不持久化任何 key 值。
-- `DSH_SESSION_ROOT` 按机器人实例隔离，避免多个飞书机器人意外共享历史。
+- `DSH_SESSION_ROOT` 位于 `~/.feishu-codex-bridge/bots/<appId>/dsh-sessions/`，按机器人实例隔离，避免多个飞书机器人意外共享历史。
 - 项目 `cwd` 在 session 创建时固化，并在恢复时再次校验。
 - `FEISHU_CODEX_BRIDGE_DSH_EFFORT` 是 Bridge 私有变量，由生成的 profile 映射到 DeepSeek adapter 的 `reasoningEffort`；它不是上游 JSON-RPC 字段；对不支持分档 effort 的模型（见 §10），该值只折叠为推理开/关。
 - stdout 只承载 JSON-RPC；stderr 单独捕获并做长度限制，避免协议污染和无限日志增长。
@@ -239,7 +238,7 @@ Bridge 不读取或重写 JSONL。恢复是否成功以 DSH 协议响应和后�
 
 ### 7.3 模型或 effort 变更
 
-DSH rc.8 的初始化配置是进程级配置。话题设置在两轮之间发生变化时：
+DSH `0.1.1-rc.2` 的初始化配置是进程级配置。话题设置在两轮之间发生变化时：
 
 1. 等待当前轮结束。
 2. 向旧进程发送 `shutdown`，超时则终止进程组。
@@ -324,7 +323,7 @@ supportedModes = ['full']
 - `isAlive`：同时检查子进程与 JSON-RPC transport 状态。
 - `runGoal`、`clearGoal`、`steer` 和 `compact`：抛出明确的“不支持”错误，不做静默模拟。
 - `listThreads`：返回空列表；`readHistory`：返回空历史，且能力位 `resume=false` 会隐藏历史恢复入口。
-- backend `doctor`：检查 Node、主包版本、入口文件、profile 和权限模式；不读取 API key 值。
+- backend `doctor`：检查主包精确版本、入口文件和生成 profile；不读取 API key 值。
 
 单个 DSH session 同时只允许一个 active run。并发提交由现有 orchestrator 排队或拒绝，后端自身也要 fail closed，防止消息串线。
 
@@ -419,11 +418,12 @@ Bridge 生成的 profile 只装载 native tool 插件，同时设置 `DSH_TOOLS_
 
 在临时空目录执行：
 
-1. 安装精确 rc.8 包集合。
+1. 安装精确 `0.1.1-rc.2` 包集合。
 2. 验证主包版本和 `dsh-jsonrpc-agent` 入口。
 3. 加载 Bridge 生成的 profile。
 4. 在不发起模型请求的情况下完成进程启动与 `initialize`。
-5. 若开发环境存在 `DEEPSEEK_API_KEY`，可额外执行一次人工确认的最小真实 prompt；CI 不要求该密钥。
+5. 运行 `node scripts/check-dsh-profile.mjs <backend-install-dir>`，确认全部包版本、进程身份、零 TCP listener 与优雅退出。
+6. 真实 provider prompt 只在维护者明确授权的独立测试机器人中执行；CI 不要求也不读取任何密钥。
 
 ## 13. 验收标准
 
