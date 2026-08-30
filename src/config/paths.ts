@@ -107,6 +107,14 @@ export const paths = {
    * 解析靠 createRequire(backendsDir/...).resolve（见 agent/backend-loader）；
    * 安装靠 `npm install --prefix backendsDir`（见 agent/installer）。 */
   backendsDir: join(appDir, 'backends'),
+  /** Generated secret-free DSH Cordis profile, colocated with its private node_modules tree. */
+  get dshProfileFile(): string {
+    return join(paths.backendsDir, 'dsh-sdk', 'cordis.yml');
+  },
+  /** DSH JSONL persistence root for the current bot. */
+  get dshSessionsDir(): string {
+    return join(currentBotDir, 'dsh-sessions');
+  },
   /** 空白项目默认落地目录 */
   projectsRootDir: join(appDir, 'projects'),
   larkCliDir,
