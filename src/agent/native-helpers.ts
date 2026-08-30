@@ -6,7 +6,7 @@ import { log } from '../core/logger';
 
 /**
  * 平台 prebuild 原生 helper 的可执行位修复（通用基础设施，供任何用 node-pty 的
- * 按需后端复用；当前内置后端无此依赖，保留以备将来）。
+ * 按需后端复用；DSH 的依赖闭包包含 node-pty）。
  *
  * 【为什么需要】node-pty 1.1.0 的 macOS `spawn-helper`（prebuildify 产物，node-pty
  * 在 macOS 上经它 posix_spawnp 起 PTY 子进程）经 `npm install` 装进用户私装目录后

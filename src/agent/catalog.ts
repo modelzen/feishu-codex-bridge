@@ -1,4 +1,10 @@
 import { DEFAULT_BACKEND_ID, type PermissionMode } from './types';
+import {
+  DSH_BIN_NAME,
+  DSH_INSTALL_SPECS,
+  DSH_MAIN_PACKAGE,
+  DSH_VERSION,
+} from './dsh/constants';
 
 /**
  * 后端 catalog —— 后端的「元数据 + 管理面驱动」单一真源（依赖类型/体积/检测/安装/
@@ -10,11 +16,11 @@ import { DEFAULT_BACKEND_ID, type PermissionMode } from './types';
  * catalog（设计 §3.5）。Web 后端页 / DM picker / doctor / 按需下载按钮全自动出现。
  */
 
-/** 底层 agent 家族（picker 按此分组；当前仅 Codex 组；string 为未来 agent 预留）。 */
+/** 底层 agent 家族（picker 按此分组；string 交叉类型允许后续家族免改公共类型）。 */
 export type AgentFamily = 'codex' | 'claude' | (string & {});
 
 /** 后端进程的接入方式（仅描述/分组用，不参与运行路由）。 */
-export type BackendAccess = 'app-server' | 'sdk' | 'acp';
+export type BackendAccess = 'app-server' | 'sdk' | 'acp' | 'jsonrpc';
 
 /**
  * 依赖类型 —— 决定「装哪 / 怎么检测 / 能不能一键按需装」。
@@ -22,7 +28,7 @@ export type BackendAccess = 'app-server' | 'sdk' | 'acp';
  *   'npm-ondemand'  npm 包，按需装到用户私装目录（库类 / bin 类两形态）。
  *                   **唯一可一键下载的类型。** 库类（无 binName）走 import + require.resolve；
  *                   bin 类（有 binName）被 spawn、走 node_modules/.bin 路径（见 backend-loader）。
- *                   当前内置后端均非此类（codex 是 external-cli），保留以备将来挂新后端。
+ *                   Claude（库类）与 DSH（bin 类）均通过此路径按需管理。
  *   'npm-external'  外部 npm 包，用户自管（当前内置后端无此类，保留给未来不便按需装的包）。
  */
 export type DepKind = 'external-cli' | 'npm-ondemand' | 'npm-external';
@@ -40,6 +46,11 @@ export interface BackendDep {
   binName?: string;
   /** pin 版本（npm-ondemand，避免漂移）；undefined ⇒ latest。 */
   version?: string;
+  /**
+   * 一个后端需要原子安装的完整 npm 包集合（每项可带精确版本）。未声明时沿用
+   * `pkg` + `version` 的单包行为；声明时 `pkg` 仍是版本展示与安装态判断的主包。
+   */
+  installSpecs?: readonly string[];
   /** 体积提示 MB（Web 下载确认用，给用户预期）。 */
   approxSizeMB?: number;
   /** 检测/装法的一句话提示（external-cli 探不到、npm-external 未装时给用户）。 */
@@ -113,6 +124,24 @@ export const BACKEND_CATALOG: readonly BackendCatalogEntry[] = [
     // 必须与 ClaudeAgentBackend.supportedModes 完全一致（单测强制）。
     supportedModes: ['qa', 'write', 'full'],
     blurb: 'Claude Code（SDK 内置，复用本机登录；qa/write 走 OS 沙箱，能力较 Codex 精简）',
+  },
+  {
+    id: 'dsh-sdk',
+    agentFamily: 'dsh',
+    displayName: 'DeepSeek Harness',
+    access: 'jsonrpc',
+    dep: {
+      kind: 'npm-ondemand',
+      pkg: DSH_MAIN_PACKAGE,
+      binName: DSH_BIN_NAME,
+      version: DSH_VERSION,
+      installSpecs: DSH_INSTALL_SPECS,
+      approxSizeMB: 285,
+      detectHint: `按需下载 DSH ${DSH_VERSION} 运行包（约 285MB）`,
+      installCmd: `由 Bridge 私装精确版本 ${DSH_VERSION}（零 sudo）`,
+    },
+    supportedModes: ['full'],
+    blurb: '实验性多模型 DSH JSON-RPC 后端（仅 full；使用各 provider API key）',
   },
 ];
 

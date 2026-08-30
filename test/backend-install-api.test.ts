@@ -17,6 +17,7 @@ const { CATALOG, doctorResults } = vi.hoisted(() => {
     'codex-appserver': { ok: true, version: '1.2.3' },
     'fake-lib': { ok: false, version: null, hint: '未安装，点下载', depState: 'not-installed', installable: true },
     'fake-bin': { ok: false, version: null, hint: '未安装，点下载', depState: 'not-installed', installable: true },
+    'fake-bundle': { ok: false, version: null, hint: '未安装，点下载', depState: 'not-installed', installable: true },
   };
   const CATALOG = [
     {
@@ -61,6 +62,27 @@ const { CATALOG, doctorResults } = vi.hoisted(() => {
       supportedModes: ['full'],
       blurb: 'bin 类按需装夹具',
     },
+    // 合成「多包 + bin」按需后端：一次安装同版本运行包集合，并校验入口。
+    {
+      id: 'fake-bundle',
+      agentFamily: 'fake',
+      displayName: '假后端（包集合）',
+      access: 'jsonrpc',
+      dep: {
+        kind: 'npm-ondemand',
+        pkg: '@example/fake-runtime',
+        binName: 'fake-jsonrpc-agent',
+        version: '1.2.3',
+        installSpecs: [
+          '@example/fake-runtime@1.2.3',
+          '@example/fake-protocol@1.2.3',
+        ],
+        approxSizeMB: 80,
+        detectHint: '未安装，点下载',
+      },
+      supportedModes: ['full'],
+      blurb: '多包按需装夹具',
+    },
   ];
   return { CATALOG, doctorResults };
 });
@@ -94,7 +116,7 @@ describe('listBackendCatalog · 状态聚合', () => {
     const svc = createAdminService();
     const out = await svc.listBackendCatalog();
     expect(out.defaultBackend).toBe('codex-appserver');
-    expect(out.entries.map((e) => e.id)).toEqual(['codex-appserver', 'fake-lib', 'fake-bin']);
+    expect(out.entries.map((e) => e.id)).toEqual(['codex-appserver', 'fake-lib', 'fake-bin', 'fake-bundle']);
 
     const codex = out.entries.find((e) => e.id === 'codex-appserver')!;
     expect(codex).toMatchObject({
@@ -129,7 +151,7 @@ describe('listBackendCatalog · 状态聚合', () => {
 
 describe('installBackend · installer 委托 + 守门', () => {
   it('库类 installable 后端委托 installer（带版本 pin、binName=undefined），透传进度/结果', async () => {
-    const installer = vi.fn(async (pkg: string, onProgress?: (c: string) => void) => {
+    const installer = vi.fn(async (pkg: string | readonly string[], onProgress?: (c: string) => void) => {
       onProgress?.('added 1 package\n');
       void pkg;
       return { ok: true as const, code: 0, aborted: false, tail: 'done' };
@@ -155,6 +177,19 @@ describe('installBackend · installer 委托 + 守门', () => {
     expect(r.ok).toBe(true);
     // version 省略 → 不拼 @ver（latest）；binName 透传 → 装完走 .bin 校验
     expect(installer).toHaveBeenCalledWith('fake-bin-cli', undefined, undefined, { binName: 'fake-bin-cli' });
+  });
+
+  it('多包后端把精确 installSpecs 原样交给 installer，并校验声明的 bin', async () => {
+    const installer = vi.fn(async () => ({ ok: true as const, code: 0, aborted: false, tail: 'done' }));
+    const svc = createAdminService({ installBackend: installer });
+    const r = await svc.installBackend('fake-bundle');
+    expect(r.ok).toBe(true);
+    expect(installer).toHaveBeenCalledWith(
+      ['@example/fake-runtime@1.2.3', '@example/fake-protocol@1.2.3'],
+      undefined,
+      undefined,
+      { binName: 'fake-jsonrpc-agent' },
+    );
   });
 
   it('非 installable 后端（external-cli codex）→ {ok:false} 给手动装法，不调 installer', async () => {
