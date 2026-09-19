@@ -29,6 +29,13 @@ import type { ServerNotification, Thread, ThreadItem, Turn } from './protocol';
 
 const APPROVAL_POLICY = 'never';
 
+/** Resolve configuration without running a model. null clears the native tier;
+ * an explicit configured tier (including fast) must survive restoring inheritance. */
+async function configuredServiceTier(client: AppServerClient, cwd: string): Promise<string | null> {
+  const result = await client.request<{ config: { service_tier?: string | null } }>('config/read', { cwd, includeLayers: false });
+  return result.config?.service_tier ?? null;
+}
+
 /**
  * Map a permission tier to the thread/start|resume params that enforce it.
  * 'full' (or unset) keeps the historical danger-full-access. 'qa'/'write' send a
@@ -278,7 +285,13 @@ class CodexThread implements AgentThread {
     readonly sessionId: string,
     private model: string | undefined,
     private effort: ReasoningEffort | undefined,
+    private fastMode: boolean | null | undefined,
+    private readonly cwd: string,
   ) {}
+
+  getPreferences(): TurnOptions {
+    return { model: this.model, effort: this.effort, fastMode: this.fastMode };
+  }
 
   runStreamed(input: AgentInput, turn?: TurnOptions): AgentRun {
     const self = this;
@@ -286,6 +299,7 @@ class CodexThread implements AgentThread {
     // Per-turn overrides persist for subsequent turns (matches turn/start semantics).
     if (turn?.model) this.model = turn.model;
     if (turn?.effort) this.effort = turn.effort;
+    if (turn?.fastMode !== undefined) this.fastMode = turn.fastMode;
     // Liveness clock for the idle watchdog: refreshed on EVERY raw notification
     // below (even ones mapNotification drops, like command output deltas), so a
     // long-running shell command doesn't read as "wedged".
@@ -296,8 +310,9 @@ class CodexThread implements AgentThread {
     };
     if (self.model) params.model = self.model;
     if (self.effort) params.effort = self.effort;
+    if (self.fastMode !== undefined) params.serviceTier = self.fastMode ? 'fast' : null;
 
-    // Fire turn/start NOW — at runStreamed() call time, NOT lazily on the first
+    // Except when restoring inheritance (which reads config first), fire turn/start NOW — at runStreamed() call time, NOT lazily on the first
     // next() — so model inference runs in parallel with the caller's card setup
     // (stream.create + adoptThreadId cost 2-3 RTTs before the for-await begins).
     // Early notifications buffer in the client's AsyncQueue, so nothing is lost.
@@ -313,7 +328,10 @@ class CodexThread implements AgentThread {
     // clean child exit closes the stream on its own, ending the loop.)
     let startError: Error | undefined;
     const startFailed: Promise<'start-failed'> = new Promise((resolve) => {
-      self.client.request('turn/start', params).then(undefined, (err: unknown) => {
+      const request = self.fastMode === null
+        ? configuredServiceTier(self.client, self.cwd).then(serviceTier => self.client.request('turn/start', { ...params, serviceTier }))
+        : self.client.request('turn/start', params);
+      request.then(undefined, (err: unknown) => {
         startError = err instanceof Error ? err : new Error(String(err));
         log.fail('agent', startError, { phase: 'turn/start' });
         resolve('start-failed');
@@ -645,28 +663,42 @@ export class CodexAppServerBackend implements AgentBackend {
     // before we spawn, so a rejected tier leaves no orphan app-server process.
     const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact);
     const client = await this.spawn(opts.cwd);
-    const res = await client.request<{ thread: { id: string } }>('thread/start', {
-      cwd: opts.cwd,
-      approvalPolicy: APPROVAL_POLICY,
-      ...sandbox,
-      developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
-      ...(opts.model ? { model: opts.model } : {}),
-    });
-    return new CodexThread(client, res.thread.id, opts.model, opts.effort);
+    try {
+      const inheritedTier = opts.fastMode === null ? await configuredServiceTier(client, opts.cwd) : null;
+      const res = await client.request<{ thread: { id: string } }>('thread/start', {
+        cwd: opts.cwd,
+        approvalPolicy: APPROVAL_POLICY,
+        ...sandbox,
+        developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
+        ...(opts.model ? { model: opts.model } : {}),
+        ...(opts.fastMode !== undefined ? { serviceTier: opts.fastMode === null ? inheritedTier : opts.fastMode ? 'fast' : null } : {}),
+      });
+      return new CodexThread(client, res.thread.id, opts.model, opts.effort, opts.fastMode, opts.cwd);
+    } catch (err) {
+      await client.close().catch(() => undefined);
+      throw err;
+    }
   }
 
   async resumeThread(opts: ResumeThreadOptions): Promise<AgentThread> {
     const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact);
     const client = await this.spawn(opts.cwd);
-    const res = await client.request<{ thread: { id: string } }>('thread/resume', {
-      threadId: opts.sessionId,
-      cwd: opts.cwd,
-      approvalPolicy: APPROVAL_POLICY,
-      ...sandbox,
-      developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
-      ...(opts.model ? { model: opts.model } : {}),
-    });
-    return new CodexThread(client, res.thread.id, opts.model, opts.effort);
+    try {
+      const inheritedTier = opts.fastMode === null ? await configuredServiceTier(client, opts.cwd) : null;
+      const res = await client.request<{ thread: { id: string } }>('thread/resume', {
+        threadId: opts.sessionId,
+        cwd: opts.cwd,
+        approvalPolicy: APPROVAL_POLICY,
+        ...sandbox,
+        developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
+        ...(opts.model ? { model: opts.model } : {}),
+        ...(opts.fastMode !== undefined ? { serviceTier: opts.fastMode === null ? inheritedTier : opts.fastMode ? 'fast' : null } : {}),
+      });
+      return new CodexThread(client, res.thread.id, opts.model, opts.effort, opts.fastMode, opts.cwd);
+    } catch (err) {
+      await client.close().catch(() => undefined);
+      throw err;
+    }
   }
 
   private async spawn(cwd: string): Promise<AppServerClient> {

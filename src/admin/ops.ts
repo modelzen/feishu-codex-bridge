@@ -291,13 +291,18 @@ export async function performSetAutoCompact(opts: {
  * 的最终防线在 {@link pickDefault}：盘上若仍存到坏值，apply 时会被忽略并回落后端默认。 */
 export async function performSetModelDefault(opts: {
   projectName: string;
-  model: string;
+  model?: string;
   effort?: ReasoningEffort;
+  fastMode?: boolean | null;
 }): Promise<AdminWriteOutcome> {
   const p = await getProjectByName(opts.projectName);
   if (!p) return { ok: false, reason: `项目「${opts.projectName}」不存在` };
-  await updateProject(opts.projectName, { defaultModel: opts.model, defaultEffort: opts.effort });
-  return { ok: true, project: await freshOr(opts.projectName, { ...p, defaultModel: opts.model, defaultEffort: opts.effort }) };
+  const patch: Partial<Project> = {
+    ...(opts.model !== undefined ? { defaultModel: opts.model, defaultEffort: opts.effort } : {}),
+    ...(opts.fastMode !== undefined ? { defaultFastMode: opts.fastMode } : {}),
+  };
+  await updateProject(opts.projectName, patch);
+  return { ok: true, project: await freshOr(opts.projectName, { ...p, ...patch }) };
 }
 
 /**

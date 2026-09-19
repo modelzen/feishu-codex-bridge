@@ -1389,7 +1389,7 @@ export function createOrchestrator(
           mode: perm.mode,
           network: perm.network,
           autoCompact: perm.autoCompact,
-        }).then((r) => {
+        }, goal).then((r) => {
           tResolveDone = Date.now();
           return r;
         });
@@ -1430,7 +1430,7 @@ export function createOrchestrator(
           // a fresh session bound to the resolved cwd, on the project's backend.
           const cwd = project?.cwd ?? fallbackCwd;
           const be = backendFor(project?.backend);
-          thread = await be.startThread({ cwd, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
+          thread = await be.startThread({ cwd, fastMode: project?.defaultFastMode, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
           trackSession(sessionKey, thread);
           // 自愈观测：来源=全新会话（无持久化记录），与 resume-ok/resume-recreate
           // 互斥——三者其一 + agent 层的 spawn/prewarm-hit 即可还原完整恢复路径。
@@ -1443,6 +1443,7 @@ export function createOrchestrator(
             sessionId: thread.sessionId,
             backend: be.id,
             titleJobKey,
+            fastMode: project?.defaultFastMode,
             // `text` is already file-woven when preIngested; use the raw
             // `summaryText` (handleTurn's original) so the session label isn't
             // manifest boilerplate + a temp path.
@@ -1521,6 +1522,7 @@ export function createOrchestrator(
           // 编织完成 → turn/start 之间不再读盘：首轮直接用预取的会话记录
           // （prior=undefined 即确知是全新会话，刚 upsert 的记录还没有 model）。
           firstRec: prior ?? null,
+          fastMode: prior ? prior.fastMode : project?.defaultFastMode,
           titleJobKey,
           titleSource,
           timing: { tResolve: tResolveDone - tIntake, tWeave: Date.now() - tIntake },
@@ -1555,15 +1557,26 @@ export function createOrchestrator(
     threadId: string,
     chatId: string,
     perm?: { mode?: PermissionMode; network?: boolean; autoCompact?: boolean },
+    refreshPreferences = false,
   ): Promise<{ thread: AgentThread | undefined; recreated: boolean }> {
     const live = sessions.get(threadId);
     if (live) {
-      if (live.isAlive()) return { thread: live, recreated: false };
+      if (refreshPreferences && live.getPreferences) {
+        const current = await getSession(threadId);
+        const applied = live.getPreferences();
+        refreshPreferences = current?.fastMode !== applied.fastMode
+          || current?.model !== applied.model || current?.effort !== applied.effort;
+      }
+      if (live.isAlive() && !refreshPreferences) return { thread: live, recreated: false };
+      // Goals auto-start natively and never pass through turn/start. Resume the
+      // same native session with the latest persisted preferences before a goal,
+      // including Fast changes made by /model since the previous ordinary turn.
+      if (refreshPreferences) await live.close();
       // app-server 子进程已死（崩溃/被 kill）：死线程留在缓存只会反复失败，
       // 清掉让它落入下面既有的 resume-or-recreate 兜底（持久化的 sessionId
       // 还在，话题自愈而不是僵死到重启）。
       sessions.delete(threadId);
-      log.info('agent', 'dead-thread-evict', { threadId });
+      log.info('agent', refreshPreferences ? 'goal-preferences-refresh' : 'dead-thread-evict', { threadId });
     }
     const rec = await getSession(threadId);
     if (!rec) return { thread: undefined, recreated: false };
@@ -1579,6 +1592,7 @@ export function createOrchestrator(
         sessionId: rec.sessionId,
         model: rec.model,
         effort: rec.effort,
+        fastMode: rec.fastMode,
         mode: perm?.mode,
         network: perm?.network,
         autoCompact: perm?.autoCompact,
@@ -1595,6 +1609,7 @@ export function createOrchestrator(
         cwd,
         model: rec.model,
         effort: rec.effort,
+        fastMode: rec.fastMode,
         mode: perm?.mode ?? project?.mode,
         network: perm?.network ?? project?.network,
         autoCompact: perm?.autoCompact ?? project?.autoCompact,
@@ -1666,7 +1681,7 @@ export function createOrchestrator(
           model: project?.defaultModel,
           effort: project?.defaultEffort,
         });
-        const thread = await be.startThread({ cwd, model, effort, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
+        const thread = await be.startThread({ cwd, model, effort, fastMode: project?.defaultFastMode, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
         tResolveDone = Date.now();
         return { thread, model, effort };
       })();
@@ -1705,6 +1720,7 @@ export function createOrchestrator(
         images,
         model,
         effort,
+        fastMode: project?.defaultFastMode,
         cwd,
         summary: stripFileTokens(text).slice(0, 80) || '(空)',
         requesterOpenId: msg.senderId,
@@ -1792,10 +1808,12 @@ export function createOrchestrator(
         const state: ModelCardState = {
           chatId: msg.chatId,
           threadId: sessionKey,
+          sessionId: rec?.sessionId,
           requesterOpenId: msg.senderId,
           models,
           model: recModel ?? def.model,
           effort: rec?.effort ?? def.effort,
+          fastMode: rec ? rec.fastMode : project?.defaultFastMode,
           backend: be.id,
           createdAt: Date.now(),
         };
@@ -1978,6 +1996,7 @@ export function createOrchestrator(
         // codex thread for a codex session, claude for a claude one.
         const be = backendFor(rec?.backend ?? project?.backend);
         const cwd = rec?.cwd ?? project?.cwd ?? fallbackCwd;
+        const fastMode = rec ? rec.fastMode : project?.defaultFastMode;
         // Carry the session's chosen model/effort into the new thread so /clear
         // resets the CONVERSATION, not the user's model pick. Tier (mode/network/
         // autoCompact) comes from the caller's live perm.
@@ -1985,6 +2004,7 @@ export function createOrchestrator(
           cwd,
           model: rec?.model,
           effort: rec?.effort,
+          fastMode,
           mode: perm.mode,
           network: perm.network,
           autoCompact: perm.autoCompact,
@@ -2011,6 +2031,7 @@ export function createOrchestrator(
           titleJobKey,
           model: rec?.model,
           effort: rec?.effort,
+          fastMode,
           summary: '(新会话)',
           createdAt: Date.now(),
           updatedAt: Date.now(),
@@ -2145,6 +2166,26 @@ export function createOrchestrator(
     return state;
   }
 
+  async function saveProjectModelForm(project: Project, formValue: Record<string, unknown> | undefined) {
+    const modelId = selectValue(formValue, 'model');
+    const effortRaw = asEffort(selectValue(formValue, 'effort'));
+    const fastRaw = selectValue(formValue, 'fastMode');
+    const fastMode = (project.backend ?? DEFAULT_BACKEND_ID) === DEFAULT_BACKEND_ID
+      ? fastRaw === 'default' ? null : fastRaw === 'on' ? true : fastRaw === 'off' ? false : undefined
+      : undefined;
+    // Fast has its own form: changing it must not freeze a currently inherited
+    // model/effort, and does not depend on model discovery being available.
+    if (!modelId && !effortRaw && fastMode !== undefined) {
+      return performSetModelDefault({ projectName: project.name, fastMode });
+    }
+    const visible = (await listModels(backendFor(project.backend))).filter(x => !x.hidden);
+    const model = modelId ? visible.find(x => x.id === modelId) : visible.length === 1 ? visible[0] : undefined;
+    if (!model) return { ok: false as const, reason: '所选模型无效或已下架，未保存。' };
+    const supported = model.supportedEfforts ?? [];
+    const effort = effortRaw && supported.includes(effortRaw) ? effortRaw : supported.length ? model.defaultEffort : undefined;
+    return performSetModelDefault({ projectName: project.name, model: model.id, effort, fastMode });
+  }
+
   dispatcher
     .on(MC.model, ({ evt, option }) => {
       const state = authPending(modelPending, evt);
@@ -2176,6 +2217,22 @@ export function createOrchestrator(
         state.effort = option as ReasoningEffort;
         await patchSession(state.threadId, { effort: state.effort });
         state.note = '✅ 已设置 effort，下一轮生效';
+        return buildModelCard(state);
+      });
+    })
+    .on(MC.fast, ({ evt, option }) => {
+      const state = authPending(modelPending, evt);
+      if (!state || state.backend !== DEFAULT_BACKEND_ID || (option !== 'on' && option !== 'off' && option !== 'default')) return;
+      settleUpdate(evt.messageId, async () => {
+        const rec = await getSession(state.threadId);
+        if (!rec || rec.backend !== state.backend || (state.sessionId && rec.sessionId !== state.sessionId)) {
+          state.note = '⚠️ 会话不存在或后端已切换，请重新发 /model';
+          return buildModelCard(state);
+        }
+        const fastMode = option === 'default' ? null : option === 'on';
+        await patchSession(state.threadId, (latest) => latest.sessionId === rec.sessionId && latest.backend === state.backend ? { fastMode } : {});
+        state.fastMode = fastMode;
+        state.note = `✅ Fast ${fastMode === null ? '已恢复沿用 Codex 设置' : fastMode ? '已开启' : '已关闭'}，下一轮生效`;
         return buildModelCard(state);
       });
     })
@@ -3480,19 +3537,11 @@ export function createOrchestrator(
     })
     .on(GS.modelDefaultSubmit, ({ evt, formValue }) => {
       if (!isAdmin(cfg, evt.operator?.openId ?? '')) return;
-      const modelId = selectValue(formValue, 'model');
-      const effortRaw = asEffort(selectValue(formValue, 'effort'));
       void (async () => {
         const project = await getProjectByChatId(evt.chatId);
         if (!project) return;
-        const models = await listModels(backendFor(project.backend));
-        const m = modelId ? models.find((x) => x.id === modelId && !x.hidden) : undefined;
-        if (m) {
-          const supported = m.supportedEfforts ?? [];
-          const effort = effortRaw && supported.includes(effortRaw) ? effortRaw : supported.length ? m.defaultEffort : undefined;
-          const r = await performSetModelDefault({ projectName: project.name, model: m.id, effort });
-          if (r.ok) log.info('console', 'group-model-default', { project: project.name, model: m.id, effort });
-        }
+        const r = await saveProjectModelForm(project, formValue);
+        if (r.ok) log.info('console', 'group-model-default', { project: project.name });
         const fresh = (await getProjectByChatId(evt.chatId)) ?? project;
         await sendManagedCard(channel, evt.chatId, buildGroupSettingsCard(fresh)).catch((e) =>
           log.fail('console', e, { phase: 'group-model-default-result' }),
@@ -3685,25 +3734,12 @@ export function createOrchestrator(
     .on(DM.modelDefaultSubmit, ({ evt, value, formValue }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const name = typeof value.n === 'string' ? value.n : '';
-      const modelId = selectValue(formValue, 'model');
-      const effortRaw = asEffort(selectValue(formValue, 'effort'));
       void (async () => {
         const p = await getProjectByName(name);
         if (!p) return;
-        const models = await listModels(backendFor(p.backend));
-        const m = modelId ? models.find((x) => x.id === modelId && !x.hidden) : undefined;
-        let notice: string;
-        if (!m) {
-          notice = '⚠️ 所选模型无效或已下架，未保存。';
-        } else {
-          const supported = m.supportedEfforts ?? [];
-          const effort = effortRaw && supported.includes(effortRaw) ? effortRaw : supported.length ? m.defaultEffort : undefined;
-          const r = await performSetModelDefault({ projectName: name, model: m.id, effort });
-          notice = r.ok
-            ? `✅ 默认已设为「${m.displayName}」${effort ? ` · 强度 ${effort}` : ''}，新话题生效。`
-            : `⚠️ ${r.reason}`;
-          if (r.ok) log.info('console', 'project-model-default', { project: name, model: m.id, effort });
-        }
+        const r = await saveProjectModelForm(p, formValue);
+        const notice = r.ok ? '✅ 默认设置已保存，新话题生效。' : `⚠️ ${r.reason}`;
+        if (r.ok) log.info('console', 'project-model-default', { project: name });
         const fresh = (await getProjectByName(name)) ?? p;
         await sendManagedCard(
           channel,
@@ -3874,6 +3910,7 @@ export function createOrchestrator(
     knownThreadId?: string;
     model?: string;
     effort?: ReasoningEffort;
+    fastMode?: boolean | null;
     cwd?: string;
     summary?: string;
     /** who triggered this run (for ⏹/⚙️ ownership gating) */
@@ -4071,6 +4108,7 @@ export function createOrchestrator(
         titleJobKey: opts.titleJobKey,
         model: opts.model,
         effort: opts.effort,
+        fastMode: opts.fastMode,
         summary: opts.summary ?? opts.firstText.slice(0, 80),
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -4129,7 +4167,7 @@ export function createOrchestrator(
         const turnModel = rec?.model ?? opts.model;
         const turnEffort = rec?.effort ?? opts.effort;
         const modelDisp = getModelDisplay(cfg);
-        const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
+        const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort, fastMode: rec ? rec.fastMode : opts.fastMode });
         titleTurnAttempted = true;
         const turnStartAt = Date.now(); // turn/start 已在 runStreamed() 内发出（与下面的建卡并行）
         state.run = run;
@@ -4568,6 +4606,7 @@ export function createOrchestrator(
         titleJobKey: opts.titleJobKey,
         model: opts.model,
         effort: opts.effort,
+        fastMode: opts.fastMode,
         summary: opts.summary ?? objective.slice(0, 80),
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -4921,7 +4960,7 @@ export function createOrchestrator(
           try {
             const thread = await resolveDocThread(sessionKey, cwd, instructions, ctx.question);
             const rec = await getSession(sessionKey);
-            const run = thread.runStreamed({ text: prompt }, { model: rec?.model, effort: rec?.effort });
+            const run = thread.runStreamed({ text: prompt }, { model: rec?.model, effort: rec?.effort, fastMode: rec?.fastMode });
 
             let state: RunState = initialState;
             let timedOut = false;
@@ -5026,6 +5065,7 @@ export function createOrchestrator(
           sessionId: rec.sessionId,
           model: rec.model,
           effort: rec.effort,
+          fastMode: rec.fastMode,
         });
         trackSession(sessionKey, resumed);
         commentInstrUsed.set(sessionKey, instructions);

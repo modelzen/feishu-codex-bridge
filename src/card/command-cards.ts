@@ -5,6 +5,7 @@ import { actions, button, card, hr, linkButton, md, note, selectStatic, type Car
 export const MC = {
   model: 'model.set',
   effort: 'model.effort',
+  fast: 'model.fast',
 } as const;
 
 /** Action ids for the `/resume` card. */
@@ -35,10 +36,12 @@ export interface ModelCardState {
   chatId: string;
   /** the topic (session) whose model/effort this card edits */
   threadId: string;
+  sessionId?: string;
   requesterOpenId: string;
   models: ModelInfo[];
   model: string;
   effort: ReasoningEffort;
+  fastMode?: boolean | null;
   /** the backend whose models this card lists（写回会话前复核，防跨后端把一个后端的
    * model id 持久化进另一后端的会话——resume 时会喂坏 CLI）。旧卡缺省。 */
   backend?: string;
@@ -99,6 +102,18 @@ export function buildModelCard(state: ModelCardState): CardObject {
     elements.push(note('该后端不支持在此切换模型或推理强度。'));
   }
 
+  if (state.backend === 'codex-appserver') {
+    elements.push(hr(), md('⚡ **Fast 模式**'), actions([selectStatic({
+      actionId: MC.fast,
+      placeholder: 'Fast 模式',
+      initial: state.fastMode == null ? 'default' : state.fastMode ? 'on' : 'off',
+      options: [
+        { label: '沿用 Codex 设置（未覆盖）', value: 'default' },
+        { label: 'Fast：开启', value: 'on' },
+        { label: 'Fast：关闭', value: 'off' },
+      ],
+    })]), note('下一轮生效。Fast 会增加用量消耗，可用性取决于模型和账号。'));
+  }
   if (state.note) elements.push(note(state.note));
   return card(elements, { summary: '模型设置' });
 }

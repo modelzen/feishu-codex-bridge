@@ -263,3 +263,11 @@ describe('session-store', () => {
     expect(await getSession('t-marker')).not.toHaveProperty('titleJobKey');
   });
 });
+
+
+it('persists explicit restored inheritance over an old Fast override', async () => {
+  await upsertSession({ ...rec('fast', 'host'), fastMode: true });
+  await patchSession('fast', { fastMode: null });
+  expect((await getSession('fast'))?.fastMode).toBeNull();
+  expect(JSON.parse(await readFile(paths.sessionsFile, 'utf8')).sessions[0].fastMode).toBeNull();
+});

@@ -93,7 +93,7 @@ describe('buildModelDefaultCard · 按后端能力自适应 + ctx 路由', () =>
   });
 
   it('claude（无 effort 档）→ 有模型下拉、无强度下拉 + 说明', () => {
-    const j = json({ name: 'p' }, claude, 'dm');
+    const j = json({ name: 'p', backend: 'claude-agent' }, claude, 'dm');
     expect(j).toContain('Opus');
     expect(j).not.toContain('强度：'); // 不出现假 effort 档
     expect(j).toContain('不调节推理强度');
@@ -101,7 +101,7 @@ describe('buildModelDefaultCard · 按后端能力自适应 + ctx 路由', () =>
 
   it('单模型 + 无 effort → 信息卡，无表单提交', () => {
     const single = [model({ id: 'only', displayName: '唯一模型', isDefault: true })];
-    const j = json({ name: 'p' }, single, 'dm');
+    const j = json({ name: 'p', backend: 'claude-agent' }, single, 'dm');
     expect(j).toContain('唯一模型');
     expect(j).toContain('无需设置默认');
     expect(j).not.toContain('dm.proj.modelDefault.submit');
@@ -130,4 +130,38 @@ describe('modelDefaultSummary', () => {
     expect(s).toContain('gpt-5.5');
     expect(s).toContain('高'); // EFFORT_LABEL.high
   });
+});
+
+
+describe('Fast defaults', () => {
+  it.each(['dm', 'group'] as const)('renders and echoes Fast in %s settings', ctx => {
+    const j = json({ name: 'p', defaultFastMode: true }, codex, ctx);
+    expect(j).toContain('"name":"fastMode"');
+    expect(j).toContain('"initial_option":"on"');
+    expect(j).toContain('用量消耗');
+    expect(json({ name: 'p', defaultFastMode: false }, codex, ctx)).toContain('"initial_option":"off"');
+  });
+  it('offers Fast even for a single Codex model without effort', () => {
+    const j = json({ name: 'p' }, [model({ id: 'only', displayName: 'Only' })], 'dm');
+    expect(j).toContain('"name":"fastMode"');
+    expect(j).toContain('dm.proj.modelDefault.submit');
+  });
+  it('does not offer Codex Fast for Claude', () => {
+    expect(json({ name: 'p', backend: 'claude-agent' }, claude, 'dm')).not.toContain('"name":"fastMode"');
+  });
+  it('summarizes explicit on and off while keeping unconfigured defaults neutral', () => {
+    expect(modelDefaultSummary({ defaultFastMode: true })).toContain('Fast 开启');
+    expect(modelDefaultSummary({ defaultFastMode: false })).toContain('Fast 关闭');
+    expect(modelDefaultSummary({})).not.toContain('Fast');
+  });
+});
+
+
+it('keeps a separate Fast-only form and always offers inherited settings', () => {
+  const j = json({ name: 'p', defaultFastMode: true }, [], 'dm');
+  expect(j).toContain('"name":"fast_default"');
+  expect(j).not.toContain('"name":"model_default"');
+  expect(j).toContain('沿用 Codex 设置');
+  expect(j).toContain('"value":"default"');
+  expect(modelDefaultSummary({ defaultFastMode: null })).not.toContain('Fast 关闭');
 });

@@ -89,3 +89,16 @@ describe('buildModelCard · 按当前模型能力自适应', () => {
     expect(j).not.toContain('model.set'); // 只有 1 个可见 → 不给模型下拉
   });
 });
+
+
+describe('/model Fast', () => {
+  it.each([true, false, undefined])('echoes stored Fast %s', fastMode => {
+    const j = json({ ...state(codex, 'gpt-5.6-sol'), backend: 'codex-appserver', fastMode });
+    expect(j).toContain('model.fast');
+    expect(j).toContain(`"initial_option":"${fastMode === undefined ? 'default' : fastMode ? 'on' : 'off'}"`);
+    expect(j).toContain('用量消耗');
+  });
+  it('hides Fast on other backends', () => {
+    expect(json({ ...state(multiNoEffort, 'm1'), backend: 'claude-agent' })).not.toContain('model.fast');
+  });
+});

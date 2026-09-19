@@ -195,9 +195,13 @@ export interface CompactResult {
 export interface TurnOptions {
   model?: string;
   effort?: ReasoningEffort;
+  /** Fast preference: null restores Codex configuration, undefined preserves native settings. */
+  fastMode?: boolean | null;
 }
 
 export interface AgentThread {
+  /** Last model, effort and Fast preferences applied to this live thread, when supported. */
+  getPreferences?(): TurnOptions;
   /** backend session id（codex 的 thread id，其它后端可能是 session UUID）——持久化进
    * SessionRecord.sessionId，重启后经 resumeThread 找回同一会话。 */
   readonly sessionId: string;
@@ -235,6 +239,8 @@ export interface StartThreadOptions {
   cwd: string;
   model?: string;
   effort?: ReasoningEffort;
+  /** Fast preference: null restores Codex configuration, undefined preserves native settings. */
+  fastMode?: boolean | null;
   /** permission tier; undefined → 'full' (preserves legacy danger-full-access) */
   mode?: PermissionMode;
   /** let the sandboxed agent's shell reach the network (qa/write only; full is

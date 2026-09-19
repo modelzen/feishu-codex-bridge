@@ -8,6 +8,7 @@ import {
   createAdminWriteExecutor,
   performBackendSwitch,
   performSetAutoCompact,
+  performSetModelDefault,
   performSetCompletionReminder,
   performSetNoMention,
   performSetPermissionMode,
@@ -423,4 +424,27 @@ describe('createAdminWriteExecutor / runAdminWriteOp（Web · IPC 入口）', ()
       missingCfg({ kind: 'setCompletionReminder', mode: 'failures', longTaskMinutes: 3 }),
     ).rejects.toBeInstanceOf(AdminWriteError);
   });
+});
+
+
+describe('persist Fast project defaults', () => {
+  it('round-trips on/off and preserves preference on legacy model-only saves', async () => {
+    await performSetModelDefault({ projectName: 'demo', model: 'gpt-5.5', fastMode: true });
+    expect((await getProjectByName('demo'))?.defaultFastMode).toBe(true);
+    await performSetModelDefault({ projectName: 'demo', model: 'gpt-5.5', effort: 'high' });
+    expect((await getProjectByName('demo'))?.defaultFastMode).toBe(true);
+    await performSetModelDefault({ projectName: 'demo', model: 'gpt-5.5', fastMode: false });
+    expect((await getProjectByName('demo'))?.defaultFastMode).toBe(false);
+  });
+});
+
+
+
+it('restores Fast inheritance durably without selecting model or effort', async () => {
+  await performSetModelDefault({ projectName: 'demo', fastMode: true });
+  await performSetModelDefault({ projectName: 'demo', fastMode: null });
+  const project = await getProjectByName('demo');
+  expect(project?.defaultFastMode).toBeNull();
+  expect(project?.defaultModel).toBeUndefined();
+  expect(project?.defaultEffort).toBeUndefined();
 });
