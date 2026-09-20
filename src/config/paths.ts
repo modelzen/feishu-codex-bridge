@@ -102,11 +102,19 @@ export const paths = {
   /**
    * 按需后端（npm-ondemand 包）私装目录：一个扁平
    * `~/.feishu-codex-bridge/backends/node_modules` 放所有按需后端的 npm 包。
-   * （通用基础设施；当前内置后端 codex 是 external-cli，不落此目录，保留以备将来。）
+   * Claude / DSH 等 npm-ondemand 后端落在此处；codex external-cli 不落此目录。
    * 永远在用户 HOME 下、用户可写（零 sudo/brew），与全局包目录的权限死结解耦。
    * 解析靠 createRequire(backendsDir/...).resolve（见 agent/backend-loader）；
    * 安装靠 `npm install --prefix backendsDir`（见 agent/installer）。 */
   backendsDir: join(appDir, 'backends'),
+  /** Generated secret-free DSH Cordis profile, colocated with its private node_modules tree. */
+  get dshProfileFile(): string {
+    return join(paths.backendsDir, 'dsh-sdk', 'cordis.yml');
+  },
+  /** DSH JSONL persistence root for the current bot. */
+  get dshSessionsDir(): string {
+    return join(currentBotDir, 'dsh-sessions');
+  },
   /** 空白项目默认落地目录 */
   projectsRootDir: join(appDir, 'projects'),
   larkCliDir,

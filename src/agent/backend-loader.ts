@@ -6,7 +6,7 @@ import { paths } from '../config/paths';
 import type { BackendCatalogEntry } from './catalog';
 
 /**
- * 按需后端依赖的加载器（npm-ondemand 包，库类 / bin 类；通用基础设施，当前内置后端未用）。
+ * 按需后端依赖的加载器（npm-ondemand 包，库类 / bin 类；Claude / DSH 共用）。
  *
  * 真机验证过的解析方案（design/backend-catalog-ondemand.md §2.1，实验 C/D/F）：
  *   ① 先试 bridge 自身的 node_modules —— 直接 `await import(pkg)`（bare specifier）。

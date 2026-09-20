@@ -8,16 +8,16 @@
 
 🌐 **官网：<https://bridge.vonvon.cc>**
 
-> 把飞书 / Lark 桥接到你本机的 [Codex](https://github.com/openai/codex) 或 [Claude Code](https://www.anthropic.com/claude-code)，在群里 @ 机器人就能让它在指定项目目录里干活，结果以流式 Markdown 卡片实时回到群里。
+> 把飞书 / Lark 桥接到你本机的 [Codex](https://github.com/openai/codex)、[Claude Code](https://www.anthropic.com/claude-code)，或实验性的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)，在群里 @ 机器人就能让它在指定项目目录里干活，结果以流式 Markdown 卡片实时回到群里。
 >
 > **项目 = 群 = 固定工作目录（cwd）**，**话题（thread）= 一个会话（session）**。
 
-一句话：你在飞书群里发「帮我加个登录接口」，机器人就在这个群绑定的代码目录里跑 Codex / Claude，边跑边把推理、命令、改动、结果更新到一张卡片上；点 ⏹ 可随时终止。
+一句话：你在飞书群里发「帮我加个登录接口」，机器人就在这个群绑定的代码目录里跑所选 agent，边跑边把推理、命令、改动、结果更新到一张卡片上；点 ⏹ 可随时终止。
 
 > 🎀 **想先看它在飞书里长啥样、能干嘛？** 看这篇图文介绍 👉 [《让 Codex 当你飞书里的同事》](https://my.feishu.cn/docx/AFKNdf4QaooL5OxSR8bc5H7vn7b)
 
 ```
-飞书群消息 ──长连接──▶ bridge ──▶ Codex app-server / Claude Agent SDK（每会话一独立后端）
+飞书群消息 ──长连接──▶ bridge ──▶ Codex / Claude / DSH（每会话一独立后端）
    ▲                      │
    └─── 流式 Markdown 卡片 ◀┘
 ```
@@ -42,7 +42,7 @@ feishu-codex-bridge web
 ```text
 帮我在这台电脑上安装并跑起来 feishu-codex-bridge：
 
-1) 先 node -v 确认有 Node.js(≥18)，没有就先装好；
+1) 先 node -v 确认有 Node.js(≥20)，没有就先装好；
 2) 再 codex --version 确认已经安装了 codex CLI，没有就先装好；
 3) 全局安装：
    npm i -g @modelzen/feishu-codex-bridge
@@ -68,7 +68,7 @@ feishu-codex-bridge web
 ## ✨ 特性
 
 - **群 = 项目，话题 = 会话**：每个群绑定一个本地目录；群里 @ 机器人就在该目录跑 agent。对某条消息开话题 = 一条独立连续会话（自动 resume）。
-- **两种后端**：**Codex**（能力最全：goal / steer / compact / resume + 真沙箱只读档）或 **Claude Code**（SDK 内置、复用本机登录、能力较精简）。建项目时按需选，同一台机可混用。
+- **三种后端**：**Codex**（能力最全）、**Claude Code**（复用本机登录），以及可按需下载的实验性 **DeepSeek Harness**（DSH，多 provider API key）。建项目时选择，同一台机可混用；DSH 不会成为默认后端。
 - **流式卡片**：推理 / 命令 / 文件改动 / 结果实时刷新到一张可折叠卡片；⏹ 随时终止，卡死有 watchdog 自动回收，异常不波及其他群。
 - **免 @ + 自主目标**：话题 / 单会话群里可直接说话不必每次 @；`/goal <目标>` 让它自主多轮干到完成。
 - **多模态**：消息里直接发图片（读图）、发文件附件（下载到本地交给 agent 打开分析）。
@@ -87,14 +87,14 @@ feishu-codex-bridge web
 
 ### A. 飞书群 → 本机 agent（主用法）
 
-- **建项目**：私聊机器人 → 控制台菜单「新建项目」→ 绑定一个本地目录 → **选后端（Codex / Claude）** → 机器人建好群、置顶命令说明、把你拉进去。
+- **建项目**：私聊机器人 → 控制台菜单「新建项目」→ 绑定一个本地目录 → **选择已就绪的后端** → 机器人建好群、置顶命令说明、把你拉进去。DSH 需先在 Web 控制台「后端 Agent」中下载。
 - **两种群按场景选**：
   - **👥 多话题群**：@ 机器人开话题，每个话题是一条**独立会话**（上下文隔离、可并行）。适合多人协作 / 一人并行多任务。
   - **💬 单会话群**：整群就是**一条连续会话**、全程**免 @**。适合个人单线深入、像私聊一样直接聊。
 - **干活**：群里 @ 机器人（或话题内免 @）描述需求，流式卡片回结果；卡片上 ⏹ 随时终止当前轮。
 - **自主目标**：`/goal <目标>` 让它多轮自主执行到完成；运行卡上有 **⏹ 终止**（立刻停）和 **🎯 结束目标**（本轮跑完停）。
-- **斜杠命令**：`/model`、`/resume`、`/compact`、`/context` 等，按所选后端能力自适应裁剪（Claude 不显示它不支持的项）。
-- **发图 / 附件**：发图片读图、发文件（日志 / PDF / 代码）让 agent 打开分析。
+- **斜杠命令**：`/model`、`/resume`、`/compact`、`/context` 等，按所选后端能力自适应裁剪。DSH 首版不提供 goal / steer / compact / 历史选择器。
+- **发图 / 附件**：Codex / Claude 可直接读图；DSH 首版会在发送前明确拒绝图片，不会静默丢弃。普通文件仍可由 Bridge 下载后交给 agent 分析。
 - **用量**：私聊「用量」看 5h / 7d 限额（剩余 % + 重置时间）与个人统计，一键生成可转发的**战绩分享卡**（数据来自 Codex 个人资料页，需 ChatGPT 登录）。
 
 ### B. 本机 agent → 飞书（☕ 咖啡一下）
@@ -153,6 +153,7 @@ feishu-codex-bridge doctor                      本地自检：后端 / 登录 /
 
 - 🔒 / ✏️ 的读写限定由 OS 沙箱强制，仅 **macOS / 原生 Windows** 可强制；**Linux·WSL 选这两档会 fail-closed 拒绝启动**（绝不静默降级为完全访问），要用请把后端跑在容器 / 隔离环境里。
 - ⚠️ **完全访问** = 任何能给机器人发消息的人都能以你的身份在这台机器上执行任意命令 —— 只把信任的人拉进群、在你自己掌控的机器上跑、目录里别放敏感数据。
+- **DSH 首版只支持「完全访问」**，并在启动前拒绝只读 / 读写档，不会自动提权。它固定使用 native tools、关闭 telemetry，不启动 Web 服务；但仍能访问项目、网络及当前用户可读数据，只适合你完全信任的小团队。
 - 它不是多租户托管服务，是给你（和你信任的小团队）自用的桥。
 
 ---
@@ -160,6 +161,8 @@ feishu-codex-bridge doctor                      本地自检：后端 / 登录 /
 ## 🌐 Web 控制台
 
 `feishu-codex-bridge web` 打开本机浏览器里的管理面板（只绑 `127.0.0.1` + 每次启动随机 token 鉴权），一屏搞定：扫码加机器人、开权限 / 订阅事件 checklist、启停 / 重启 / 更新后台服务、看所有 bot / 项目 / 话题 / 实时日志、后端环境检测。daemon 在跑时是可写控制台；没跑时退化为只读预览，仍可一键启动 daemon。日常管理基本只跟它和飞书私聊控制台打交道。
+
+实验性 DSH 后端在「后端 Agent」页按需安装，Bridge 会把精确锁定的 `0.1.1-rc.2` 包集合私装到 `~/.feishu-codex-bridge/backends/`（无需 sudo）。provider 凭据由 DSH 从继承环境或 `$DSH_HOME/.credentials.yaml` 读取；Bridge 不读取、复制或持久化 key 值。DSH 会话历史按机器人隔离在 `~/.feishu-codex-bridge/bots/<appId>/dsh-sessions/`。
 
 ---
 
