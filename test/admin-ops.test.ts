@@ -1,13 +1,16 @@
 import { rmSync } from 'node:fs';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { paths } from '../src/config/paths';
-import { addProject, getProjectByName, removeProject } from '../src/project/registry';
+import { addProject, getProjectByName, removeProject, updateProject } from '../src/project/registry';
 import {
   AdminWriteError,
   createAppPreferencesWriter,
   createAdminWriteExecutor,
   performBackendSwitch,
   performSetAutoCompact,
+  performSetModelDefault,
+  performSetContextBriefing,
+  performSetDiscuss, performSetParticipation,
   performSetCompletionReminder,
   performSetNoMention,
   performSetPermissionMode,
@@ -102,6 +105,33 @@ beforeEach(async () => {
 });
 
 describe('共享层契约：DM（handle-message re-export）与 ops 是同一个函数对象', () => {
+  it('Discuss is opt-in, only single Codex groups, and preserves noMention', async () => {
+    expect((await getProjectByName('demo'))?.discuss).toBeUndefined();
+    expect((await performSetDiscuss({ projectName: 'demo', on: true })).ok).toBe(false);
+    await updateProject('demo', { kind: 'single', noMention: false });
+    expect((await performSetDiscuss({ projectName: 'demo', on: true })).ok).toBe(true);
+    expect((await getProjectByName('demo'))?.noMention).toBe(false);
+    expect((await performSetDiscuss({ projectName: 'demo', on: false })).ok).toBe(true);
+    expect((await getProjectByName('demo'))?.noMention).toBe(false);
+    expect((await performSetDiscuss({ projectName: 'demo', on: 'yes' as never })).ok).toBe(false);
+  });
+
+  it('persists the project context switch without evicting sessions or modifying other fields', async () => {
+    const before = await getProjectByName('demo');
+    const evict = vi.fn(async () => undefined);
+    const result = await runAdminWriteOp({ kind: 'setContextBriefing', project: 'demo', on: false },
+      { backendFor: () => fakeBackend(), evictLiveSessionsForChat: evict });
+    expect(result.ok).toBe(true);
+    expect(await getProjectByName('demo')).toEqual({ ...before, contextBriefing: false });
+    expect(evict).not.toHaveBeenCalled();
+    expect((await performSetContextBriefing({ projectName: 'demo', on: true })).ok).toBe(true);
+    expect((await getProjectByName('demo'))?.contextBriefing).toBe(true);
+  });
+  it('rejects invalid switches and unknown projects', async () => {
+    expect((await performSetContextBriefing({ projectName: 'demo', on: 'false' as never })).ok).toBe(false);
+    expect((await performSetContextBriefing({ projectName: 'missing', on: false })).ok).toBe(false);
+    expect((await getProjectByName('demo'))?.contextBriefing).toBeUndefined();
+  });
   it('validateBackendSwitch / probeBackends / BACKEND_PROBE_TIMEOUT_MS 同源（防止两套逻辑漂移回潮）', () => {
     expect(hmValidateBackendSwitch).toBe(opsValidateBackendSwitch);
     expect(hmProbeBackends).toBe(opsProbeBackends);
@@ -423,4 +453,26 @@ describe('createAdminWriteExecutor / runAdminWriteOp（Web · IPC 入口）', ()
       missingCfg({ kind: 'setCompletionReminder', mode: 'failures', longTaskMinutes: 3 }),
     ).rejects.toBeInstanceOf(AdminWriteError);
   });
+});
+
+
+it('changes history model and Fast while preserving independent project switches', async () => {
+  await updateProject('demo', { contextBriefing: false, discuss: true, defaultModel: 'main-model' });
+  expect((await performSetContextBriefing({ projectName: 'demo', model: 'gpt-5.6-sol', fast: true })).ok).toBe(true);
+  expect(await getProjectByName('demo')).toMatchObject({ contextBriefing: false, contextBriefingModel: 'gpt-5.6-sol', contextBriefingFast: true, discuss: true, defaultModel: 'main-model' });
+  expect((await performSetContextBriefing({ projectName: 'demo', on: true })).ok).toBe(true);
+  expect((await getProjectByName('demo'))?.contextBriefingFast).toBe(true);
+  expect((await performSetContextBriefing({ projectName: 'demo', fast: 'true' as never })).ok).toBe(false);
+  expect((await performSetContextBriefing({ projectName: 'demo', model: '' })).ok).toBe(false);
+});
+
+
+it('persists one policy while keeping legacy readers consistent', async () => {
+  await updateProject('demo', { kind: 'single', contextBriefing: false });
+  for (const policy of ['all', 'model', 'mention'] as const) {
+    expect((await performSetParticipation({ projectName: 'demo', policy })).ok).toBe(true);
+    expect(await getProjectByName('demo')).toMatchObject({ participation: policy, discuss: policy === 'model', noMention: policy === 'all', contextBriefing: false });
+  }
+  expect((await performSetParticipation({ projectName: 'demo', policy: 'bad' as never })).ok).toBe(false);
+  expect((await getProjectByName('demo'))?.participation).toBe('mention');
 });

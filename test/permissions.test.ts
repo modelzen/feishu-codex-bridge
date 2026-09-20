@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { effectiveGuestMode, effectiveMode, turnTier } from '../src/project/registry';
 import { sandboxParams, withAutoCompact } from '../src/agent/codex-appserver/backend';
-import { buildGroupSettingsCard, buildPermissionCard, buildProjectSettingsCard } from '../src/card/dm-cards';
+import { buildGroupSettingsCard, buildBriefingModelCard, buildPermissionCard, buildProjectSettingsCard } from '../src/card/dm-cards';
 
 describe('effectiveMode', () => {
   it('defaults missing mode to full (legacy data unaffected)', () => {
@@ -176,4 +176,15 @@ describe('permission cards', () => {
     // both dropdowns default to qa (guest falls back to admin tier)
     expect((json.match(/"initial_option":"qa"/g) ?? []).length).toBe(2);
   });
+});
+
+it('exposes independent history settings and the configured model and Fast on both cards', () => {
+  const p = { name: 'P', cwd: '/x', kind: 'single' as const, discuss: true, contextBriefing: false, contextBriefingModel: 'gpt-5.6-sol', contextBriefingFast: true };
+  for (const data of [buildGroupSettingsCard(p), buildProjectSettingsCard(p)]) {
+    const json = JSON.stringify(data); expect(json).toContain('消息简史'); expect(json).toContain('gpt-5.6-sol'); expect(json).toContain('Fast 开'); expect(json).toContain('briefingModel');
+  }
+  for (const ctx of ['dm', 'group'] as const) {
+    const json = JSON.stringify(buildBriefingModelCard(p, [], ctx));
+    expect(json).toContain('gpt-5.6-sol'); expect(json).toContain('briefingModel.submit'); expect(json).toContain('Fast 关');
+  }
 });

@@ -239,7 +239,7 @@ describe('buildRunCard — terminal collapse', () => {
 
   it('turns off streaming on a terminal card', () => {
     const card = buildRunCard({ rs: fullRun() }) as { config: { streaming_mode?: boolean } };
-    expect(card.config.streaming_mode).toBeUndefined();
+    expect(card.config.streaming_mode).toBe(false);
   });
 
   it('keeps a partial answer above the note when interrupted', () => {
@@ -426,5 +426,43 @@ describe('模型 · 推理强度 footnote（模型显示三档）', () => {
     expect(json).toContain('超强');
     expect(json).toContain('purple');
     expect(json).not.toContain('undefined');
+  });
+});
+
+describe('tool default collapse preference', () => {
+  const live = () => run([1, 2, 3].map((n) => ({ type: 'tool_use' as const, itemId: `t${n}`, title: `command-${n}` })));
+  it('keeps the latest live call collapsed while retaining its details', () => {
+    const card = buildRunCard({ rs: live(), collapseTools: true });
+    const panels = bodyEls(card).filter((el) => el.tag === 'collapsible_panel');
+    expect(panels.length).toBeGreaterThan(0);
+    expect(panels.every((el) => el.expanded === false)).toBe(true);
+    expect(JSON.stringify(card)).toContain('command-3');
+  });
+  it('preserves automatic expansion when the preference is absent or off', () => {
+    for (const collapseTools of [undefined, false]) {
+      const panels = bodyEls(buildRunCard({ rs: live(), collapseTools })).filter((el) => el.tag === 'collapsible_panel');
+      expect(panels.some((el) => el.expanded === true)).toBe(true);
+    }
+  });
+  it('continues to hide tools when display is disabled', () => {
+    expect(JSON.stringify(buildRunCard({ rs: live(), collapseTools: true, showTools: false }))).not.toContain('command-3');
+  });
+});
+
+describe('terminal progress images', () => {
+  it('keeps uploaded progress images inside the process panel beside final-answer images', () => {
+    const s = run([
+      { type: 'text_delta', itemId: 'progress', delta: 'Preview ![draft](draft.png)' },
+      { type: 'text_delta', itemId: 'answer', delta: 'Final ![result](result.png)' },
+      { type: 'done', turnId: 'turn' },
+    ]);
+    const card = buildRunCard({ rs: s, cardKey: 'test', images: new Map([
+      ['draft.png', 'img_draft'], ['result.png', 'img_result'],
+    ]) });
+    const els = bodyEls(card);
+    const process = els.find(el => el.tag === 'collapsible_panel');
+    expect(JSON.stringify(process)).toContain('img_draft');
+    expect(JSON.stringify(process)).not.toContain('![draft]');
+    expect(els.some(el => el.tag === 'img' && el.img_key === 'img_result')).toBe(true);
   });
 });

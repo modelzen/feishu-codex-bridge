@@ -42,7 +42,7 @@ feishu-codex-bridge web
 ```text
 帮我在这台电脑上安装并跑起来 feishu-codex-bridge：
 
-1) 先 node -v 确认有 Node.js(≥18)，没有就先装好；
+1) 先 node -v 确认有 Node.js(≥20.3.0，语音取消使用 AbortSignal.any)，没有就先装好；
 2) 再 codex --version 确认已经安装了 codex CLI，没有就先装好；
 3) 全局安装：
    npm i -g @modelzen/feishu-codex-bridge

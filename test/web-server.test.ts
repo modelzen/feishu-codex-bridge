@@ -35,7 +35,10 @@ function stubService(): AdminService {
           kind: 'multi' as const,
           origin: 'created' as const,
           noMention: true,
+          participation: 'all' as const,
           autoCompact: true,
+          contextBriefing: true,
+          discuss: false,
           mode: 'full' as const,
           guestMode: 'full' as const,
           network: false,
@@ -58,6 +61,9 @@ function stubService(): AdminService {
     async setNoMention() {
       throw new NotWiredYetError('✋ 免@ 开关');
     },
+    async setParticipation() { throw new NotWiredYetError('AI 参与策略'); },
+    async setDiscuss() { throw new NotWiredYetError('Discuss'); },
+    async setContextBriefing() { throw new NotWiredYetError('上下文策略'); },
     async setAutoCompact() {
       throw new NotWiredYetError('🗜️ 自动压缩开关');
     },
@@ -378,7 +384,7 @@ describe('web server · 只读 API', () => {
 });
 
 describe('web server · 写操作占位（只读预览：daemon 未跑）', () => {
-  it.each(['backend', 'permission', 'no-mention', 'auto-compact'])('POST /api/project/demo/%s → 501', async (action) => {
+  it.each(['backend', 'permission', 'no-mention', 'auto-compact', 'context-briefing', 'discuss'])('POST /api/project/demo/%s → 501', async (action) => {
     const res = await authed(`/api/project/demo/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -393,6 +399,13 @@ describe('web server · 写操作占位（只读预览：daemon 未跑）', () =
   it('写操作同样要鉴权：无 token → 401（不是 501）', async () => {
     const res = await get('/api/project/demo/backend', { method: 'POST', body: '{}' });
     expect(res.status).toBe(401);
+  });
+  it('requires authentication and a boolean for context strategy writes', async () => {
+    expect((await get('/api/project/demo/discuss', { method: 'POST', body: '{"on":false}' })).status).toBe(401);
+    expect((await get('/api/project/demo/context-briefing', { method: 'POST', body: '{"on":false}' })).status).toBe(401);
+    const response = await authed('/api/project/demo/context-briefing', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: '{"on":"false"}' });
+    expect(response.status).toBe(400);
   });
 
   it('POST /api/bots/:id/completion-reminder 在只读预览 → 501', async () => {
@@ -421,6 +434,8 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
     svc.setNoMention = async () => {
       throw new AdminWriteError('项目「demo」不存在');
     };
+    svc.setParticipation = async (botId, project, policy) => { written.push({ botId, project, policy }); };
+    svc.setContextBriefing = async (botId, project, on, settings) => { written.push({ botId, project, on, ...settings }); };
     svc.setCompletionReminder = async (botId, value) => {
       written.push({ botId, completionReminder: value });
     };
@@ -431,6 +446,26 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
 
   afterAll(async () => {
     await writeWeb.close();
+  });
+
+  it('writes each AI participation policy and rejects invalid values', async () => {
+    for (const policy of ['all', 'model', 'mention', 'bad']) {
+      const res = await fetch(`${writeBase}/api/project/demo/participation?bot=cli_a`, {
+        method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ policy }),
+      });
+      expect(res.status).toBe(policy === 'bad' ? 400 : 200);
+      if (policy !== 'bad') expect(written).toContainEqual({ botId: 'cli_a', project: 'demo', policy });
+    }
+  });
+  it('accepts model-only and Fast-only history settings without changing its switch', async () => {
+    for (const body of [{ model: 'gpt-5.6-sol' }, { fast: true }]) {
+      const res = await fetch(`${writeBase}/api/project/demo/context-briefing?bot=cli_a`, {
+        method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      expect(res.status).toBe(200);
+      expect(written.at(-1)).toMatchObject({ botId: 'cli_a', project: 'demo', on: undefined, ...body });
+    }
+    written.length = 0;
   });
 
   it('写成功 → 200 {ok:true}（前端走 ✅ 已保存）', async () => {

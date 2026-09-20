@@ -6,12 +6,13 @@ import type { AgentEvent, AgentInput } from '../src/agent/types';
 
 const fake = vi.hoisted(() => ({
   backend: { capabilities: { steer: true }, id: 'codex', listModels: vi.fn(async () => []), resumeThread: vi.fn(), startThread: vi.fn() },
+  steerDeadlineMs: 6000,
   final: vi.fn(async () => true),
   createCard: vi.fn(async () => 'card'),
   send: vi.fn(async () => ({})),
   log: { info: vi.fn(), warn: vi.fn(), fail: vi.fn() },
 }));
-vi.mock('../src/bot/steer-delivery', async original => { const real = await original<typeof import('../src/bot/steer-delivery')>(); return { ...real, steerWithDeadline: (thread: any, input: any, id: string) => real.steerWithDeadline(thread, input, id, undefined, 150) }; });
+vi.mock('../src/bot/steer-delivery', async original => { const real = await original<typeof import('../src/bot/steer-delivery')>(); return { ...real, steerWithDeadline: (thread: any, input: any, id: string) => real.steerWithDeadline(thread, input, id, undefined, fake.steerDeadlineMs) }; });
 vi.mock('../src/core/logger', () => ({ log: fake.log, withTrace: (_ctx: unknown, fn: () => unknown) => fn() }));
 vi.mock('../src/agent', async (original) => ({ ...await original<object>(), createBackend: () => fake.backend }));
 vi.mock('../src/project/registry', async (original) => ({
@@ -86,6 +87,7 @@ function setup(policy: 'steer' | 'queue' = 'steer') {
 }
 beforeEach(() => {
   vi.clearAllMocks();
+  fake.steerDeadlineMs = 6000;
   fake.backend.capabilities.steer = true;
   fake.final.mockReset().mockResolvedValue(true);
   fake.createCard.mockReset().mockResolvedValue('card');
@@ -199,6 +201,7 @@ describe('message queue lifecycle', () => {
 });
 
 it.each(['disconnect', 'missing-response'])('does not replay uncertain steer delivery: %s', async failure => {
+ fake.steerDeadlineMs = 150;
  const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
  const o = setup(); await o.onMessage(message('first'));
  await until(() => expect(run.consumed).toHaveLength(1));

@@ -1,4 +1,5 @@
-import { readFile, stat } from 'node:fs/promises';
+import type { PermissionMode } from '../agent/types';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { extname, isAbsolute, resolve, sep } from 'node:path';
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
@@ -11,13 +12,13 @@ import { log } from '../core/logger';
  * image sources found in codex's reply into `src → image_key`.
  *
  * Sources are either a LOCAL file (relative to the run cwd, or an absolute path
- * INSIDE that cwd subtree — never outside, so the agent can't make the bot
- * upload `~/.ssh/…`) or an `http(s)` URL. Everything is best-effort: a rejected
+ * inside that cwd subtree for qa/write; full permits any local path) or an
+ * `http(s)` URL. Everything is best-effort: a rejected
  * path, a missing file, an oversized image or a failed upload is logged and
  * skipped — the original markdown text stays in place, never throwing.
  */
 
-/** Cap per reply so a flood of refs can't wedge a turn or hammer the upload API. */
+/** Cap each streaming/final-answer pass so a flood cannot hammer the upload API. */
 const MAX_IMAGES = 9;
 /** Feishu rejects uploads over 10MB (and 0-byte files). */
 const MAX_BYTES = 10 * 1024 * 1024;
@@ -73,6 +74,7 @@ export async function uploadOutboundImages(
   channel: LarkChannel,
   sources: string[],
   cwd: string,
+  mode: PermissionMode = 'write',
 ): Promise<Map<string, string>> {
   const picked = sources.slice(0, MAX_IMAGES);
   if (sources.length > picked.length) {
@@ -81,7 +83,7 @@ export async function uploadOutboundImages(
   const results = await Promise.all(
     picked.map(async (src) => {
       try {
-        return [src, await resolveAndUpload(channel, src, cwd)] as const;
+        return [src, await resolveAndUpload(channel, src, cwd, mode)] as const;
       } catch (err) {
         log.warn('outbound', 'image-failed', { src: src.slice(0, 80), err: String(err) });
         return [src, undefined] as const;
@@ -94,8 +96,8 @@ export async function uploadOutboundImages(
   return out;
 }
 
-async function resolveAndUpload(channel: LarkChannel, src: string, cwd: string): Promise<string | undefined> {
-  const { buffer, cacheKey } = await loadSource(src, cwd);
+async function resolveAndUpload(channel: LarkChannel, src: string, cwd: string, mode: PermissionMode): Promise<string | undefined> {
+  const { buffer, cacheKey } = await loadSource(src, cwd, mode);
   if (!buffer) return undefined;
   const hit = cache.get(cacheKey);
   if (hit) return hit;
@@ -107,17 +109,18 @@ async function resolveAndUpload(channel: LarkChannel, src: string, cwd: string):
 /** Load a source's bytes + a stable cache key. `buffer` undefined ⇒ rejected
  * (out of cwd / bad ext / missing / oversized / fetch failed); the cache key is
  * still returned but never populated, so it's harmless. */
-async function loadSource(src: string, cwd: string): Promise<{ buffer?: Buffer; cacheKey: string }> {
+async function loadSource(src: string, cwd: string, mode: PermissionMode): Promise<{ buffer?: Buffer; cacheKey: string }> {
   if (/^https?:\/\//i.test(src)) return loadRemote(src);
-  return loadLocal(src, cwd);
+  return loadLocal(src, cwd, mode);
 }
 
-async function loadLocal(src: string, cwd: string): Promise<{ buffer?: Buffer; cacheKey: string }> {
-  const cwdAbs = resolve(cwd);
-  const abs = isAbsolute(src) ? resolve(src) : resolve(cwdAbs, src);
-  // Security: only files inside the run cwd subtree — never an arbitrary path
-  // the agent names (so it can't exfiltrate local images via the bot).
-  if (abs !== cwdAbs && !abs.startsWith(cwdAbs + sep)) {
+async function loadLocal(src: string, cwd: string, mode: PermissionMode): Promise<{ buffer?: Buffer; cacheKey: string }> {
+  const cwdAbs = mode === 'full' ? resolve(cwd) : await realpath(resolve(cwd));
+  const abs = await realpath(isAbsolute(src) ? resolve(src) : resolve(cwdAbs, src));
+  // Follow project permissions: qa/write stay in the workspace; full can read
+  // any local image. User-requested rationale: 反正用lark-cli也能发。
+  // Resolve symlinks before checking the workspace boundary.
+  if (mode !== 'full' && abs !== cwdAbs && !abs.startsWith(cwdAbs + sep)) {
     log.warn('outbound', 'image-outside-cwd', { src: src.slice(0, 80) });
     return { cacheKey: `local:${abs}` };
   }
@@ -192,4 +195,46 @@ async function uploadBuffer(channel: LarkChannel, buffer: Buffer): Promise<strin
     return undefined;
   }
   return key;
+}
+
+/** Per-turn background uploads. Failed sources get one final retry at completion. */
+export class StreamingImages {
+  readonly images = new Map<string, string>();
+  private attempted = new Set<string>();
+  private pending = new Set<Promise<void>>();
+
+  constructor(
+    private upload: (sources: string[]) => Promise<Map<string, string>>,
+    private repaint: () => void,
+  ) {}
+
+  refresh(text: string): void {
+    const fresh = imageSources(text).filter((src) => !this.attempted.has(src))
+      .slice(0, MAX_IMAGES - this.attempted.size);
+    if (!fresh.length) return;
+    for (const src of fresh) this.attempted.add(src);
+    const task = Promise.resolve().then(() => this.upload(fresh)).then((images) => {
+      for (const [src, key] of images) this.images.set(src, key);
+      if (images.size) this.repaint();
+    }).catch((err) => log.fail('outbound', err, { phase: 'stream-images' }));
+    this.pending.add(task);
+    void task.then(() => this.pending.delete(task));
+  }
+
+  async drain(): Promise<void> {
+    while (this.pending.size) await Promise.all(this.pending);
+  }
+
+  /** Final-answer refs get their own bounded pass, even if progress messages
+   * used the streaming budget. Merge rather than replace: images already shown
+   * during the turn must remain visible in the terminal process panel. */
+  async finalize(finalAnswer: string): Promise<ReadonlyMap<string, string>> {
+    await this.drain();
+    const sources = imageSources(finalAnswer).slice(0, MAX_IMAGES);
+    if (sources.length) {
+      const uploaded = await this.upload(sources);
+      for (const [src, key] of uploaded) this.images.set(src, key);
+    }
+    return this.images;
+  }
 }

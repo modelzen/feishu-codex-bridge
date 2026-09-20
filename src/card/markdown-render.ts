@@ -1,4 +1,4 @@
-import { card, hr, image, md, note, type CardElement, type CardObject, type HeaderTemplate } from './cards';
+import { card, hr, image, md, mdStream, note, type CardElement, type CardObject, type HeaderTemplate } from './cards';
 
 /**
  * Markdown → card-element rendering for outbound replies. Two jobs:
@@ -55,11 +55,11 @@ export function extractCardFences(text: string): { fences: string[]; stripped: s
  * images with `img` elements and stripping any ```feishu-card fences. Plain
  * text (no images, no fences) short-circuits to a single markdown element.
  */
-export function renderRichText(text: string, images: ImageMap = NO_IMAGES): CardElement[] {
+export function renderRichText(text: string, images: ImageMap = NO_IMAGES, streamTailId?: string): CardElement[] {
   const body = extractCardFences(text).stripped;
   if (!body.includes('![')) {
     const t = body.trim();
-    return t ? [md(t)] : [];
+    return t ? [streamTailId ? mdStream(t, streamTailId) : md(t)] : [];
   }
   const els: CardElement[] = [];
   let buf = '';
@@ -88,6 +88,12 @@ export function renderRichText(text: string, images: ImageMap = NO_IMAGES): Card
   }
   buf += body.slice(last);
   flush();
+  // Images force a structural update once. Keep the growing trailing markdown
+  // addressable so later text deltas return to CardKit's element typewriter.
+  const tail = els.at(-1);
+  if (streamTailId && tail?.tag === 'markdown') {
+    els[els.length - 1] = mdStream(String(tail.content), streamTailId);
+  }
   return els;
 }
 

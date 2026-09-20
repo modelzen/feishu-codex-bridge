@@ -1,4 +1,5 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
+import type { StreamingImages } from './outbound-images';
 import { log } from '../core/logger';
 import type { CardObject } from './cards';
 import { isCardIdNotReady } from './managed';
@@ -92,6 +93,8 @@ function isRateLimited(err: unknown): boolean {
  * streams and carries clickable controls (⏹).
  */
 export class RunCardStream {
+  /** Optional per-turn image worker; does not block event consumption. */
+  imageWorker?: { uploads: StreamingImages; text: () => string };
   private cardId = '';
   private _messageId = '';
   private seq = 0;
@@ -150,6 +153,8 @@ export class RunCardStream {
    * event-consume loop instead of awaiting {@link streamCard} per event.
    */
   streamCoalesced(channel: LarkChannel, fullCard: CardObject, answerEid: string | null): void {
+    if (this.liveUpdatesFrozen) return;
+    this.imageWorker?.uploads.refresh(this.imageWorker.text());
     this.pending = { card: fullCard, answerEid };
     this.pumpChannel = channel;
     if (!this.pumpPromise) this.pumpPromise = this.pump();
@@ -158,6 +163,7 @@ export class RunCardStream {
   /** Await any in-flight coalesced push so the final streaming frame lands (and
    * `seq` stays ordered) before the terminal update. Call after the loop ends. */
   async drain(): Promise<void> {
+    await this.imageWorker?.uploads.drain();
     if (this.pumpPromise) await this.pumpPromise;
   }
 
@@ -217,7 +223,7 @@ export class RunCardStream {
       channel.rawClient.cardkit.v1.cardElement.content({
         path: { card_id: this.cardId, element_id: elementId },
         data: { content, sequence: ++this.seq, uuid: `e_${this.cardId}_${this.seq}` },
-      });
+      }).then(assertCardkitSuccess);
     await this.pacer?.wait();
     const t0 = Date.now();
     try {
@@ -227,14 +233,14 @@ export class RunCardStream {
         const code = cardkitErrCode(err);
         if (code === ERR_STREAMING_OFF) {
           log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, reopenStreaming: true });
-          await channel.rawClient.cardkit.v1.card.settings({
+          assertCardkitSuccess(await channel.rawClient.cardkit.v1.card.settings({
             path: { card_id: this.cardId },
             data: {
               settings: JSON.stringify({ config: { streaming_mode: true } }),
               sequence: ++this.seq,
               uuid: `o_${this.cardId}_${this.seq}`,
             },
-          });
+          }));
           await push();
         } else if (code === ERR_SEQ_OUT_OF_ORDER) {
           log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, retry: true });
@@ -332,10 +338,10 @@ export class RunCardStream {
     await this.pacer?.wait();
     const t0 = Date.now();
     try {
-      await channel.rawClient.cardkit.v1.card.update({
+      assertCardkitSuccess(await channel.rawClient.cardkit.v1.card.update({
         path: { card_id: this.cardId },
         data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `s_${this.cardId}_${this.seq}` },
-      });
+      }));
       this.lastContent = data;
       const rtt = Date.now() - t0;
       this.pushCount++;
@@ -387,7 +393,8 @@ export class RunCardStream {
    */
   finalizeCard(channel: LarkChannel, fullCard: CardObject): Promise<boolean> {
     this.liveUpdatesFrozen = true;
-    return this.enqueueForcedUpdate(channel, fullCard);
+    const terminal = JSON.parse(JSON.stringify(fullCard)) as CardObject;
+    return this.drain().then(() => this.enqueueForcedUpdate(channel, terminal));
   }
 
   private enqueueForcedUpdate(channel: LarkChannel, fullCard: CardObject): Promise<boolean> {
@@ -409,10 +416,10 @@ export class RunCardStream {
   private async pushForcedUpdate(channel: LarkChannel, data: string): Promise<boolean> {
     if (!this.cardId) return false;
     const push = async (): Promise<void> => {
-      await channel.rawClient.cardkit.v1.card.update({
+      assertCardkitSuccess(await channel.rawClient.cardkit.v1.card.update({
         path: { card_id: this.cardId },
         data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `u_${this.cardId}_${this.seq}` },
-      });
+      }));
       this.lastContent = data;
     };
     for (let i = 0; ; i++) {
@@ -465,4 +472,12 @@ function structureSig(card: CardObject, eid: string | null): string {
   if (!eid || !Array.isArray(els)) return JSON.stringify(card);
   const blanked = els.map((el) => (el && el.element_id === eid ? { ...el, content: '' } : el));
   return JSON.stringify({ ...(card as object), body: { ...body, elements: blanked } });
+}
+
+/** SDK resolves HTTP 200 business failures; preserve codes for retry policy. */
+function assertCardkitSuccess(response: unknown): void {
+  const result = response as { code?: number; msg?: string } | undefined;
+  if (result?.code !== undefined && result.code !== 0) {
+    throw Object.assign(new Error(result.msg ?? `CardKit error ${result.code}`), { code: result.code });
+  }
 }

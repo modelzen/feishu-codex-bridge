@@ -95,6 +95,8 @@ export interface RunCardState {
   requesterOpenId?: string;
   /** drop tool blocks from the render (pref) */
   showTools?: boolean;
+  /** Keep tool details available but never expand them automatically. */
+  collapseTools?: boolean;
   /** model id for the bottom-right「模型 · 推理强度」footnote (e.g. 'gpt-5.5'); set
    * when 模型显示 is running OR always. Absent ⇒ no footnote (default / off). */
   model?: string;
@@ -119,8 +121,7 @@ export interface RunCardState {
   /** goal run cards, after 🎯 结束目标 was tapped: the goal is cleared and this
    * turn is finishing — drop the 结束目标 button (keep ⏹ 终止) and show a notice. */
   goalEnding?: boolean;
-  /** `![](src) → image_key` for the final answer's images (populated at terminal
-   * after upload; absent while streaming, so refs show as text until then). */
+  /** `![](src) → image_key` for images uploaded during streaming or completion. */
   images?: ReadonlyMap<string, string>;
 }
 
@@ -180,13 +181,16 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
       textParts.push(b.content);
     }
   }
-  if (tools.length > 0) elements.push(...renderToolGroup(tools, false));
+  if (tools.length > 0) elements.push(...renderToolGroup(tools, false, false, rc.collapseTools === true));
 
   // Single streamed answer element. Only emitted once there's text, so its first
   // appearance is one whole-card update that establishes the element; subsequent
   // growth streams via cardElement.content. Stable element_id ⇒ append-only prefix.
   const answer = textParts.join('\n\n');
-  if (answer) elements.push(mdStream(answer, ANSWER_EID));
+  if (answer) {
+    if (rc.images?.size) elements.push(...renderRichText(answer, rc.images, ANSWER_EID));
+    else elements.push(mdStream(answer, ANSWER_EID));
+  }
 
   // Footer: status (left) + 模型·effort footnote (right) share one row when the
   // 显示模型 pref is on; either alone falls back to a single line.
@@ -258,7 +262,7 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
   const processBlocks = state.blocks.filter((_, i) => i !== answerIdx);
   const blocks = rc.showTools === false ? processBlocks.filter((b) => b.kind !== 'tool') : processBlocks;
   const reasoning = reasoningContent(state);
-  const processEls = buildProcessBody(reasoning, blocks);
+  const processEls = buildProcessBody(reasoning, blocks, rc.images);
   if (processEls.length > 0) {
     const toolCount = blocks.reduce((n, b) => (b.kind === 'tool' ? n + 1 : n), 0);
     elements.push(
@@ -273,7 +277,7 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
 
   // Terminal answer: split out uploaded images into img elements and drop any
   // ```feishu-card fence (it's hoisted into a standalone clean card). Streaming
-  // still renders plain md (renderRunning) — images aren't uploaded until now.
+  // also resolves images as their background uploads complete.
   if (answer) elements.push(...renderRichText(answer, rc.images));
 
   if (state.terminal === 'interrupted') {
@@ -334,20 +338,20 @@ function lastTextIndex(blocks: Block[]): number {
  * (with tool-output bodies) exceeds {@link PROCESS_BODY_BUDGET}, rebuild it with
  * every tool group degraded to a header-only summary.
  */
-function buildProcessBody(reasoning: string, blocks: Block[]): CardElement[] {
-  const rich = processElements(reasoning, blocks, false);
+function buildProcessBody(reasoning: string, blocks: Block[], images?: ReadonlyMap<string, string>): CardElement[] {
+  const rich = processElements(reasoning, blocks, false, images);
   if (estimateSize(rich) <= PROCESS_BODY_BUDGET && estimateComponents(rich) <= PROCESS_COMPONENT_BUDGET) {
     return rich;
   }
-  return processElements(reasoning, blocks, true);
+  return processElements(reasoning, blocks, true, images);
 }
 
-function processElements(reasoning: string, blocks: Block[], compactTools: boolean): CardElement[] {
+function processElements(reasoning: string, blocks: Block[], compactTools: boolean, images?: ReadonlyMap<string, string>): CardElement[] {
   const out: CardElement[] = [];
   if (reasoning) out.push(reasoningPanel(reasoning, false));
   for (const group of groupBlocks(blocks)) {
     if (group.kind === 'text') {
-      if (group.content.trim()) out.push(md(group.content));
+      if (group.content.trim()) out.push(...renderRichText(group.content, images));
     } else {
       out.push(...renderToolGroup(group.tools, true, compactTools));
     }
@@ -475,7 +479,7 @@ function* groupBlocks(blocks: Block[]): Generator<Group> {
   if (toolBuf.length > 0) yield { kind: 'tools', tools: toolBuf };
 }
 
-function renderToolGroup(tools: ToolEntry[], finalized: boolean, compact = false): CardElement[] {
+function renderToolGroup(tools: ToolEntry[], finalized: boolean, compact = false, collapseTools = false): CardElement[] {
   if (tools.length === 0) return [];
   // compact (process-panel over size/component budget): one summary panel that
   // still lists each tool's FULL command, just without output bodies.
@@ -493,7 +497,7 @@ function renderToolGroup(tools: ToolEntry[], finalized: boolean, compact = false
   const latest = tools[tools.length - 1];
   const out: CardElement[] = [];
   if (prior.length > 0) out.push(collapsedToolSummary(prior, false));
-  if (latest) out.push(toolPanel(latest, true));
+  if (latest) out.push(toolPanel(latest, !collapseTools));
   return out;
 }
 

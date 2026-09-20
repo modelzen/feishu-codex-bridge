@@ -5,7 +5,10 @@ import { paths } from '../config/paths';
 import type { PermissionMode, ReasoningEffort } from '../agent/types';
 
 /** A project = a Feishu group bound to a fixed working directory. */
+export type ParticipationPolicy = 'all' | 'model' | 'mention';
+
 export interface Project {
+  participation?: ParticipationPolicy;
   /** unique project name (also the group name) */
   name: string;
   /** the bound Feishu group chat_id (oc_xxx) */
@@ -50,6 +53,12 @@ export interface Project {
    * bridge pushes codex's auto-compact token limit past any real usage to disable
    * it (see backend sandboxParams / AUTO_COMPACT_OFF_LIMIT). */
   autoCompact?: boolean;
+  /** Conditional Luna briefing; off keeps raw new-message context. Default on. */
+  contextBriefing?: boolean;
+  contextBriefingModel?: string;
+  contextBriefingFast?: boolean;
+  /** Fork-based group participation, single Codex sessions only; default off. */
+  discuss?: boolean;
   /** agent backend id for this project (see src/agent/index.ts registry).
    * Omitted on old/normal data → the codex default (DEFAULT_BACKEND_ID — historical path,
    * zero behavior change). Routed per project in createOrchestrator's
@@ -228,4 +237,17 @@ export async function removeProject(name: string): Promise<Project | undefined> 
     await write(projects);
     return removed;
   });
+}
+
+/** Legacy settings migrate on read; an explicit policy always takes precedence. */
+export function participationPolicy(p: Pick<Project, 'participation' | 'discuss' | 'noMention' | 'kind' | 'origin'>): ParticipationPolicy {
+  return p.participation ?? (p.discuss ? 'model' : (p.noMention ?? defaultNoMention(p)) ? 'all' : 'mention');
+}
+export const PARTICIPATION_OPTIONS = [
+  { label: '回复全部消息', value: 'all' },
+  { label: '模型自行决定回复', value: 'model' },
+  { label: '只回复被 @ 的消息', value: 'mention' },
+];
+export function participationLabel(p: Pick<Project, 'participation' | 'discuss' | 'noMention' | 'kind' | 'origin'>): string {
+  return PARTICIPATION_OPTIONS.find(o => o.value === participationPolicy(p))!.label;
 }

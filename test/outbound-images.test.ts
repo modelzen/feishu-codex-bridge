@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -103,5 +103,31 @@ describe('uploadOutboundImages', () => {
     const map = await uploadOutboundImages(channel, ['gone.png', 'real.png'], cwd);
     expect(map.has('gone.png')).toBe(false);
     expect(map.get('real.png')).toMatch(/^img_key_/);
+  });
+});
+
+
+describe('project permission image boundaries', () => {
+  it.each(['qa', 'write'] as const)('%s permits workspace files but rejects outside files and symlink escapes', async (mode) => {
+    const cwd = await tmpDir();
+    const outside = await tmpDir();
+    await writeFile(join(cwd, 'inside.png'), PNG);
+    await writeFile(join(outside, 'outside.png'), PNG);
+    await symlink(join(outside, 'outside.png'), join(cwd, 'link.png'));
+    const { channel, state } = fakeChannel();
+    const map = await uploadOutboundImages(channel, ['inside.png', join(outside, 'outside.png'), 'link.png'], cwd, mode);
+    expect([...map.keys()]).toEqual(['inside.png']);
+    expect(state.calls).toBe(1);
+  });
+
+  it('full permits an image outside the workspace', async () => {
+    const cwd = await tmpDir();
+    const outside = await tmpDir();
+    const path = join(outside, 'outside.png');
+    await writeFile(path, PNG);
+    const { channel, state } = fakeChannel();
+    const map = await uploadOutboundImages(channel, [path], cwd, 'full');
+    expect(map.has(path)).toBe(true);
+    expect(state.calls).toBe(1);
   });
 });

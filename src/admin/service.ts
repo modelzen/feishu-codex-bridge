@@ -11,7 +11,7 @@ import {
   type ResolvedCompletionReminderConfig,
 } from '../config/schema';
 import {
-  defaultNoMention,
+  participationPolicy, type ParticipationPolicy,
   effectiveGuestMode,
   effectiveMode,
   listProjectsIn,
@@ -110,6 +110,9 @@ export interface AdminService {
   setNoMention(botId: string, projectName: string, on: boolean): Promise<void>;
   /** 🗜️ 自动压缩开关（写），含驱逐活跃会话的既有语义。 */
   setAutoCompact(botId: string, projectName: string, on: boolean): Promise<void>;
+  setParticipation(botId: string, projectName: string, policy: ParticipationPolicy): Promise<void>;
+  setDiscuss(botId: string, projectName: string, on: boolean): Promise<void>;
+  setContextBriefing(botId: string, projectName: string, on: boolean | undefined, settings?: { model?: string; fast?: boolean }): Promise<void>;
   /** 🔔 每 bot 的普通任务结束提醒（写）；经 bot 进程落盘并热更新 LIVE cfg。 */
   setCompletionReminder(
     botId: string,
@@ -285,8 +288,13 @@ export interface AdminProject {
   origin: 'created' | 'joined';
   /** effective 免@（noMention ?? defaultNoMention） */
   noMention: boolean;
+  participation: ParticipationPolicy;
   /** effective 自动压缩（autoCompact ?? true） */
   autoCompact: boolean;
+  contextBriefing: boolean;
+  contextBriefingModel?: string;
+  contextBriefingFast?: boolean;
+  discuss: boolean;
   /** effective 管理员权限档 */
   mode: PermissionMode;
   /** effective 普通用户权限档 */
@@ -477,8 +485,13 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       branch: p.branch,
       kind: p.kind ?? 'multi',
       origin: p.origin ?? 'created',
-      noMention: p.noMention ?? defaultNoMention(p),
+      noMention: participationPolicy(p) === 'all',
+      participation: participationPolicy(p),
       autoCompact: p.autoCompact ?? true,
+      contextBriefing: p.contextBriefing ?? true,
+      contextBriefingModel: p.contextBriefingModel ?? 'gpt-5.6-luna',
+      contextBriefingFast: p.contextBriefingFast ?? false,
+      discuss: participationPolicy(p) === 'model',
       mode: effectiveMode(p),
       guestMode: effectiveGuestMode(p),
       network: p.network ?? false,
@@ -581,6 +594,15 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
 
     async setAutoCompact(botId: string, projectName: string, on: boolean): Promise<void> {
       await executeWrite(botId, '🗜️ 自动压缩开关', { kind: 'setAutoCompact', project: projectName, on });
+    },
+    async setParticipation(botId: string, projectName: string, policy: ParticipationPolicy): Promise<void> {
+      await executeWrite(botId, 'AI 参与策略', { kind: 'setParticipation', project: projectName, policy });
+    },
+    async setDiscuss(botId: string, projectName: string, on: boolean): Promise<void> {
+      await executeWrite(botId, 'Discuss', { kind: 'setDiscuss', project: projectName, on });
+    },
+    async setContextBriefing(botId: string, projectName: string, on: boolean | undefined, settings?: { model?: string; fast?: boolean }): Promise<void> {
+      await executeWrite(botId, '🧠 上下文策略', { kind: 'setContextBriefing', project: projectName, on, ...settings });
     },
 
     async setCompletionReminder(

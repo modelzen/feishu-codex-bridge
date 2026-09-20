@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { log } from '../../core/logger';
 import type {
   AgentBackend,
@@ -279,6 +280,14 @@ class CodexThread implements AgentThread {
     private model: string | undefined,
     private effort: ReasoningEffort | undefined,
   ) {}
+
+  async forkContext(): Promise<{ path?: string; empty: boolean; model?: string; effort?: ReasoningEffort }> {
+    const { thread } = await this.client.request<{ thread: { path?: string; preview?: string; model?: string; reasoningEffort?: ReasoningEffort } }>(
+      'thread/read', { threadId: this.sessionId, includeTurns: false });
+    const path = thread.path && existsSync(thread.path) ? thread.path : undefined;
+    if (!path && thread.preview) throw new Error('Discuss requires a persisted legacy rollout; start a new legacy session');
+    return { path, empty: !path, model: this.model ?? thread.model, effort: this.effort ?? thread.reasoningEffort };
+  }
 
   runStreamed(input: AgentInput, turn?: TurnOptions): AgentRun {
     const self = this;
@@ -670,6 +679,7 @@ export class CodexAppServerBackend implements AgentBackend {
     const client = await this.spawn(opts.cwd);
     const res = await client.request<{ thread: { id: string } }>('thread/start', {
       cwd: opts.cwd,
+      ...(opts.historyMode ? { historyMode: opts.historyMode } : {}),
       approvalPolicy: APPROVAL_POLICY,
       ...sandbox,
       developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,

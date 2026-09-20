@@ -53,6 +53,7 @@ export function card(
   } = {},
 ): CardObject {
   const config: Record<string, unknown> = { update_multi: true };
+  if (opts.streaming !== undefined) config.streaming_mode = opts.streaming;
   if (opts.forward === false) config.enable_forward = false;
   if (opts.widthMode) config.width_mode = opts.widthMode;
   if (opts.streaming) {

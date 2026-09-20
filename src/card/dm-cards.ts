@@ -8,6 +8,7 @@ import {
   getSessionTitleConfig,
   getSessionTitleEfforts,
   getShowToolCalls,
+  getCollapseToolCalls,
   resolveOwner,
   RUN_IDLE_TIMEOUT_MAX_SEC,
   RUN_IDLE_TIMEOUT_MIN_SEC,
@@ -15,7 +16,7 @@ import {
   type AppConfig,
   type SessionTitleAiConfig,
 } from '../config/schema';
-import { defaultNoMention, effectiveGuestMode, effectiveMode, type Project } from '../project/registry';
+import { participationPolicy, participationLabel, PARTICIPATION_OPTIONS, effectiveGuestMode, effectiveMode, type Project } from '../project/registry';
 import {
   DEFAULT_BACKEND_ID,
   REASONING_EFFORTS,
@@ -74,6 +75,7 @@ export const DM = {
   rmDo: 'dm.rmDo',
   rmCancel: 'dm.rmCancel',
   setTools: 'dm.set.tools',
+  setCollapseTools: 'dm.set.collapseTools',
   setShowModel: 'dm.set.showModel',
   setWatchdog: 'dm.set.watchdog',
   // 假死超时「自定义…」：watchdogCustom 打开输入卡，watchdogCustomSubmit 保存任意秒数
@@ -101,6 +103,11 @@ export const DM = {
   setNoMentionDm: 'dm.proj.noMention',
   // 🗜️ 自动压缩：项目级开关（同群设置里的那个，DM 里也能改），按钮携带项目名 n
   setAutoCompactDm: 'dm.proj.autoCompact',
+  setContextBriefingDm: 'dm.proj.contextBriefing',
+  briefingModel: 'dm.proj.briefingModel',
+  briefingModelSubmit: 'dm.proj.briefingModel.submit',
+  setParticipationDm: 'dm.proj.participation',
+  setDiscussDm: 'dm.proj.discuss',
   // 🤖 默认模型/强度：新话题的起始模型 + 推理强度（选完提交的下拉表单子卡，仿权限卡）
   modelDefault: 'dm.proj.modelDefault',
   modelDefaultSubmit: 'dm.proj.modelDefault.submit',
@@ -127,6 +134,11 @@ export const DM = {
 export const GS = {
   setNoMention: 'gs.noMention',
   setAutoCompact: 'gs.autoCompact',
+  setContextBriefing: 'gs.contextBriefing',
+  briefingModel: 'gs.briefingModel',
+  briefingModelSubmit: 'gs.briefingModel.submit',
+  setParticipation: 'gs.participation',
+  setDiscuss: 'gs.discuss',
   // 🤖 默认模型/强度：群内 /settings 的镜像入口（open=进子卡，submit=保存，settings=返回群设置）
   settings: 'gs.settings',
   modelDefault: 'gs.modelDefault',
@@ -774,7 +786,7 @@ export function buildProjectListCard(
     const topicCount = (p.chatId ? sessionsByChat.get(p.chatId) : undefined)?.length ?? 0;
     const dir = `📂 \`${p.cwd}\`${p.branch && p.branch !== '—' ? `   🌿 ${p.branch}` : ''}`;
     const meta = p.chatId
-      ? `${kindLabel(p.kind)}${(p.origin ?? 'created') === 'joined' ? ' · 🔗已加入' : ''}   ·   免@：${(p.noMention ?? defaultNoMention(p)) ? '开' : '关'}`
+      ? `${kindLabel(p.kind)}${(p.origin ?? 'created') === 'joined' ? ' · 🔗已加入' : ''}   ·   AI 参与策略：${participationLabel(p)}`
       : '⚠️ 未绑定群';
     elements.push(md(`**${p.name}**${p.blank ? ' _(空白)_' : ''}`));
     elements.push(note(`${dir}\n${meta}`));
@@ -914,6 +926,16 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
         [
           { label: '显示', value: 'on' },
           { label: '隐藏', value: 'off' },
+        ],
+      ),
+      ...settingItem(
+        '🔧 工具调用默认收起',
+        '开启后，最新工具调用也不自动展开；仍可点击查看详情。工具调用隐藏时此项不生效。',
+        DM.setCollapseTools,
+        getCollapseToolCalls(cfg) ? 'on' : 'off',
+        [
+          { label: '开启', value: 'on' },
+          { label: '关闭', value: 'off' },
         ],
       ),
       ...settingItem(
@@ -1484,30 +1506,27 @@ export function buildCompletionReminderCustomCard(cfg: AppConfig): CardObject {
  * {@link buildSettingsCard}. Admin-gated by the handler.
  */
 export function buildGroupSettingsCard(
-  project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin' | 'autoCompact' | 'defaultModel' | 'defaultEffort'>,
+  project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin' | 'autoCompact' | 'contextBriefing' | 'contextBriefingModel' | 'contextBriefingFast' | 'participation' | 'discuss' | 'backend' | 'defaultModel' | 'defaultEffort'>,
 ): CardObject {
   const kind = project.kind ?? 'multi';
-  const noMention = project.noMention ?? defaultNoMention(project);
   const autoCompact = project.autoCompact ?? true;
-  const scopeNote =
-    kind === 'single'
-      ? '开启后：本群所有消息(不用 @)都交给我处理。'
-      : '开启后：话题内的消息(不用 @)都交给我处理；**开新话题仍需 @我**。';
   return card(
     [
       md(`**群设置** · ${project.name}`),
       note(`群类型(建群时定，不可改)：${kindLabel(kind)}`),
-      ...optionRow('✋ 免@（不用 @ 也回复）', GS.setNoMention, noMention ? 'on' : 'off', [
-        { label: '开', value: 'on' },
-        { label: '关', value: 'off' },
-      ]),
-      note(scopeNote),
-      note('⚠️ 免@ 需应用已开通「接收群内所有消息」(im:message.group_msg)权限，否则收不到非 @ 消息。'),
+      ...optionRow('AI 参与策略', GS.setParticipation, participationPolicy(project), PARTICIPATION_OPTIONS.filter(o => o.value !== 'model' || (kind === 'single' && (!project.backend || project.backend === 'codex-appserver')))),
+      note('非 @ 消息需要应用具有接收群内所有消息权限。模型自行决定回复目前支持 Codex 单会话群。'),
       ...optionRow('🗜️ 自动压缩上下文', GS.setAutoCompact, autoCompact ? 'on' : 'off', [
         { label: '开', value: 'on' },
         { label: '关', value: 'off' },
       ]),
       note('开启后：上下文接近上限时 Codex 自动总结早前对话、释放空间（默认开）。改动下一轮会话生效。'),
+      ...optionRow('🧠 消息简史', GS.setContextBriefing, project.contextBriefing !== false ? 'on' : 'off', [
+        { label: '开', value: 'on' }, { label: '关', value: 'off' },
+      ]),
+      note('开启：使用消息总结模型整理消息；关闭：直接提供原文。'),
+      note(`消息总结模型：${project.contextBriefingModel ?? 'gpt-5.6-luna'} · Fast ${project.contextBriefingFast ? '开' : '关'}`),
+      actions([button('设置消息总结模型', { a: GS.briefingModel })]),
       hr(),
       md('🤖 默认模型 / 推理强度'),
       actions([button('设置默认模型', { a: GS.modelDefault }, 'primary')]),
@@ -1805,15 +1824,19 @@ export function buildProjectSettingsCard(
     | 'guestMode'
     | 'network'
     | 'autoCompact'
+    | 'contextBriefing'
+    | 'contextBriefingModel'
+    | 'contextBriefingFast'
+    | 'participation' | 'discuss'
     | 'backend'
     | 'defaultModel'
     | 'defaultEffort'
+
   >,
   backendName?: string,
   notice?: string,
 ): CardObject {
   const kind = project.kind ?? 'multi';
-  const noMention = project.noMention ?? defaultNoMention(project);
   const autoCompact = project.autoCompact ?? true;
   return card(
     [
@@ -1829,16 +1852,9 @@ export function buildProjectSettingsCard(
         `当前 ${backendName ?? project.backend ?? DEFAULT_BACKEND_ID} 🔒　·　后端在**新建项目时选定**，运行时固定、不支持切换。如需更改，请删除该项目后用新后端重新创建。`,
       ),
       hr(),
-      md('✋ 免@（不用 @ 也回复）'),
-      actions([
-        button('开', { a: DM.setNoMentionDm, v: 'on', n: project.name }, noMention ? 'primary' : 'default'),
-        button('关', { a: DM.setNoMentionDm, v: 'off', n: project.name }, noMention ? 'default' : 'primary'),
-      ]),
-      note(
-        kind === 'single'
-          ? '开启后：本群所有消息(不用 @)都交给我处理。'
-          : '开启后：话题内消息(不用 @)都处理；**开新话题仍需 @我**。',
-      ),
+      md('AI 参与策略'),
+      actions(PARTICIPATION_OPTIONS.filter(o => o.value !== 'model' || (kind === 'single' && (!project.backend || project.backend === 'codex-appserver'))).map(o => button(o.label, { a: DM.setParticipationDm, v: o.value, n: project.name }, participationPolicy(project) === o.value ? 'primary' : 'default'))),
+      note('模型自行决定回复目前支持 Codex 单会话群。消息简史独立设置。'),
       hr(),
       md('🗜️ 自动压缩上下文'),
       actions([
@@ -1846,6 +1862,15 @@ export function buildProjectSettingsCard(
         button('关', { a: DM.setAutoCompactDm, v: 'off', n: project.name }, autoCompact ? 'default' : 'primary'),
       ]),
       note('开启后：上下文接近上限时 Codex 自动总结早前对话、释放空间（默认开）。改动下一轮会话生效。'),
+      hr(),
+      md('🧠 消息简史'),
+      actions([
+        button('开', { a: DM.setContextBriefingDm, v: 'on', n: project.name }, project.contextBriefing !== false ? 'primary' : 'default'),
+        button('关', { a: DM.setContextBriefingDm, v: 'off', n: project.name }, project.contextBriefing === false ? 'primary' : 'default'),
+      ]),
+      note('开启：使用消息总结模型整理消息；关闭：直接提供原文。'),
+      note(`消息总结模型：${project.contextBriefingModel ?? 'gpt-5.6-luna'} · Fast ${project.contextBriefingFast ? '开' : '关'}`),
+      actions([button('设置消息总结模型', { a: DM.briefingModel, n: project.name })]),
       hr(),
       md('🤖 默认模型 / 推理强度'),
       actions([button('设置默认模型', { a: DM.modelDefault, n: project.name }, 'primary')]),
@@ -1930,4 +1955,21 @@ export function buildAddAllowedCard(
     ],
     { header: { title: '➕ 添加白名单成员', template: 'blue' } },
   );
+}
+
+/** Message-history model is independent of the replying model. */
+export function buildBriefingModelCard(p: Pick<Project, 'name' | 'contextBriefingModel' | 'contextBriefingFast'>, models: ModelInfo[], ctx: 'dm' | 'group', notice?: string): CardObject {
+  const selected = p.contextBriefingModel ?? 'gpt-5.6-luna';
+  const options = models.filter(m => !m.hidden).map(m => ({ label: m.displayName, value: m.id }));
+  if (!options.some(m => m.value === selected)) options.unshift({ label: selected, value: selected });
+  return card([
+    md(`**消息总结模型** · ${p.name}`), ...(notice ? [md(notice)] : []),
+    note('只影响消息简史。保存后下一次整理生效；已有摘要保留，主 Agent 模型不变。'),
+    form('briefing_model', [
+      selectMenu({ name: 'model', placeholder: '选择消息总结模型', options, initial: selected }),
+      selectMenu({ name: 'fast', placeholder: 'Fast', options: [{ label: 'Fast 关', value: 'off' }, { label: 'Fast 开', value: 'on' }], initial: p.contextBriefingFast ? 'on' : 'off' }),
+      actions([submitButton('保存', ctx === 'dm' ? { a: DM.briefingModelSubmit, n: p.name } : { a: GS.briefingModelSubmit }, 'primary', 'save_briefing')]),
+    ]),
+    actions([button('返回', ctx === 'dm' ? { a: DM.projectSettings, n: p.name } : { a: GS.settings })]),
+  ], { header: { title: '消息总结模型', template: 'blue' } });
 }
