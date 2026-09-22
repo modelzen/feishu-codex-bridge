@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -223,7 +223,9 @@ async function jsonOf(res: Response): Promise<any> {
 }
 
 beforeAll(async () => {
-  logDir = mkdtempSync(join(tmpdir(), 'web-server-test-logs-'));
+  // Windows runner TEMP may use RUNNER~1; libuv fs.watch needs the canonical
+  // directory spelling to match paths returned by native change notifications.
+  logDir = realpathSync(mkdtempSync(join(tmpdir(), 'web-server-test-logs-')));
   web = createWebServer({ service: stubService(), token: TOKEN, logDir });
   const { port, url } = await web.listen(0); // 临时端口，起了就关，绝不占固定口
   base = `http://127.0.0.1:${port}`;

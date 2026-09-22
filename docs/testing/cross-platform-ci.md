@@ -33,7 +33,10 @@ This explicit command enables native service tests. Ordinary `npm test` skips
 them. Run it in a disposable VM or CI runner: on macOS/Linux it temporarily
 registers a uniquely named service that runs a small local Node worker. It does
 not install, stop, restart, or read credentials from the real Bridge service.
-Temporary services and files are cleaned up after each test, including failures.
+The tests attempt service teardown even after a failure, preserving both the
+original error and any cleanup errors. Temporary files are removed only after
+teardown succeeds. If teardown cannot be confirmed, the unique fixture directory
+is retained and the error includes manual service-cleanup commands and its path.
 
 The Node 24 CI jobs also run these tests:
 

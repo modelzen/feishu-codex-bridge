@@ -1,9 +1,9 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { type ServiceDefinitionOptions } from '../src/service/common';
 import { buildPlist } from '../src/service/launchd';
 import { buildUnit } from '../src/service/systemd';
@@ -26,6 +26,10 @@ interface Fixture {
   name: string;
   options: Required<ServiceDefinitionOptions>;
   events: () => Promise<WorkerEvent[]>;
+  teardown?: {
+    actions: Array<() => void | Promise<void>>;
+    manualCommands: string[];
+  };
 }
 
 function command(executable: string, args: string[], env?: NodeJS.ProcessEnv): string {
@@ -93,16 +97,45 @@ ${keepAlive ? 'setInterval(() => {}, 1000);' : ''}
       return text.split('\n').slice(0, -1).filter(Boolean).map((line) => JSON.parse(line) as WorkerEvent);
     },
   };
+  const failures: unknown[] = [];
   try {
     await body(fixture);
   } catch (error) {
+    failures.push(error);
+  }
+  let teardownConfirmed = true;
+  if (fixture.teardown) {
+    try {
+      await cleanup(fixture.teardown.actions);
+    } catch (error) {
+      teardownConfirmed = false;
+      failures.push(error);
+    }
+  }
+  if (failures.length) {
     for (const file of [options.stdoutPath, options.stderrPath]) {
       console.error(`${file}:\n${await readFile(file, 'utf8').catch(() => '(not created)')}`);
     }
-    throw error;
-  } finally {
-    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }
+  if (teardownConfirmed) {
+    try {
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (error) {
+      failures.push(error);
+    }
+  } else {
+    const quote = (value: string): string => `'${value.replace(/'/g, `'"'"'`)}'`;
+    const instructions = [
+      `Teardown was not confirmed. Retained fixture: ${root}`,
+      `Manual cleanup for isolated service ${fixture.name}:`,
+      ...fixture.teardown!.manualCommands,
+      'After confirming the service is removed and the worker PIDs in events.jsonl have exited, remove the fixture:',
+      `rm -rf -- ${quote(root)}`,
+    ].join('\n');
+    throw new AggregateError(failures, instructions);
+  }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, `Native service test and cleanup failed; fixture: ${root}`);
 }
 
 function expectWorker(event: WorkerEvent, fixture: Fixture, serviceFlag: string | null): void {
@@ -183,29 +216,32 @@ describe.skipIf(!enabled)('native service smoke tests (explicit opt-in)', () => 
       command('systemd-analyze', ['--user', 'verify', unitPath]);
       // Missing user bus is a CI configuration failure, never a silent skip.
       command('systemctl', ['--user', 'show-environment']);
-      try {
-        command('systemctl', ['--user', 'link', '--runtime', unitPath]);
-        command('systemctl', ['--user', 'daemon-reload']);
-        command('systemctl', ['--user', 'start', unitName]);
-        const first = await waitForWorker(fixture);
-        expectWorker(first, fixture, null);
-        command('systemctl', ['--user', 'restart', unitName]);
-        const second = await waitForWorker(fixture, first.pid);
-        expectWorker(second, fixture, null);
-        expect(second.pid).not.toBe(first.pid);
-        expect(command('systemctl', ['--user', 'is-active', unitName]).trim()).toBe('active');
-        await expectLogs(fixture);
-      } finally {
-        // Attempt all cleanup even after partial registration/timeouts. Both
-        // stop and disable --now stop this unique job; --runtime removes only
-        // its temporary link, never a persistent user service definition.
-        await cleanup([
+      // Register teardown before the first mutation: even a timed-out link may
+      // have registered the unit. The owner retains files if cleanup is unsure.
+      fixture.teardown = {
+        actions: [
           () => { command('systemctl', ['--user', 'stop', unitName]); },
           () => { command('systemctl', ['--user', 'disable', '--runtime', '--now', unitName]); },
           () => { command('systemctl', ['--user', 'daemon-reload']); },
           () => waitForExit(fixture),
-        ]);
-      }
+        ],
+        manualCommands: [
+          `systemctl --user stop ${unitName}`,
+          `systemctl --user disable --runtime --now ${unitName}`,
+          'systemctl --user daemon-reload',
+        ],
+      };
+      command('systemctl', ['--user', 'link', '--runtime', unitPath]);
+      command('systemctl', ['--user', 'daemon-reload']);
+      command('systemctl', ['--user', 'start', unitName]);
+      const first = await waitForWorker(fixture);
+      expectWorker(first, fixture, null);
+      command('systemctl', ['--user', 'restart', unitName]);
+      const second = await waitForWorker(fixture, first.pid);
+      expectWorker(second, fixture, null);
+      expect(second.pid).not.toBe(first.pid);
+      expect(command('systemctl', ['--user', 'is-active', unitName]).trim()).toBe('active');
+      await expectLogs(fixture);
     });
   }, 120_000);
 
@@ -230,22 +266,81 @@ describe.skipIf(!enabled)('native service smoke tests (explicit opt-in)', () => 
       const domain = `gui/${userInfo().uid}`;
       const target = `${domain}/${fixture.name}`;
       command('/bin/launchctl', ['print', domain]);
-      try {
-        command('/bin/launchctl', ['bootstrap', domain, plistPath]);
-        const first = await waitForWorker(fixture);
-        expectWorker(first, fixture, null);
-        command('/bin/launchctl', ['kickstart', '-k', target]);
-        const second = await waitForWorker(fixture, first.pid);
-        expectWorker(second, fixture, null);
-        expect(second.pid).not.toBe(first.pid);
-        await expectLogs(fixture);
-      } finally {
-        // Even a timed-out bootstrap may have registered the job server-side.
-        await cleanup([
+      // Even a timed-out bootstrap may have registered the job server-side.
+      fixture.teardown = {
+        actions: [
           () => { command('/bin/launchctl', ['bootout', target]); },
           () => waitForExit(fixture),
-        ]);
-      }
+        ],
+        manualCommands: [`/bin/launchctl bootout ${target}`],
+      };
+      command('/bin/launchctl', ['bootstrap', domain, plistPath]);
+      const first = await waitForWorker(fixture);
+      expectWorker(first, fixture, null);
+      command('/bin/launchctl', ['kickstart', '-k', target]);
+      const second = await waitForWorker(fixture, first.pid);
+      expectWorker(second, fixture, null);
+      expect(second.pid).not.toBe(first.pid);
+      await expectLogs(fixture);
     });
   }, 120_000);
+});
+
+// Failure-path checks use only files and injected callbacks, never an OS
+// service. They can run safely as part of the ordinary unit suite.
+describe('native service harness cleanup', () => {
+  it('retains the fixture and both errors when test and teardown fail', async () => {
+    const primary = new Error('worker startup failed');
+    const teardown = new Error('service stop failed');
+    const laterCleanup = vi.fn();
+    const diagnostics = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let root = '';
+    try {
+      let failure: unknown;
+      try {
+        await withFixture(false, async (fixture) => {
+          root = fixture.root;
+          fixture.teardown = {
+            actions: [() => { throw teardown; }, laterCleanup],
+            manualCommands: ['stop-the-isolated-test-service'],
+          };
+          throw primary;
+        });
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(AggregateError);
+      const aggregate = failure as AggregateError;
+      expect(aggregate.errors[0]).toBe(primary);
+      expect(aggregate.errors[1]).toBeInstanceOf(AggregateError);
+      expect((aggregate.errors[1] as AggregateError).errors).toEqual([teardown]);
+      expect(aggregate.message).toContain(root);
+      expect(aggregate.message).toContain('stop-the-isolated-test-service');
+      expect(laterCleanup).toHaveBeenCalledOnce();
+      expect((await stat(root)).isDirectory()).toBe(true);
+    } finally {
+      diagnostics.mockRestore();
+      // No service was started by the injected callbacks above.
+      if (root) await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves the original error and removes files after successful teardown', async () => {
+    const primary = new Error('worker assertion failed');
+    const teardown = vi.fn();
+    const diagnostics = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let root = '';
+    try {
+      await expect(withFixture(false, async (fixture) => {
+        root = fixture.root;
+        fixture.teardown = { actions: [teardown], manualCommands: [] };
+        throw primary;
+      })).rejects.toBe(primary);
+      expect(teardown).toHaveBeenCalledOnce();
+      await expect(stat(root)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      diagnostics.mockRestore();
+      if (root) await rm(root, { recursive: true, force: true });
+    }
+  });
 });

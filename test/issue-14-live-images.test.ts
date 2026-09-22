@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { join, parse, relative } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import type { AgentEvent } from '../src/agent/types';
 import { ANSWER_EID, buildRunCard, runningAnswerText } from '../src/card/run-card';
@@ -93,15 +93,16 @@ async function until(check: () => boolean, ms = 2_000): Promise<void> {
 }
 
 describe('issue #14 — relative image ref resolves against the RUN cwd', () => {
-  it('uploads a cwd-relative ref even when the bridge fallback cwd is "/" (launchd)', async () => {
-    // The service's process cwd IS `/`; the launch site used to fall back to it
-    // for the upload instead of the project directory.
+  it('uploads a cwd-relative ref when the fallback cwd is a filesystem root', async () => {
+    // launchd falls back to `/`. Use the fixture's own drive root on Windows:
+    // the checkout and temporary directory can live on different drives.
     const project = await tmpDir();
+    const root = parse(project).root;
     await writeFile(join(project, 'a.png'), PNG);
     const { channel, state } = fakeChannel();
-    const src = relative('/', join(project, 'a.png')); // e.g. var/folders/…/a.png
+    const src = relative(root, join(project, 'a.png')); // e.g. var/folders/…/a.png
 
-    const map = await uploadOutboundImages(channel, [src], '/', 'write');
+    const map = await uploadOutboundImages(channel, [src], root, 'write');
     expect(map.get(src)).toMatch(/^img_key_/);
     expect(state.uploads).toBe(1);
   });

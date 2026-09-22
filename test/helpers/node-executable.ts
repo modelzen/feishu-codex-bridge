@@ -13,12 +13,15 @@ export function writeNodeExecutable(
 
   if (process.platform === 'win32') {
     // Quoted batch literals still expand %. Disable ! expansion and escape %
-    // in paths; %* intentionally forwards the launcher's arguments unchanged.
+    // in the Node path; %* forwards the launcher's arguments unchanged.
+    // Derive the payload path from the Unicode command-line argument instead
+    // of embedding it in batch source decoded with the active OEM code page.
+    // %~dpn0 is this launcher's drive, directory and basename, without .cmd.
     const quote = (value: string): string => `"${value.replace(/%/g, '%%')}"`;
     writeFileSync(bin, [
       '@echo off',
       'setlocal DisableDelayedExpansion',
-      `${quote(process.execPath)} ${quote(script)} %*`,
+      `${quote(process.execPath)} "%~dpn0.cjs" %*`,
       'exit /b %errorlevel%',
       '',
     ].join('\r\n'));
