@@ -16,12 +16,19 @@ import {
  * re-rendered and pushed on each tick (see {@link RunCardStream}).
  */
 export class RunRender {
-  private state: RunState = initialState;
+  private state: RunState = { ...initialState, startedAt: Date.now() };
   /** when false, tool blocks are dropped from the rendered card (pref) */
   showTools = true;
 
   apply(ev: AgentEvent): void {
     this.state = reduce(this.state, ev);
+    this.freezeClock();
+  }
+
+  private freezeClock(): void {
+    if (this.state.terminal !== 'running' && this.state.completedAt === undefined) {
+      this.state = { ...this.state, completedAt: Date.now() };
+    }
   }
 
   /** Current structured state for rendering. */
@@ -37,15 +44,18 @@ export class RunRender {
   /** Mark the run as watchdog-killed (idle timeout). */
   timeout(seconds: number): void {
     this.state = markIdleTimeout(this.state, seconds);
+    this.freezeClock();
   }
 
   /** Mark the run as user-interrupted (⏹). */
   interrupt(): void {
     this.state = markInterrupted(this.state);
+    this.freezeClock();
   }
 
   /** Force a terminal state if the stream ended without done/error. */
   finalize(): void {
     this.state = finalizeIfRunning(this.state);
+    this.freezeClock();
   }
 }

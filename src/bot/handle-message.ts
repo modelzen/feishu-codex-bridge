@@ -3,6 +3,8 @@ import { createVoiceService } from '../voice/service';
 import { ingestVoice, createIntakeQueue, type IngestedContext } from '../voice/inbound';
 import type { VoiceReply } from '../voice/types';
 import { steerWithDeadline, isRejectedSteer } from './steer-delivery';
+import { TurnCardEvents, type SteerCardEvent } from './turn-card-events';
+import { runSegment } from '../card/run-segment';
 import type {
   BotAddedEvent,
   CardActionEvent,
@@ -469,6 +471,7 @@ function runFailureMessage(err: unknown, dropped: number): string {
 }
 
 interface ActiveState {
+  steerReply?: { run: AgentRun; accept: (messageId: string, voice?: VoiceReply) => boolean };
   /** Captured with the steer target so a late ACK cannot decorate another turn. */
   voiceReply?: { run: AgentRun; add: (voice: VoiceReply) => void };
   /** Prevent a late ASR result from restarting a stopped conversation. */
@@ -1324,9 +1327,11 @@ export function createOrchestrator(
       const tid = cur.run.turnId();
       if (tid) {
         const voiceReply = cur.voiceReply?.run === cur.run ? cur.voiceReply : undefined;
+        const steerReply = cur.steerReply?.run === cur.run ? cur.steerReply : undefined;
         try {
           await steerWithDeadline(cur.thread, { text: woven.text, images }, tid);
-          if (woven.voice) voiceReply?.add(woven.voice);
+          const split = steerReply?.accept(msg.messageId, woven.voice);
+          if (!split && woven.voice) voiceReply?.add(woven.voice);
           log.info('intake', 'steer', { tid, images: images?.length ?? 0 });
           return;
         } catch (err) {
@@ -4216,6 +4221,7 @@ export function createOrchestrator(
     // if the stream producer throws mid-turn (avoids leaking a stale stop target)
     let curCardKey: string | undefined;
     let disposeInterrupt: (() => void) | undefined;
+    let cardClock: ReturnType<typeof setInterval> | undefined;
     // intake durations ride the FIRST turn's stream.timing line only (M-1)
     let intake = opts.timing;
     let firstRec = opts.firstRec;
@@ -4256,9 +4262,14 @@ export function createOrchestrator(
         const turnStartAt = Date.now(); // turn/start 已在 runStreamed() 内发出（与下面的建卡并行）
         state.run = run;
         const render = new RunRender();
+        const cardEvents = new TurnCardEvents();
+        state.steerReply = { run, accept: (messageId, voice) => cardEvents.accept(messageId, voice) };
+        let boundary: RunState | undefined;
+        let segmentStartedAt: number | undefined;
+        const segmentSnapshot = (): RunState => runSegment(render.snapshot(), boundary, segmentStartedAt);
         render.showTools = getShowToolCalls(cfg);
         let cardMsgId: string | undefined;
-        const rc: RunCardState = {
+        let rc: RunCardState = {
           rs: render.snapshot(),
           voiceMessages: currentTurn.voice ? [currentTurn.voice] : [],
           requesterOpenId: currentTurn.requesterOpenId,
@@ -4295,7 +4306,7 @@ export function createOrchestrator(
 
         // CardKit streaming entity: body streams with the native typewriter,
         // ⏹/⚙️ ride whole-card updates — both on one card_id (see RunCardStream).
-        const stream = queuedCard?.stream ?? new RunCardStream();
+        let stream = queuedCard?.stream ?? new RunCardStream();
         state.voiceReply = {
           run,
           add: (voice) => {
@@ -4343,10 +4354,13 @@ export function createOrchestrator(
         rc.cardKey = cardMsgId;
         runsByCard.set(cardMsgId, state);
         runStreams.set(cardMsgId, stream);
-        completionReminderRefreshers.set(cardMsgId, () => {
-          rc.completionReminder = completionReminderView(state);
-          void stream.updateLiveCard(channel, buildRunCard(rc));
-        });
+        const registerReminder = (messageId: string, target: RunCardState, targetStream: RunCardStream): void => {
+          completionReminderRefreshers.set(messageId, () => {
+            target.completionReminder = completionReminderView(state);
+            void targetStream.updateLiveCard(channel, buildRunCard(target));
+          });
+        };
+        registerReminder(cardMsgId, rc, stream);
         // The entity is created before its carrier messageId exists, so the
         // initial JSON cannot self-route controls. Establish the first
         // self-addressed ⏹/🔔 row immediately instead of waiting for an agent
@@ -4364,6 +4378,70 @@ export function createOrchestrator(
             /* reaction is best-effort */
           }
         }
+
+        const splitCard = async (event: SteerCardEvent): Promise<void> => {
+          const nextStream = new RunCardStream();
+          const nextBoundary = render.snapshot();
+          const nextStartedAt = Date.now();
+          const next: RunCardState = {
+            ...rc, rs: runSegment(nextBoundary, nextBoundary, nextStartedAt),
+            cardKey: undefined, continued: false, localFiles: undefined, images: undefined,
+            voiceMessages: event.voice ? [event.voice] : [],
+          };
+          let nextId: string;
+          try {
+            nextId = await nextStream.create(channel, opts.chatId, buildRunCard(next), {
+              replyTo: event.messageId, replyInThread: !opts.flat,
+            });
+          } catch (err) {
+            log.fail('card', err, { phase: 'steer-card-create' });
+            if (event.voice) state.voiceReply?.add(event.voice);
+            void channel.send(opts.chatId, { markdown: '补充消息已送达；新卡片创建失败，本轮继续在原卡片输出。' },
+              { replyTo: event.messageId, replyInThread: !opts.flat }).catch(() => undefined);
+            return;
+          }
+          const previous = rc;
+          const previousStream = stream;
+          const previousId = cardMsgId!;
+          previous.rs = { ...previous.rs, terminal: 'done', footer: null, completedAt: nextStartedAt };
+          previous.continued = true;
+          completionReminderRefreshers.delete(previousId);
+          runsByCard.delete(previousId);
+          runStreams.delete(previousId);
+          // Switch the live target before awaiting the frozen card's I/O. The
+          // event queue retains all backend output produced while cards rotate.
+          boundary = nextBoundary;
+          segmentStartedAt = nextStartedAt;
+          rc = next;
+          stream = nextStream;
+          cardMsgId = nextId;
+          curCardKey = nextId;
+          rc.cardKey = nextId;
+          runsByCard.set(nextId, state);
+          runStreams.set(nextId, stream);
+          registerReminder(nextId, rc, stream);
+          attachRunImages({ stream, rc, channel,
+            upload: sources => uploadOutboundImages(channel, sources, runCwd, opts.mode ?? DEFAULT_PERMISSION_MODE) });
+          stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID);
+          try {
+            await previousStream.drain();
+            const text = finalMessageText(previous.rs);
+            previous.localFiles = await outboundFiles.prepare(text, {
+              messageId: previousId, chatId: opts.chatId, cwd: runCwd,
+              mode: opts.mode ?? DEFAULT_PERMISSION_MODE, requesterOpenId: currentTurn.requesterOpenId,
+              replyInThread: !opts.flat, cardId: previousStream.getCardId(),
+            }, (id, element) => previousStream.updateElement(channel, id, element));
+            previous.images = await previousStream.settleImages(text);
+          } catch (err) {
+            log.fail('card', err, { phase: 'steer-card-assets' });
+          }
+          await previousStream.finalizeCard(channel, buildRunCard(previous))
+            .catch(err => log.fail('card', err, { phase: 'steer-card-finalize' }));
+        };
+        cardClock = setInterval(() => {
+          if (rc.rs.terminal === 'running') stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID);
+        }, 1000);
+        cardClock.unref();
 
         // ⏹ 终止（QW-15）：发 turn/interrupt 后等事件流**自然 done** —— codex
         // 0.139+ 实测 interrupt 4ms 返回、turn/completed(status:"interrupted")
@@ -4403,7 +4481,11 @@ export function createOrchestrator(
         let lastEvAt = tStart;
         let evCount = 0;
         let textChars = 0;
-        for await (const ev of guarded) {
+        for await (const ev of cardEvents.consume(guarded)) {
+          if (ev.type === 'steer_accepted') {
+            await splitCard(ev);
+            continue;
+          }
           const tEv = Date.now();
           if (!firstEvAt) firstEvAt = tEv;
           const et = (ev as { type?: string }).type;
@@ -4433,7 +4515,7 @@ export function createOrchestrator(
             );
           }
           render.apply(ev);
-          rc.rs = render.snapshot();
+          rc.rs = segmentSnapshot();
           // The global mode is live-editable. Re-evaluate on every structural /
           // answer frame so switching away from manual removes the button from
           // an already-running card instead of leaving a stale affordance.
@@ -4443,6 +4525,9 @@ export function createOrchestrator(
           // typewriter (cardElement.content), structure → whole-card update.
           stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID);
         }
+        clearInterval(cardClock);
+        cardClock = undefined;
+        state.steerReply = undefined;
         state.run = undefined; // completion-card I/O must queue, never steer into a finished turn
         const doneAt = Date.now(); // codex stopped emitting / loop ended
         stopper.dispose(); // 事件流已收尾：撤掉 ⏹ 的 5s 强停兜底定时器
@@ -4464,7 +4549,7 @@ export function createOrchestrator(
           idleTimeoutSeconds: Math.round(idleMs / 1000),
           procDead,
         });
-        rc.rs = render.snapshot();
+        rc.rs = segmentSnapshot();
         if (interrupted) log.info('agent', 'interrupt', { graceful: !stopper.forced(), threadId: topicThreadId ?? null });
 
         // A killed turn (watchdog / forced ⏹) leaves codex mid-turn with a
@@ -4625,6 +4710,8 @@ export function createOrchestrator(
       // A replacement run may have reserved the key while failure feedback
       // was in flight. Never delete another run's reservation.
       if (active.get(activeKey) === state) active.delete(activeKey);
+      clearInterval(cardClock);
+      state.steerReply = undefined;
       state.voiceReply = undefined;
       if (curCardKey) {
         runsByCard.delete(curCardKey);
@@ -4749,7 +4836,7 @@ export function createOrchestrator(
     // context (null between turns); assigned directly in the loop so TS narrows it.
     // `stream`/`cardMsgId` are null until the turn produces real output — a card is
     // sent LAZILY on first content, so a planning-only turn leaves no empty box.
-    type GoalTurnCtx = { render: RunRender; rc: RunCardState; stream: RunCardStream | null; cardMsgId: string | null };
+    type GoalTurnCtx = { render: RunRender; rc: RunCardState; stream: RunCardStream | null; cardMsgId: string | null; clock?: ReturnType<typeof setInterval> };
     let cur: GoalTurnCtx | null = null;
     let replyTo = opts.replyTo;
     let replyInThread = opts.flat ? false : (opts.replyInThread ?? Boolean(opts.knownThreadId));
@@ -4791,6 +4878,8 @@ export function createOrchestrator(
      * never produced content (no card was sent) — that's how empty turns vanish. */
     const finalizeCard = async (ctx: GoalTurnCtx | null): Promise<void> => {
       if (!ctx || !ctx.stream || !ctx.cardMsgId) return;
+      clearInterval(ctx.clock);
+      ctx.clock = undefined;
       await ctx.stream.drain();
       ctx.render.finalize();
       ctx.rc.rs = ctx.render.snapshot();
@@ -4837,6 +4926,10 @@ export function createOrchestrator(
       ctx.rc.cardKey = cardMsgId;
       ctx.stream = stream;
       ctx.cardMsgId = cardMsgId;
+      ctx.clock = setInterval(() => {
+        if (ctx.rc.rs.terminal === 'running') stream.streamCoalesced(channel, buildRunCard(ctx.rc), ANSWER_EID);
+      }, 1000);
+      ctx.clock.unref();
       runsByCard.set(cardMsgId, state);
       runStreams.set(cardMsgId, stream);
       await adoptThreadId(cardMsgId, ctx.rc);
@@ -5008,6 +5101,7 @@ export function createOrchestrator(
         .send(opts.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
         .catch(() => undefined);
     } finally {
+      clearInterval(cur?.clock);
       active.delete(activeKey);
       if (cur?.cardMsgId) runsByCard.delete(cur.cardMsgId);
       // Recycle the codex process (it may still be mid-goal, and a terminated goal

@@ -60,6 +60,7 @@ function deferred<T>() {
 function thread() {
   const turns: ReturnType<typeof deferred<void>>[] = [];
   const consumed: AgentInput[] = [];
+  const progress: { queue: AgentEvent[]; wake?: () => void }[] = [];
   const t = {
     sessionId: 'host', isAlive: () => true,
     close: vi.fn(async () => { for (const turn of turns) turn.resolve(); }),
@@ -68,18 +69,30 @@ function thread() {
     runStreamed(input: AgentInput) {
       consumed.push(input);
       const end = deferred<void>();
+      const live: { queue: AgentEvent[]; wake?: () => void } = { queue: [] };
+      progress.push(live);
       const id = `turn-${turns.push(end)}`;
       return {
         turnId: () => id, // deliberately keep backend ID stale during final-card I/O
         events: (async function* (): AsyncGenerator<AgentEvent> {
           yield { type: 'turn_started', turnId: id };
-          await end.promise;
+          let done = false;
+          let failure: { error: unknown } | undefined;
+          void end.promise.then(() => { done = true; live.wake?.(); }, error => { failure = { error }; done = true; live.wake?.(); });
+          while (!done || live.queue.length) {
+            const event = live.queue.shift();
+            if (event) yield event;
+            else await new Promise<void>(resolve => { live.wake = resolve; });
+          }
+          if (failure) throw failure.error;
           yield { type: 'done', turnId: id };
         })(),
       };
     },
   };
-  return { t, turns, consumed };
+  return { t, turns, consumed, emit(event: AgentEvent, index = 0) {
+    progress[index]!.queue.push(event); progress[index]!.wake?.();
+  } };
 }
 let orchestrator: ReturnType<typeof createOrchestrator>;
 let seq = 0;
@@ -356,16 +369,19 @@ it('shows queued voice on its own turn and does not leak it into the next text r
   run.turns[2]!.resolve();
 });
 
-it('adds accepted voice steering once to the existing card while keeping the agent input plain', async () => {
+it('opens a new card for accepted voice steering while keeping the agent input plain', async () => {
   const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t); const o = setup();
   await o.onMessage(message('first')); await until(() => expect(fake.createCard).toHaveBeenCalledOnce());
   const msg = { ...message('<audio/>'), rawContentType: 'audio' };
   await o.onMessage(msg); await until(() => expect(run.t.steer).toHaveBeenCalledOnce());
   await until(() => expect(panelText(fake.live.mock.calls.at(-1)![1])).toEqual(['语音正文']));
   await o.onMessage(msg);
-  expect(fake.createCard).toHaveBeenCalledOnce();
+  expect(fake.createCard).toHaveBeenCalledTimes(2);
   expect(run.t.steer.mock.calls[0]![0].text).not.toMatch(/语音消息|> |复述/);
-  run.turns[0]!.resolve(); await until(() => expect(fake.final).toHaveBeenCalled());
+  expect(panelText(fake.createCard.mock.calls[1]![2])).toEqual(['语音正文']);
+  expect(fake.createCard.mock.calls[1]![3]).toMatchObject({ replyTo: msg.messageId, replyInThread: true });
+  expect(run.consumed).toHaveLength(1);
+  run.turns[0]!.resolve(); await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()));
   expect(panelText(fake.final.mock.calls.at(-1)![1])).toEqual(['语音正文']);
 });
 
@@ -410,4 +426,76 @@ it('keeps a late successful steer acknowledgement attached to its original reply
   run.turns[1]!.resolve();
   await until(() => expect(fake.log.info.mock.calls.filter(c => c[1] === 'final')).toHaveLength(2));
   expect(panelText(fake.final.mock.calls.at(-1)![1])).toEqual([]);
+});
+
+
+it('rotates consecutive steers without starting another turn or replaying full text snapshots', async () => {
+  const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t); const o = setup();
+  let cardId = 0; fake.createCard.mockImplementation(async () => `card-${++cardId}`);
+  await o.onMessage(message('first')); await until(() => expect(fake.createCard).toHaveBeenCalledOnce());
+  run.emit({ type: 'text_delta', itemId: 'answer', delta: 'BEFORE' });
+  await until(() => expect(JSON.stringify(fake.live.mock.calls.at(-1))).toContain('BEFORE'));
+  const steer1 = message('change direction'); await o.onMessage(steer1);
+  await until(() => expect(fake.final).toHaveBeenCalledTimes(1));
+  const frozen1 = JSON.stringify(fake.final.mock.calls[0]![1]);
+  expect(frozen1).toContain('BEFORE');
+  expect(frozen1).toContain('后续输出见下一张卡片');
+  expect(frozen1).not.toContain('run.stop');
+  run.emit({ type: 'text', itemId: 'answer', text: 'BEFORE-AFTER' });
+  await until(() => expect(JSON.stringify(fake.live.mock.calls.at(-1))).toContain('-AFTER'));
+  expect(JSON.stringify(fake.live.mock.calls.at(-1))).not.toContain('BEFORE');
+  const steer2 = message('another change'); await o.onMessage(steer2);
+  await until(() => expect(fake.final).toHaveBeenCalledTimes(2));
+  run.emit({ type: 'text', itemId: 'last', text: 'FINAL' });
+  run.turns[0]!.resolve();
+  await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()));
+  expect(fake.createCard).toHaveBeenCalledTimes(3);
+  expect(fake.createCard.mock.calls[1]![3]).toMatchObject({ replyTo: steer1.messageId });
+  expect(fake.createCard.mock.calls[2]![3]).toMatchObject({ replyTo: steer2.messageId });
+  expect(run.consumed).toHaveLength(1);
+  expect(run.t.steer).toHaveBeenCalledTimes(2);
+  expect(JSON.stringify(fake.final.mock.calls.at(-1)![1])).toContain('FINAL');
+  expect(JSON.stringify(fake.final.mock.calls.at(-1)![1])).not.toContain('BEFORE');
+});
+
+it('keeps delivering on the old card if the accepted steer cannot create its card', async () => {
+  const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t); const o = setup();
+  await o.onMessage(message('first')); await until(() => expect(fake.createCard).toHaveBeenCalledOnce());
+  fake.createCard.mockRejectedValueOnce(new Error('CardKit unavailable'));
+  await o.onMessage(message('steer'));
+  await until(() => expect(fake.send).toHaveBeenCalledWith('chat', expect.objectContaining({ markdown: expect.stringContaining('新卡片创建失败') }), expect.anything()));
+  run.emit({ type: 'text', itemId: 'a', text: 'STILL DELIVERED' });
+  run.turns[0]!.resolve();
+  await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()));
+  expect(JSON.stringify(fake.final.mock.calls.at(-1)![1])).toContain('STILL DELIVERED');
+  expect(JSON.stringify(fake.final.mock.calls.at(-1)![1])).not.toContain('后续输出见下一张卡片');
+  expect(run.consumed).toHaveLength(1);
+  expect(run.t.steer).toHaveBeenCalledOnce();
+});
+
+it('buffers output and completion while the new steer card is being created', async () => {
+  const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t); const o = setup();
+  await o.onMessage(message('first')); await until(() => expect(fake.createCard).toHaveBeenCalledOnce());
+  const created = deferred<string>(); fake.createCard.mockReturnValueOnce(created.promise);
+  await o.onMessage(message('steer'));
+  await until(() => expect(fake.createCard).toHaveBeenCalledTimes(2));
+  run.emit({ type: 'text', itemId: 'a', text: 'DURING CREATE' });
+  run.turns[0]!.resolve();
+  created.resolve('new-card');
+  await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()));
+  expect(JSON.stringify(fake.final.mock.calls.at(-1)![1])).toContain('DURING CREATE');
+  expect(run.consumed).toHaveLength(1);
+});
+
+
+it('refreshes elapsed time during silence and stops refreshing after completion', async () => {
+  const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t); const o = setup();
+  await o.onMessage(message('first')); await until(() => expect(fake.createCard).toHaveBeenCalledOnce());
+  await vi.waitFor(() => expect(JSON.stringify(fake.live.mock.calls.at(-1)![1])).toContain('已处理 1秒'), { timeout: 1500, interval: 20 });
+  run.turns[0]!.resolve();
+  await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()));
+  expect(JSON.stringify(fake.final.mock.calls.at(-1)![1])).toContain('用时 1秒');
+  const writes = fake.live.mock.calls.length;
+  await new Promise(resolve => setTimeout(resolve, 1100));
+  expect(fake.live).toHaveBeenCalledTimes(writes);
 });

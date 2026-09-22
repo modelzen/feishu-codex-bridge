@@ -320,10 +320,9 @@ describe('buildRunCard — full command visibility', () => {
     events.push({ type: 'done', turnId: 'x' });
     const card = buildRunCard({ rs: run(events) });
     const json = JSON.stringify(card);
-    // not degraded to a batched summary (the summary title says「N 个工具调用」;
-    // the process-fold header only says「N 个工具」) — and 1 fold + 5 tool panels.
+    // Every operation retains an independently expandable detail inside its group.
     expect(json).not.toContain('个工具调用');
-    expect(panelCount(card)).toBe(6);
+    expect(panelCount(card)).toBe(7); // process + consecutive-tool group + 5 details
     for (let i = 0; i < 5; i++) expect(json).toContain(`FULLCMD_TAIL_${i}`);
   });
 
@@ -338,7 +337,7 @@ describe('buildRunCard — full command visibility', () => {
     events.push({ type: 'done', turnId: 'x' });
     const card = buildRunCard({ rs: run(events) });
     const json = JSON.stringify(card);
-    expect(json).toContain('130 个工具调用'); // degraded to the summary (component budget)
+    expect(json).toContain('已运行 130 条命令'); // degraded to the summary (component budget)
     expect(json).toContain('BATCHED_TAIL'); // ...but a batched command is still shown in full
     // component-budget guard held: the card is a handful of panels, not 130
     expect(panelCount(card)).toBeLessThan(10);
