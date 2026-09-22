@@ -223,9 +223,14 @@ async function jsonOf(res: Response): Promise<any> {
 }
 
 beforeAll(async () => {
-  // Windows runner TEMP may use RUNNER~1; libuv fs.watch needs the canonical
-  // directory spelling to match paths returned by native change notifications.
-  logDir = realpathSync(mkdtempSync(join(tmpdir(), 'web-server-test-logs-')));
+  const temporaryLogDir = mkdtempSync(join(tmpdir(), 'web-server-test-logs-'));
+  // Plain realpathSync only resolves symlinks; .native also expands RUNNER~1.
+  // libuv's directory watcher otherwise aborts on short/long path mismatches:
+  // https://github.com/libuv/libuv/issues/5010
+  logDir = realpathSync.native(temporaryLogDir);
+  if (process.platform === 'win32' && process.env.CI) {
+    console.info('Windows log watcher paths', JSON.stringify({ input: temporaryLogDir, native: logDir }));
+  }
   web = createWebServer({ service: stubService(), token: TOKEN, logDir });
   const { port, url } = await web.listen(0); // 临时端口，起了就关，绝不占固定口
   base = `http://127.0.0.1:${port}`;
