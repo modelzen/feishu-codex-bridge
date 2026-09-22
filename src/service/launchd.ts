@@ -4,6 +4,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { homedir, userInfo } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { normalizeServiceCodexBin, saveServiceCodexBin, selectInstallCodexBin } from './codex-bin';
 import {
   ensureLogFiles,
   serviceStderrPath,
@@ -42,6 +43,7 @@ export function buildPlist(options: ServiceDefinitionOptions & { label?: string 
   const nodePath = process.execPath;
   const cliBinPath = options.cliBinPath ?? resolveCliBinPath();
   const pathEnv = options.envPath ?? process.env.PATH ?? '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin';
+  const codexBin = normalizeServiceCodexBin(options.codexBin === undefined ? process.env.CODEX_BIN : options.codexBin);
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -67,8 +69,8 @@ export function buildPlist(options: ServiceDefinitionOptions & { label?: string 
   <dict>
     <key>PATH</key>
     <string>${escapeXml(pathEnv)}</string>
-${process.env.CODEX_BIN ? `    <key>CODEX_BIN</key>
-    <string>${escapeXml(process.env.CODEX_BIN)}</string>
+${codexBin !== undefined ? `    <key>CODEX_BIN</key>
+    <string>${escapeXml(codexBin ?? '')}</string>
 ` : ''}  </dict>
 </dict>
 </plist>
@@ -76,10 +78,13 @@ ${process.env.CODEX_BIN ? `    <key>CODEX_BIN</key>
 }
 
 export async function installLaunchd(): Promise<ServiceStatus> {
+  const codexBin = selectInstallCodexBin();
   const plistPath = launchAgentPlistPath();
   await mkdir(dirname(plistPath), { recursive: true });
   await ensureLogFiles();
-  await writeFile(plistPath, buildPlist(), 'utf8');
+  await writeFile(plistPath, buildPlist({ codexBin }), 'utf8');
+  // Save before bootout: an in-service caller may be terminated with its job.
+  saveServiceCodexBin(codexBin);
 
   if (isLoaded()) {
     const bootout = runLaunchctl(['bootout', serviceTarget()]);

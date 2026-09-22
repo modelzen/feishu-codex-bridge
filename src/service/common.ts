@@ -35,6 +35,8 @@ export interface ServiceDefinitionOptions {
   stdoutPath?: string;
   stderrPath?: string;
   envPath?: string;
+  /** undefined uses the installer environment; null explicitly clears an override. */
+  codexBin?: string | null;
 }
 
 /** Service log files live under the app dir, identical across platforms. */

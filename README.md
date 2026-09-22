@@ -120,6 +120,8 @@ feishu-codex-bridge doctor                      本地自检：后端 / 登录 /
 
 > ⚠️ 后台服务必须**全局安装**（`npm i -g`），别用 npx —— 服务里硬编码了 CLI 路径，npx 临时缓存会被清理。前台 `run` 用 npx 没问题（单次进程）。
 
+需要使用指定版本的 Codex 时，在 `start` 时设置 `CODEX_BIN`，服务会保存该路径并在重启后继续使用。已有服务需要重新生成配置；详见[指定后台 Codex、更新和取消覆盖](docs/configuration/codex-bin.md)。
+
 ---
 
 ## ⚙️ 配置与数据

@@ -1,9 +1,15 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { paths } from '../config/paths';
 import { mergeProcessEnv } from '../platform/spawn';
+import {
+  normalizeServiceCodexBin,
+  readServiceCodexBin,
+  saveServiceCodexBin,
+  selectInstallCodexBin,
+} from './codex-bin';
 import {
   appendServiceErr,
   ensureLogFiles,
@@ -60,12 +66,21 @@ function servicePidFile(): string {
  * because cmd.exe is the interpreter.
  */
 export function buildLauncherCmd(options: ServiceDefinitionOptions = {}): string {
+  const codexBin = normalizeServiceCodexBin(options.codexBin === undefined ? process.env.CODEX_BIN : options.codexBin);
+  // Percent substitutions still run inside quoted batch strings. Delayed !
+  // substitutions are disabled before any user paths are read below.
+  const literal = (value: string): string => value.replace(/%/g, '%%');
   return [
     '@echo off',
-    `set "PATH=${options.envPath ?? process.env.PATH ?? ''}"`,
-    ...(process.env.CODEX_BIN ? [`set "CODEX_BIN=${process.env.CODEX_BIN}"`] : []),
+    'setlocal DisableDelayedExpansion',
+    // This ASCII-only prefix works before cmd has decoded any UTF-8 paths and
+    // uses SystemRoot so a deliberately minimal PATH cannot hide chcp.com.
+    '"%SystemRoot%\\System32\\chcp.com" 65001 >nul',
+    'if errorlevel 1 exit /b %errorlevel%',
+    `set "PATH=${literal(options.envPath ?? process.env.PATH ?? '')}"`,
+    ...(codexBin === undefined ? [] : [`set "CODEX_BIN=${literal(codexBin ?? '')}"`]),
     `set "${SERVICE_ENV_FLAG}=1"`,
-    `"${process.execPath}" "${options.cliBinPath ?? resolveCliBinPath()}" run >> "${options.stdoutPath ?? serviceStdoutPath()}" 2>> "${options.stderrPath ?? serviceStderrPath()}"`,
+    `"${literal(process.execPath)}" "${literal(options.cliBinPath ?? resolveCliBinPath())}" run >> "${literal(options.stdoutPath ?? serviceStdoutPath())}" 2>> "${literal(options.stderrPath ?? serviceStderrPath())}"`,
     '',
   ].join('\r\n');
 }
@@ -100,13 +115,31 @@ export function buildLauncherVbs(): string {
  *    new bridge's env so it resolves paths and spawns codex/npm correctly even if
  *    the relauncher itself ran with a stripped-down environment.
  */
-function startNow(opts: { appDir?: string; envPath?: string; userProfile?: string } = {}): void {
+interface StartOptions {
+  appDir?: string;
+  envPath?: string;
+  userProfile?: string;
+  /** undefined preserves legacy inheritance; null explicitly clears the override. */
+  codexBin?: string | null;
+}
+
+/** Restarts use installed state, never a stale daemon or a new terminal's override. */
+function restartCodexBin(appDir: string = paths.appDir): string | null | undefined {
+  const saved = readServiceCodexBin(appDir);
+  return saved === undefined ? normalizeServiceCodexBin(process.env.CODEX_BIN) : saved;
+}
+
+function startNow(opts: StartOptions = {}): void {
   const dir = opts.appDir ?? paths.appDir;
+  const codexBin = opts.codexBin === undefined ? restartCodexBin(dir) : opts.codexBin;
   const out = openSync(join(dir, 'service.log'), 'a');
   const err = openSync(join(dir, 'service.err.log'), 'a');
   const overrides: NodeJS.ProcessEnv = { [SERVICE_ENV_FLAG]: '1' };
   if (opts.envPath) overrides.PATH = opts.envPath;
   if (opts.userProfile) overrides.USERPROFILE = opts.userProfile;
+  // An own undefined entry tells mergeProcessEnv to remove all case variants,
+  // so a managed clear cannot inherit a foreign CODEX_BIN from WMI/taskeng.
+  if (codexBin !== undefined) overrides.CODEX_BIN = codexBin ?? undefined;
   const child = spawn(process.execPath, [resolveCliBinPath(), 'run'], {
     detached: true,
     windowsHide: true,
@@ -139,10 +172,12 @@ function startNow(opts: { appDir?: string; envPath?: string; userProfile?: strin
 }
 
 export async function installWinStartup(): Promise<ServiceStatus> {
+  const codexBin = selectInstallCodexBin();
   await mkdir(paths.appDir, { recursive: true });
   await ensureLogFiles();
-  await writeFile(launcherCmdPath(), buildLauncherCmd(), 'utf8');
+  await writeFile(launcherCmdPath(), buildLauncherCmd({ codexBin }), 'utf8');
   await writeFile(launcherVbsPath(), buildLauncherVbs(), 'utf8');
+  saveServiceCodexBin(codexBin);
 
   // HKCU → no admin. Value: wscript.exe "<vbs>" (hidden launcher).
   const reg = spawnSync(
@@ -164,7 +199,7 @@ export async function installWinStartup(): Promise<ServiceStatus> {
   // leaving isServiceRunning()=false and every update/restart button a silent
   // no-op — precisely the "updated but not relaunched" symptom. When already live,
   // we've refreshed the autostart files above; leave the running daemon untouched.
-  if (!winStartupRunning()) startNow();
+  if (!winStartupRunning()) startNow({ codexBin });
   return statusWinStartup();
 }
 
@@ -204,11 +239,12 @@ export async function restartWinStartup(): Promise<ServiceStatus> {
     throw new Error('登录自启未安装（先运行 `feishu-codex-bridge start`）。');
   }
   await ensureLogFiles();
+  const codexBin = restartCodexBin();
   const oldPid = readServicePid();
   if (oldPid === null || !pidAlive(oldPid)) {
     // Nothing alive to displace (foreground/first run) — start inline; no kill
     // tree to escape, so the caller doing startNow() is safe here.
-    startNow();
+    startNow({ codexBin });
     return statusWinStartup();
   }
   const reqPath = relaunchRequestFile();
@@ -216,6 +252,7 @@ export async function restartWinStartup(): Promise<ServiceStatus> {
     oldPid,
     envPath: process.env.PATH ?? '',
     userProfile: process.env.USERPROFILE ?? '',
+    codexBin,
     nonce: `${process.pid}-${Date.now()}`,
   });
   if (!spawnTreeFreeRelauncher(reqPath)) {
@@ -244,6 +281,8 @@ interface RelaunchRequest {
    *  `~/.feishu-codex-bridge` to the user's dir even if the relauncher ran under a
    *  foreign profile (WMI/taskeng may not preserve the user's env). */
   userProfile: string;
+  /** Installed override, including an explicit clear; absent in older requests. */
+  codexBin?: string | null;
   /** Dedup marker; the relauncher reads it only for the diagnostic trail. */
   nonce: string;
 }
@@ -281,16 +320,24 @@ function claimRelaunchRequest(reqPath: string): RelaunchRequest | null {
   try {
     const r = JSON.parse(readFileSync(claim, 'utf8')) as Partial<RelaunchRequest>;
     if (typeof r.oldPid === 'number' && Number.isFinite(r.oldPid)) {
+      if (r.codexBin !== undefined && r.codexBin !== null && typeof r.codexBin !== 'string') {
+        throw new TypeError('Invalid CODEX_BIN in relaunch request');
+      }
+      if (typeof r.codexBin === 'string' && !isAbsolute(r.codexBin)) {
+        throw new TypeError('Relaunch CODEX_BIN must already be absolute');
+      }
       return {
         oldPid: r.oldPid,
         envPath: typeof r.envPath === 'string' ? r.envPath : '',
         userProfile: typeof r.userProfile === 'string' ? r.userProfile : '',
+        codexBin: normalizeServiceCodexBin(r.codexBin),
         nonce: String(r.nonce ?? ''),
       };
     }
   } catch {
     /* corrupt claim → nothing usable */
   }
+  rmSync(claim, { force: true });
   return null;
 }
 
@@ -432,7 +479,7 @@ export interface WinRelaunchDeps {
   pidAlive?: (pid: number) => boolean;
   /** Tree-kill the old daemon (default `taskkill /T /F`); returns exit + stderr for the trail. */
   taskkill?: (pid: number) => { status: number | null; stderr: string };
-  start?: (opts: { appDir: string; envPath: string; userProfile: string }) => void;
+  start?: (opts: { appDir: string; envPath: string; userProfile: string; codexBin?: string | null }) => void;
   sleep?: (ms: number) => Promise<void>;
   /** Max wait for the old daemon to actually die before giving up (avoid double-instance). */
   graceMs?: number;
@@ -515,7 +562,7 @@ export async function runWinRelaunch(deps: WinRelaunchDeps = {}): Promise<void> 
     }
 
     await sleep(300); // let the OS reclaim the old daemon's listen socket before the new one binds
-    start({ appDir, envPath: req.envPath, userProfile: req.userProfile });
+    start({ appDir, envPath: req.envPath, userProfile: req.userProfile, codexBin: req.codexBin });
     // Read back the pid startNow wrote to the (correct) appDir so the trail is
     // self-consistent — otherwise the log only shows the transient relauncher pid.
     let newPid = '?';

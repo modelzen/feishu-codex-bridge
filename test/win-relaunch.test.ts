@@ -1,10 +1,20 @@
-import { describe, expect, it } from 'vitest';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
 import {
   buildRelauncherPowershell,
   encodePowershellCommand,
   runWinRelaunch,
   type WinRelaunchDeps,
 } from '../src/service/win-startup';
+
+// The real relauncher drops its one-shot task on Windows even with injected
+// lifecycle dependencies. Keep that last OS cleanup boundary mocked as well.
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:child_process')>(),
+  spawnSync: vi.fn(() => ({ status: 0, stdout: '', stderr: '' })),
+}));
 
 // Windows update→restart fix. restartWinStartup can't kill from its own process
 // (it's inside the target's taskkill /T tree — DM path IS the daemon, Web path is
@@ -60,6 +70,7 @@ interface StartOpts {
   appDir: string;
   envPath: string;
   userProfile: string;
+  codexBin?: string | null;
 }
 
 /**
@@ -217,5 +228,40 @@ describe('runWinRelaunch (ordering: kill → wait for death → startNow)', () =
     expect(winner.events).toContain('start'); // winner starts exactly one daemon
     expect(loser.events).not.toContain('start'); // loser must NOT start a second
     expect(loser.events.some((e) => e.includes('no relaunch request'))).toBe(true);
+  });
+});
+
+describe('runWinRelaunch persisted CODEX_BIN request', () => {
+  async function consume(codexBin: unknown, check: (start: ReturnType<typeof vi.fn>) => void): Promise<void> {
+    const root = mkdtempSync(join(tmpdir(), 'win-relaunch-request-'));
+    const requestPath = join(root, 'relaunch.json');
+    const start = vi.fn();
+    writeFileSync(requestPath, JSON.stringify({ oldPid: 42, envPath: 'P', userProfile: 'U', nonce: 'test', codexBin }));
+    try {
+      await runWinRelaunch({
+        requestPath,
+        start,
+        pidAlive: () => false,
+        sleep: async () => undefined,
+        ensureLogs: async () => undefined,
+        logLine: () => undefined,
+      });
+      expect(existsSync(requestPath)).toBe(false);
+      expect(existsSync(`${requestPath}.claim.${process.pid}`)).toBe(false);
+      check(start);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  it.each([join(tmpdir(), 'selected Codex', 'codex.exe'), null, undefined])('carries an absolute selection or explicit clear, and accepts old requests (%s)', async (codexBin) => {
+    await consume(codexBin, (start) => {
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(start).toHaveBeenCalledWith(expect.objectContaining({ codexBin }));
+    });
+  });
+
+  it.each([123, false, {}, '', './codex.exe', '../foreign/codex.exe', join(tmpdir(), 'invalid\npath')])('rejects invalid override data before starting a replacement (%j)', async (codexBin) => {
+    await consume(codexBin, (start) => expect(start).not.toHaveBeenCalled());
   });
 });

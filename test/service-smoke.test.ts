@@ -35,7 +35,7 @@ interface WorkerEvent {
 interface Fixture {
   root: string;
   name: string;
-  options: Required<ServiceDefinitionOptions>;
+  options: Required<Pick<ServiceDefinitionOptions, 'cliBinPath' | 'stdoutPath' | 'stderrPath' | 'envPath'>>;
   events: () => Promise<WorkerEvent[]>;
   selection?: CodexSelectionFixture;
   teardown?: {

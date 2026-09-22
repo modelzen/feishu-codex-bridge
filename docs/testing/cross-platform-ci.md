@@ -42,9 +42,9 @@ The Node 24 CI jobs also run these tests:
 
 | Platform | Native evidence |
 | --- | --- |
-| macOS | Parse the generated plist with `plutil`; start and restart an isolated worker through launchd. |
-| Linux | Validate the generated unit with `systemd-analyze`; start and restart an isolated worker through the user systemd manager. |
-| Windows | Execute the generated `.cmd` through `cmd.exe` from fresh environments twice; verify worker arguments, saved PATH, the service flag, and appended logs. |
+| macOS | Parse the generated plist with `plutil`; start and restart an isolated worker through launchd, checking the selected Codex executable and version. |
+| Linux | Validate the generated unit with `systemd-analyze`; start and restart an isolated worker through the user systemd manager, checking the selected Codex executable and version. |
+| Windows | Execute the generated `.cmd` through `cmd.exe` from fresh environments twice; verify the selected Codex executable/version, worker arguments, saved PATH, the service flag, and appended logs. |
 
 The Linux job starts the runner's user systemd manager and supplies
 `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`. Native tests fail if the
@@ -52,9 +52,52 @@ required service manager is unavailable, rather than silently reporting a pass.
 
 Windows smoke tests cover the login launcher's execution, **not** an actual
 logout/login or the WMI/Task Scheduler restart path. The latter still has
-dependency-injected unit tests. This infrastructure does not implement the
-`CODEX_BIN` persistence proposed in PR #7; that change should add native readback
-and restart assertions for the override when it is implemented.
+dependency-injected unit tests.
+
+### Reproduce executable selection before and after a change
+
+```sh
+npm run test:native-service -- -t 'preserves selected Codex'
+```
+
+Each case creates two harmless fake executables: an old version on `PATH` and
+a new version selected by `CODEX_BIN`. A temporary worker bundles the production
+`resolveCodexBin` and `codexVersion` implementation with `tsup`; it does not copy
+or simulate the selection logic. First, fresh foreground processes prove that
+PATH alone selects `fake-codex old-on-path` and the override selects
+`fake-codex selected-by-override`. The actual service generator then sees the
+override only while writing its definition. Native background startup and
+restart must select the same new executable after the caller's override has
+been removed. Logs print the selected path, version, environment value, and PID
+so a failed baseline shows the actual old/new boundary.
+
+Run the identical test and helper files against both source revisions. The
+unfixed baseline is expected to fail the background assertion after both
+foreground controls pass. Cases cover spaces and a second path containing
+Chinese characters, literal `%` and `!`; Linux uses `%n` to expose systemd
+specifier expansion, while Windows uses a defined `%FEISHU_SMOKE_LITERAL%`
+and enables delayed expansion in the caller. Windows fixtures are tiny native
+executables compiled with the runner's .NET Framework compiler, so their own
+batch parsing cannot obscure the service bug. These executables only print a
+sentinel version; an unexpectedly selected real Codex executable is never run.
+
+Before implementation, the identical native macOS scenario was run against
+`main` at `33e9db8` and the original PR #7 behavior merged with that baseline
+(`1e15120`). The baseline failed both path cases: foreground selected the new
+executable, but launchd selected the old executable and reported no `CODEX_BIN`.
+Original PR #7 passed both cases through actual launchd startup and restart.
+Separately, three Windows restart regression tests failed against the original
+PR implementation with injected OS/process dependencies; those failures are
+unit-test evidence, not a live Windows WMI or Task Scheduler run. Cloud native
+results must be reported separately from this local reproduction evidence.
+
+Definition tests additionally distinguish an unset builder override (no
+assignment) from an explicit empty override (an empty assignment that clears an
+inherited value). They check absolute-path normalization and platform
+escaping separately from the native executable-selection scenario. That native
+scenario and its assertions remain the same before and after the fix; only its
+TypeScript fixture-options type was narrowed to accommodate the added optional
+`codexBin` builder input.
 
 ## Checks that still need a disposable interactive VM
 

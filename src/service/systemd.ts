@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { normalizeServiceCodexBin, saveServiceCodexBin, selectInstallCodexBin } from './codex-bin';
 import {
   ensureLogFiles,
   resolveCliBinPath,
@@ -39,11 +40,12 @@ function systemdUnitPath(): string {
  * under the minimal systemd environment.
  */
 export function buildUnit(options: ServiceDefinitionOptions = {}): string {
-  const esc = (s: string): string => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const esc = (s: string): string => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%');
   const nodePath = process.execPath;
   const cliBinPath = options.cliBinPath ?? resolveCliBinPath();
   const pathEnv = options.envPath ?? process.env.PATH ?? '';
-  const codexBinEnv = process.env.CODEX_BIN ? `Environment="CODEX_BIN=${esc(process.env.CODEX_BIN)}"\n` : '';
+  const codexBin = normalizeServiceCodexBin(options.codexBin === undefined ? process.env.CODEX_BIN : options.codexBin);
+  const codexBinEnv = codexBin !== undefined ? `Environment="CODEX_BIN=${esc(codexBin ?? '')}"\n` : '';
   return `[Unit]
 Description=feishu-codex-bridge bot
 After=network-online.target
@@ -54,8 +56,8 @@ Type=simple
 ExecStart="${esc(nodePath)}" "${esc(cliBinPath)}" run
 Restart=always
 RestartSec=5
-StandardOutput=append:${options.stdoutPath ?? serviceStdoutPath()}
-StandardError=append:${options.stderrPath ?? serviceStderrPath()}
+StandardOutput=append:${(options.stdoutPath ?? serviceStdoutPath()).replace(/%/g, '%%')}
+StandardError=append:${(options.stderrPath ?? serviceStderrPath()).replace(/%/g, '%%')}
 Environment="PATH=${esc(pathEnv)}"
 ${codexBinEnv}
 
@@ -110,11 +112,13 @@ function ensureSystemdOrThrow(): void {
 }
 
 export async function installSystemd(): Promise<ServiceStatus> {
+  const codexBin = selectInstallCodexBin();
   ensureSystemdOrThrow();
   const unitPath = systemdUnitPath();
   await mkdir(dirname(unitPath), { recursive: true });
   await ensureLogFiles();
-  await writeFile(unitPath, buildUnit(), 'utf8');
+  await writeFile(unitPath, buildUnit({ codexBin }), 'utf8');
+  saveServiceCodexBin(codexBin);
 
   const reload = runSystemctl(['daemon-reload']);
   if (!reload.ok) throw systemctlError('systemctl --user daemon-reload', reload);
