@@ -97,7 +97,9 @@ inherited value). They check absolute-path normalization and platform
 escaping separately from the native executable-selection scenario. That native
 scenario and its assertions remain the same before and after the fix; only its
 TypeScript fixture-options type was narrowed to accommodate the added optional
-`codexBin` builder input.
+`codexBin` builder input. The Windows fixture also expands its executable paths
+with native realpath so they match the long names returned by `where.exe`;
+the macOS before/after scenario is unaffected by that fixture correction.
 
 ## Checks that still need a disposable interactive VM
 

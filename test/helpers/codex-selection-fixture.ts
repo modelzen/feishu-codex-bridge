@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,7 +43,10 @@ async function fakeCodex(directory: string, version: string): Promise<string> {
   if (result.error || result.status !== 0) {
     throw new Error(`Fake Codex compilation failed: ${result.error?.message ?? result.status}\n${result.stdout}\n${result.stderr}`);
   }
-  return bin;
+  // Windows CI's TEMP can use RUNNER~1 while where.exe returns runneradmin.
+  // Canonicalize both fixture executables after creation so strict selection
+  // assertions and the execution allowlist compare the same native path.
+  return realpathSync.native(bin);
 }
 
 /** Use the production locator in a standalone worker, with an old executable
