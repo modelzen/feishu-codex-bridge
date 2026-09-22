@@ -179,6 +179,7 @@ import { bridgeVersion } from '../core/version';
 import { webConsoleUrl } from '../web/discovery';
 import { paths } from '../config/paths';
 import { OutboundFiles } from './outbound-files';
+import { ProcessHistory } from './process-history';
 import { getSecret } from '../config/keystore';
 import { buildScopeGrantUrl, JOIN_GROUP_SCOPES } from '../config/scopes';
 import { validateAppCredentials } from '../utils/feishu-auth';
@@ -784,6 +785,12 @@ export function createOrchestrator(
    * edit take effect (see resolveDocThread). Cleared alongside the session. */
   const commentInstrUsed = new Map<string, string>();
   const sema = new Semaphore(getMaxConcurrentRuns(cfg));
+  let shuttingDown = false;
+  const runTasks = new Set<Promise<void>>();
+  async function trackRun(task: Promise<void>): Promise<void> {
+    runTasks.add(task);
+    try { await task; } finally { runTasks.delete(task); }
+  }
   // Read live per run (not frozen at startup) so the settings card's change to
   // the idle timeout applies immediately to every group/thread — no daemon
   // restart. `cfg` is the same object `applyPref` mutates, so this sees edits.
@@ -1622,8 +1629,8 @@ export function createOrchestrator(
           titleSource,
           timing: { tResolve: tResolveDone - tIntake, tWeave: Date.now() - tIntake },
         };
-        if (goal) await launchGoalRun(launchOpts);
-        else await launchRun(launchOpts, reaction);
+        if (goal) await trackRun(launchGoalRun(launchOpts));
+        else await trackRun(launchRun(launchOpts, reaction));
       } catch (err) {
         if (active.get(sessionKey) === reserved) active.delete(sessionKey);
         const dropped = reserved.queue.splice(0).length;
@@ -1817,13 +1824,13 @@ export function createOrchestrator(
         titleSource,
         timing: { tResolve: tResolveDone - tIntake, tWeave: Date.now() - tIntake },
       };
-      if (goal) await launchGoalRun(launchOpts);
+      if (goal) await trackRun(launchGoalRun(launchOpts));
       else
-        await launchRun(
+        await trackRun(launchRun(
           launchOpts,
           reaction,
           () => reaction?.done(), // topic created → ✅ DONE (don't wait for the reply)
-        );
+        ));
     }).catch((err) => log.fail('intake', err));
   }
 
@@ -2156,6 +2163,20 @@ export function createOrchestrator(
 
   // ── card actions ──────────────────────────────────────────────────
   const dispatcher = new CardDispatcher(channel, cfg);
+  const processHistory = new ProcessHistory(paths.processHistoryDir);
+  processHistory.register(dispatcher, async (context, openId) => {
+    if (!openId || !isChatAllowed(cfg, context.chatId)) return false;
+    const project = await getProjectByChatId(context.chatId);
+    return Boolean(project && project.cwd === context.cwd && isUserAllowedInProject(cfg, project, openId));
+  });
+  const recordProcess = (rc: RunCardState): void => {
+    if (rc.processHistoryId) processHistory.update(rc.processHistoryId, rc.rs.blocks);
+  };
+  const finishProcess = async (rc: RunCardState): Promise<void> => {
+    recordProcess(rc);
+    if (rc.processHistoryId) await processHistory.release(rc.processHistoryId)
+      .catch(err => log.fail('card', err, { phase: 'process-history-save' }));
+  };
   const outboundFiles = new OutboundFiles(paths.outboundFilesDir);
   void outboundFiles.recover(channel);
   outboundFiles.register(dispatcher, async (record, openId) => {
@@ -4112,6 +4133,7 @@ export function createOrchestrator(
     reaction?: RunReaction,
     onTopicCreated?: () => void,
   ): Promise<void> {
+    if (shuttingDown) { await opts.thread.close(); return; }
     let activeKey = opts.knownThreadId ?? `pending:${opts.replyTo}`;
     let topicThreadId = opts.knownThreadId;
     // The turn's workspace: resolves relative image refs in the reply and is what
@@ -4128,6 +4150,12 @@ export function createOrchestrator(
     // M-3: 池满先排队（占位卡可见可取消）；null = 等待期被 ⏹ 取消，预订已释放。
     const slot = await acquireRunSlot(opts, state, activeKey, reaction);
     if (!slot) return;
+    if (shuttingDown) {
+      slot.release();
+      active.delete(activeKey);
+      await opts.thread.close();
+      return;
+    }
     const { release } = slot;
     let queuedCard = slot.queuedCard;
     reaction?.started(); // slot acquired → flip OneSecond → Typing
@@ -4220,6 +4248,7 @@ export function createOrchestrator(
     // tracks the latest run card key so the finally can clear runsByCard even
     // if the stream producer throws mid-turn (avoids leaking a stale stop target)
     let curCardKey: string | undefined;
+    let currentProcessId: string | undefined;
     let disposeInterrupt: (() => void) | undefined;
     let cardClock: ReturnType<typeof setInterval> | undefined;
     // intake durations ride the FIRST turn's stream.timing line only (M-1)
@@ -4352,6 +4381,11 @@ export function createOrchestrator(
         const tCardCreate = Date.now() - tCreate; // 建卡 RTT（与模型推理并行付出）
         curCardKey = cardMsgId;
         rc.cardKey = cardMsgId;
+        rc.processHistoryId = processHistory.create({
+          messageId: cardMsgId, chatId: opts.chatId, cwd: runCwd,
+          requesterOpenId: currentTurn.requesterOpenId, replyInThread: !opts.flat,
+        }, rc.rs.blocks);
+        currentProcessId = rc.processHistoryId;
         runsByCard.set(cardMsgId, state);
         runStreams.set(cardMsgId, stream);
         const registerReminder = (messageId: string, target: RunCardState, targetStream: RunCardStream): void => {
@@ -4385,7 +4419,7 @@ export function createOrchestrator(
           const nextStartedAt = Date.now();
           const next: RunCardState = {
             ...rc, rs: runSegment(nextBoundary, nextBoundary, nextStartedAt),
-            cardKey: undefined, continued: false, localFiles: undefined, images: undefined,
+            cardKey: undefined, continued: false, localFiles: undefined, images: undefined, processHistoryId: undefined,
             voiceMessages: event.voice ? [event.voice] : [],
           };
           let nextId: string;
@@ -4417,6 +4451,11 @@ export function createOrchestrator(
           cardMsgId = nextId;
           curCardKey = nextId;
           rc.cardKey = nextId;
+          rc.processHistoryId = processHistory.create({
+            messageId: nextId, chatId: opts.chatId, cwd: runCwd,
+            requesterOpenId: currentTurn.requesterOpenId, replyInThread: !opts.flat,
+          }, rc.rs.blocks);
+          currentProcessId = rc.processHistoryId;
           runsByCard.set(nextId, state);
           runStreams.set(nextId, stream);
           registerReminder(nextId, rc, stream);
@@ -4435,6 +4474,7 @@ export function createOrchestrator(
           } catch (err) {
             log.fail('card', err, { phase: 'steer-card-assets' });
           }
+          await finishProcess(previous);
           await previousStream.finalizeCard(channel, buildRunCard(previous))
             .catch(err => log.fail('card', err, { phase: 'steer-card-finalize' }));
         };
@@ -4516,6 +4556,7 @@ export function createOrchestrator(
           }
           render.apply(ev);
           rc.rs = segmentSnapshot();
+          recordProcess(rc);
           // The global mode is live-editable. Re-evaluate on every structural /
           // answer frame so switching away from manual removes the button from
           // an already-running card instead of leaving a stale affordance.
@@ -4550,6 +4591,7 @@ export function createOrchestrator(
           procDead,
         });
         rc.rs = segmentSnapshot();
+        recordProcess(rc);
         if (interrupted) log.info('agent', 'interrupt', { graceful: !stopper.forced(), threadId: topicThreadId ?? null });
 
         // A killed turn (watchdog / forced ⏹) leaves codex mid-turn with a
@@ -4607,6 +4649,7 @@ export function createOrchestrator(
           // finalizeCard, while callbacks arriving from now on cannot overwrite it.
           const manuallyRequested = Boolean(state.completionReminderRequested);
           completionReminderRefreshers.delete(cardMsgId);
+          await finishProcess(rc);
           const terminalCardUpdated = await stream.finalizeCard(channel, buildRunCard(rc));
           // One-line per-turn timeline; all ms are relative to the turn's stream start.
           {
@@ -4711,6 +4754,8 @@ export function createOrchestrator(
       // was in flight. Never delete another run's reservation.
       if (active.get(activeKey) === state) active.delete(activeKey);
       clearInterval(cardClock);
+      if (currentProcessId) void processHistory.release(currentProcessId)
+        .catch(err => log.fail('card', err, { phase: 'process-history-release' }));
       state.steerReply = undefined;
       state.voiceReply = undefined;
       if (curCardKey) {
@@ -4744,6 +4789,7 @@ export function createOrchestrator(
    * non-complete goal is cleared first so it won't reactivate on the next resume.
    */
   async function launchGoalRun(opts: LaunchOpts): Promise<void> {
+    if (shuttingDown) { await opts.thread.close(); return; }
     const objective = opts.firstText;
     let activeKey = opts.knownThreadId ?? `pending:${opts.replyTo}`;
     let topicThreadId = opts.knownThreadId;
@@ -4759,6 +4805,12 @@ export function createOrchestrator(
     // M-3: 池满先排队（占位卡可见可取消）；null = 等待期被 ⏹ 取消，预订已释放。
     const slot = await acquireRunSlot(opts, state, activeKey);
     if (!slot) return;
+    if (shuttingDown) {
+      slot.release();
+      active.delete(activeKey);
+      await opts.thread.close();
+      return;
+    }
     const { release } = slot;
     if (slot.queuedCard) {
       // goal 的 run 卡按 turn 懒建（首个有内容的 turn 才出卡），不把占位实体钉成
@@ -4883,6 +4935,7 @@ export function createOrchestrator(
       await ctx.stream.drain();
       ctx.render.finalize();
       ctx.rc.rs = ctx.render.snapshot();
+      recordProcess(ctx.rc);
       const answerText = finalMessageText(ctx.rc.rs);
       ctx.rc.localFiles = await outboundFiles.prepare(answerText, {
         messageId: ctx.cardMsgId, chatId: opts.chatId, cwd: runCwd,
@@ -4890,6 +4943,7 @@ export function createOrchestrator(
         replyInThread: !opts.flat, cardId: ctx.stream.getCardId(),
       }, (elementId, element) => ctx.stream!.updateElement(channel, elementId, element));
       ctx.rc.images = await ctx.stream.settleImages(answerText);
+      await finishProcess(ctx.rc);
       await ctx.stream.updateCard(channel, buildRunCard(ctx.rc));
       runsByCard.delete(ctx.cardMsgId);
       promoteCard(ctx.cardMsgId, ctx.rc);
@@ -4924,6 +4978,10 @@ export function createOrchestrator(
       });
       const cardMsgId = await stream.create(channel, opts.chatId, buildRunCard(ctx.rc), { replyTo, replyInThread });
       ctx.rc.cardKey = cardMsgId;
+      ctx.rc.processHistoryId = processHistory.create({
+        messageId: cardMsgId, chatId: opts.chatId, cwd: runCwd,
+        requesterOpenId: opts.requesterOpenId, replyInThread: !opts.flat,
+      }, ctx.render.snapshot().blocks);
       ctx.stream = stream;
       ctx.cardMsgId = cardMsgId;
       ctx.clock = setInterval(() => {
@@ -4981,6 +5039,7 @@ export function createOrchestrator(
           cur.rc.goalEnding = true;
           if (cur.stream) {
             cur.rc.rs = cur.render.snapshot();
+            recordProcess(cur.rc);
             cur.stream.streamCoalesced(channel, buildRunCard(cur.rc), ANSWER_EID);
           }
         } else {
@@ -5007,6 +5066,7 @@ export function createOrchestrator(
           if (cur) {
             cur.render.apply(ev);
             cur.rc.rs = cur.render.snapshot();
+            recordProcess(cur.rc);
           }
           continue;
         }
@@ -5052,12 +5112,14 @@ export function createOrchestrator(
         if (ev.type === 'thinking' || ev.type === 'thinking_delta') {
           if (cur.stream) {
             cur.rc.rs = cur.render.snapshot();
+            recordProcess(cur.rc);
             cur.stream.streamCoalesced(channel, buildRunCard(cur.rc), ANSWER_EID);
           }
           continue;
         }
         await ensureCard(cur);
         cur.rc.rs = cur.render.snapshot();
+        recordProcess(cur.rc);
         cur.stream!.streamCoalesced(channel, buildRunCard(cur.rc), ANSWER_EID);
       }
       // ⏹ 终止: mark the in-flight turn's card as interrupted before finalizing
@@ -5102,6 +5164,7 @@ export function createOrchestrator(
         .catch(() => undefined);
     } finally {
       clearInterval(cur?.clock);
+      if (cur) void finishProcess(cur.rc);
       active.delete(activeKey);
       if (cur?.cardMsgId) runsByCard.delete(cur.cardMsgId);
       // Recycle the codex process (it may still be mid-goal, and a terminated goal
@@ -5611,7 +5674,13 @@ export function createOrchestrator(
   reaper.unref(); // 不挡进程退出（CLI/测试里 orchestrator 可能不走 shutdown）
 
   async function shutdown(): Promise<void> {
+    shuttingDown = true;
     clearInterval(reaper);
+    for (const state of active.values()) {
+      state.intakeCancelled = true;
+      state.queue.length = 0;
+      state.interrupt?.();
+    }
     await sessionTitles.shutdown();
     // adopt 失败的孤儿线程已在 launchRun/launchGoalRun 的 finally 就地 close，
     // 这里只需回收 LIVE 会话缓存。
@@ -5620,6 +5689,8 @@ export function createOrchestrator(
     // close() SIGKILLs each app-server child; settle all so one hang/throw
     // doesn't block reaping the rest.
     await Promise.allSettled(live.map((t) => t.close()));
+    await Promise.allSettled([...runTasks]);
+    await processHistory.shutdown();
     log.info('bridge', 'shutdown', { closed: live.length });
   }
 

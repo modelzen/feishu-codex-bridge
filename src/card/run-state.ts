@@ -153,6 +153,16 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
       };
 
     case 'tool_use': {
+      const existing = state.blocks.findIndex(b => b.kind === 'tool' && b.tool.id === evt.itemId);
+      if (existing >= 0) {
+        return {
+          ...state,
+          blocks: state.blocks.map((b, index) => index === existing && b.kind === 'tool'
+            ? { ...b, tool: { ...b.tool, title: evt.title,
+              detail: evt.detail ?? b.tool.detail, kind: evt.kind ?? b.tool.kind } }
+            : b),
+        };
+      }
       const tool: ToolEntry = {
         id: evt.itemId,
         title: evt.title,

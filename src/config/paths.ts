@@ -65,6 +65,9 @@ export const paths = {
   get outboundFilesDir(): string {
     return join(currentBotDir, 'outbound-files');
   },
+  get processHistoryDir(): string {
+    return join(currentBotDir, 'process-history');
+  },
   /** project(群) → cwd + 默认参数 注册表（当前 bot） */
   get projectsFile(): string {
     return join(currentBotDir, 'projects.json');

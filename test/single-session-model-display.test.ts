@@ -1,3 +1,7 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { paths } from '../src/config/paths';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import type { AgentEvent, AgentInput, TurnOptions } from '../src/agent/types';
@@ -88,7 +92,12 @@ function setup(showModel: 'off' | 'running' | 'always' = 'always') {
   orchestrator = createOrchestrator(channel as never, cfg, '/test');
   return orchestrator;
 }
-beforeEach(() => {
+let historyDirectory: string;
+let restoreHistoryPath: () => void;
+beforeEach(async () => {
+  historyDirectory = await mkdtemp(join(tmpdir(), 'model-display-history-'));
+  const spy = vi.spyOn(paths, 'processHistoryDir', 'get').mockReturnValue(historyDirectory);
+  restoreHistoryPath = () => spy.mockRestore();
   vi.clearAllMocks();
   fake.record = undefined;
   fake.backend.listModels.mockResolvedValue([{ id: 'chosen-model', displayName: 'Chosen', description: '', supportedEfforts: ['medium', 'xhigh'], defaultEffort: 'medium', isDefault: true, hidden: false }] as never);
@@ -99,7 +108,11 @@ beforeEach(() => {
   fake.backend.resumeThread.mockReset();
   fake.backend.startThread.mockReset();
 });
-afterEach(async () => { await orchestrator?.shutdown(); });
+afterEach(async () => {
+  await orchestrator?.shutdown();
+  restoreHistoryPath();
+  await rm(historyDirectory, { recursive: true, force: true });
+});
 const until = (check: () => void) => vi.waitFor(check);
 
 describe('single-session model display', () => {

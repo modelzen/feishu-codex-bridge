@@ -326,7 +326,7 @@ describe('buildRunCard — full command visibility', () => {
     for (let i = 0; i < 5; i++) expect(json).toContain(`FULLCMD_TAIL_${i}`);
   });
 
-  it('degrades a huge run to a batched summary that STILL lists full commands (and never explodes the card)', () => {
+  it('opens the complete paginated history when a run exceeds one card', () => {
     const events: AgentEvent[] = [];
     const cmd0 = `run ${'a'.repeat(90)} BATCHED_TAIL`;
     for (let i = 0; i < 130; i++) {
@@ -335,12 +335,13 @@ describe('buildRunCard — full command visibility', () => {
     }
     events.push({ type: 'text', itemId: 'a', text: 'FINAL' });
     events.push({ type: 'done', turnId: 'x' });
-    const card = buildRunCard({ rs: run(events) });
+    const card = buildRunCard({ rs: run(events), processHistoryId: 'history-130' });
     const json = JSON.stringify(card);
-    expect(json).toContain('已运行 130 条命令'); // degraded to the summary (component budget)
-    expect(json).toContain('BATCHED_TAIL'); // ...but a batched command is still shown in full
-    // component-budget guard held: the card is a handful of panels, not 130
-    expect(panelCount(card)).toBeLessThan(10);
+    expect(json).toContain('run.process.open');
+    expect(json).toContain('history-130');
+    expect(json).toContain('BATCHED_TAIL');
+    expect(json).not.toMatch(/未显示|已省略|已截断/);
+    expect(Buffer.byteLength(json, 'utf8')).toBeLessThan(28000);
   });
 });
 

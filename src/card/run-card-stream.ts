@@ -3,6 +3,7 @@ import { log } from '../core/logger';
 import type { CardObject, CardElement } from './cards';
 import { isCardIdNotReady } from './managed';
 import type { StreamingImages } from './outbound-images';
+import { serializeRuntimeCard } from './runtime-card-icons';
 
 /**
  * Min gap between throttled stream pushes. Finer = smoother chunked growth
@@ -314,16 +315,17 @@ export class RunCardStream {
     opts: { replyTo?: string; replyInThread?: boolean },
   ): Promise<string> {
     this.pacer = pacerFor(chatId); // shared with the chat's other streams
+    const initialData = await serializeRuntimeCard(initialCard, channel.rawClient);
     const attempt = async (): Promise<string> => {
       const created = await channel.rawClient.cardkit.v1.card.create({
-        data: { type: 'card_json', data: JSON.stringify(initialCard) },
+        data: { type: 'card_json', data: initialData },
       });
       const cardId = (created as { data?: { card_id?: string } }).data?.card_id;
       if (!cardId) {
         throw new Error(`cardkit.card.create returned no card_id: ${JSON.stringify(created).slice(0, 200)}`);
       }
       this.cardId = cardId;
-      this.lastContent = JSON.stringify(initialCard);
+      this.lastContent = initialData;
 
       const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
       let messageId: string | undefined;
@@ -363,7 +365,7 @@ export class RunCardStream {
    * away when it comes around again. */
   async streamCard(channel: LarkChannel, fullCard: CardObject, force = false): Promise<boolean> {
     if (!this.cardId) return false;
-    const data = JSON.stringify(fullCard);
+    const data = await serializeRuntimeCard(fullCard, channel.rawClient);
     if (data === this.lastContent) return true;
     const now = Date.now();
     if (!force && now - this.lastPush < STREAM_THROTTLE_MS) return false;
@@ -465,7 +467,7 @@ export class RunCardStream {
     // Capture the exact frame at invocation time; callers often mutate their
     // RunCardState again while this queued network write is waiting its turn.
     const data = JSON.stringify(fullCard);
-    const task = this.forcedUpdateTail.then(() => {
+    const task = this.forcedUpdateTail.then(async () => {
       // Overlay at dispatch time: an already-queued demotion must not restore
       // a stale "get" button after delivery completed.
       const frame = JSON.parse(data) as CardBody;
@@ -477,7 +479,7 @@ export class RunCardStream {
         return el;
       };
       if (frame.body?.elements) frame.body.elements = frame.body.elements.map(overlay);
-      return this.pushForcedUpdate(channel, JSON.stringify(frame));
+      return this.pushForcedUpdate(channel, await serializeRuntimeCard(frame, channel.rawClient));
     });
     // A surprising transport failure must not poison the serialization tail and
     // prevent the terminal frame. pushForcedUpdate normally absorbs failures,

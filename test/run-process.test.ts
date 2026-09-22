@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildRunCard } from '../src/card/run-card';
 import { RunRender } from '../src/card/run-render';
-import { buildProcessBody } from '../src/card/run-process';
+import { buildProcessBody, buildProcessPages } from '../src/card/run-process';
 import { initialState, reduce, type Block } from '../src/card/run-state';
 
 afterEach(() => vi.useRealTimers());
@@ -43,13 +43,17 @@ describe('ordered run process', () => {
     expect(Buffer.byteLength(json, 'utf8')).toBeLessThan(22000);
     expect(json).toContain('STEP_0');
     expect(json).not.toContain('STEP_199');
-    expect(json).toContain('过程已省略');
+    expect(json).not.toContain('省略');
+    const pages = buildProcessPages(blocks);
+    expect(JSON.stringify(pages)).toContain('STEP_199');
+    for (const page of pages) expect(Buffer.byteLength(JSON.stringify(page), 'utf8')).toBeLessThanOrEqual(22000);
   });
 
   it('keeps command/output fences closed even when the output contains fences', () => {
     const body = buildProcessBody([{ kind: 'tool', tool: { id: 'x', kind: 'command', title: 'echo hi', status: 'error', output: '```\ninner\n```', exitCode: 1 } }]);
     const panel = body[0] as { elements: { content: string }[] };
-    expect(panel.elements[0]!.content).toContain('````bash\n$ echo hi');
-    expect(panel.elements[0]!.content).toContain('退出码：1\n````');
+    expect(panel.elements[0]!.content).toContain('```bash\necho hi\n```');
+    expect(panel.elements[1]!.content).toContain('````\n```\ninner\n```\n````');
+    expect(panel.elements[2]!.content).toBe('退出码：1');
   });
 });

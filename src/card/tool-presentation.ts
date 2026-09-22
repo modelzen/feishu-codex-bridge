@@ -1,5 +1,4 @@
-// Native fallback keeps cards independent of per-bot image uploads.
-const RUNTIME_TERMINAL_ICON = 'computer_outlined';
+import { RUNTIME_TERMINAL_ICON } from './runtime-card-icons';
 import type { ToolEntry } from './run-state';
 
 type ToolInput = Pick<ToolEntry, 'title' | 'kind' | 'detail' | 'status'>;
@@ -42,18 +41,22 @@ function describeTool(tool: ToolInput): ToolAction {
     return { icon: 'setting-inter_outlined', action: '读取', subject: skill ? `${short(skill, 64)} 技能` : '技能' };
   }
   if (tool.kind === 'command' || /^(?:bash|shell|exec_command|run_command|terminal)$/u.test(normalized)) {
-    const command = tool.kind === 'command' ? name : argument('command', 'cmd');
+    const command = tool.kind === 'command' ? tool.title
+      : typeof args?.command === 'string' ? args.command : typeof args?.cmd === 'string' ? args.cmd : undefined;
     if (!command) return { icon: RUNTIME_TERMINAL_ICON, action: '运行命令' };
     const unwrapped = unwrapShell(command);
-    // Only classify simple single operations. Pipelines and scripts stay commands.
-    if (!/[|;&<>\n]/u.test(unwrapped)) {
-      const read = /^(?:cat|head|tail)\s+(?:(?:-n|--lines)\s+\d+\s+)?(?:--\s+)?(?:"([^"]+)"|'([^']+)'|([^\s]+))$/u.exec(unwrapped);
-      if (read && !(read[1] ?? read[2] ?? read[3]!).startsWith('-')) return { ...readAction(read[1] ?? read[2] ?? read[3]!), command };
-      if (/^pwd\s*$/u.test(unwrapped)) return { icon: 'folder_outlined', action: '查看当前目录', command };
-      if (/^ls(?:\s|$)/u.test(unwrapped)) return { icon: 'folder_outlined', action: '查看目录', command };
-      if (/^(?:rg|grep|find)\s/u.test(unwrapped)) return { icon: 'search_outlined', action: '搜索文件', preview: unwrapped, command };
+    const words = shellWords(unwrapped);
+    if (!words) return { icon: RUNTIME_TERMINAL_ICON, action: '运行命令', command };
+    const readPath = simpleReadPath(words);
+    if (readPath) return { ...readAction(readPath), command };
+    if (words.length === 1 && words[0] === 'pwd') return { icon: 'folder_outlined', action: '查看当前目录', command };
+    if (words[0] === 'ls') return { icon: 'folder_outlined', action: '查看目录', command };
+    if (words.length > 1 && /^(?:rg|grep|find)$/u.test(words[0]!) && !isMutatingSearch(words)) {
+      return { icon: 'search_outlined', action: '搜索文件', command };
     }
-    return { icon: RUNTIME_TERMINAL_ICON, action: '运行命令', preview: unwrapped, command };
+    const mcporter = mcporterAction(words);
+    if (mcporter) return { ...mcporter, command };
+    return { icon: RUNTIME_TERMINAL_ICON, action: '运行命令', command };
   }
   if (/^(?:read|read_file|readfile)$/u.test(normalized)) return readAction(argument('file_path', 'filePath', 'path') ?? '文件');
   if (/^(?:edit|edit_file|apply_patch|write|write_file)$/u.test(normalized)) {
@@ -82,11 +85,101 @@ function readAction(path: string): ToolAction {
 }
 
 function unwrapShell(command: string): string {
-  return /^(?:\S*\/)?(?:bash|zsh|sh)\s+-(?:lc|c)\s+(['"])([\s\S]*)\1$/u.exec(command)?.[2] ?? command;
+  const wrapper = /^(?:\S*\/)?(?:bash|zsh|sh)\s+-(?:lc|c)\s+([\s\S]+)$/u.exec(command);
+  if (!wrapper) return command;
+  const wrapped = shellWords(wrapper[1]!);
+  return wrapped?.length === 1 ? wrapped[0]! : command;
+}
+
+function simpleReadPath(words: readonly string[]): string | undefined {
+  const [program, ...args] = words;
+  if (program === 'cat') {
+    const paths = args[0] === '--' ? args.slice(1) : args;
+    return paths.length === 1 && !paths[0]!.startsWith('-') ? paths[0] : undefined;
+  }
+  if (program === 'head' || program === 'tail') {
+    let index = 0;
+    if (args[index] === '-n' || args[index] === '--lines') index += 2;
+    if (args[index] === '--') index += 1;
+    return index === args.length - 1 && !args[index]!.startsWith('-') ? args[index] : undefined;
+  }
+  if (program === 'sed' && args.length === 3 && args[0] === '-n' && /^\d+(?:,\d+)?p$/u.test(args[1]!)) {
+    return !args[2]!.startsWith('-') ? args[2] : undefined;
+  }
+  return undefined;
+}
+
+function mcporterAction(words: readonly string[]): ToolAction | undefined {
+  if (words.length < 3 || !/(?:^|\/)mcporter$/u.test(words[0]!) || words[1] !== 'call') return undefined;
+  const target = words[2]!;
+  if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+$/u.test(target)) return undefined;
+  if (target === 'exa.web_search_exa') {
+    const query = words.slice(3).find(word => word.startsWith('query='))?.slice('query='.length).trim();
+    return { icon: 'search_outlined', action: '搜索网页', subject: query ? short(query, 80) : '内容' };
+  }
+  return { icon: 'plugin_outlined', action: '使用', subject: `${short(target.split('.')[0]!, 64)} 集成` };
+}
+
+function isMutatingSearch(words: readonly string[]): boolean {
+  return words[0] === 'find' && words.some(word => /^(?:-delete|-exec|-execdir|-ok|-okdir)$/u.test(word));
+}
+
+function shellWords(input: string): string[] | undefined {
+  const words: string[] = [];
+  let word = '';
+  let active = false;
+  let quote: "'" | '"' | undefined;
+  const finish = (): void => {
+    if (active) words.push(word);
+    word = '';
+    active = false;
+  };
+  for (let index = 0; index < input.length; index += 1) {
+    const character = input[index]!;
+    if (quote) {
+      if (character === quote) {
+        quote = undefined;
+        active = true;
+      } else if (character === '\\' && quote === '"') {
+        index += 1;
+        if (index >= input.length) return undefined;
+        word += input[index]!;
+        active = true;
+      } else {
+        if (quote === '"' && (character === '`' || (character === '$' && /[({]/u.test(input[index + 1] ?? '')))) return undefined;
+        word += character;
+        active = true;
+      }
+      continue;
+    }
+    if (character === '\n' || character === '\r') return undefined;
+    if (/\s/u.test(character)) {
+      finish();
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      active = true;
+      continue;
+    }
+    if (character === '\\') {
+      index += 1;
+      if (index >= input.length) return undefined;
+      word += input[index]!;
+      active = true;
+      continue;
+    }
+    if (/[|;&<>`]/u.test(character) || (character === '$' && /[({]/u.test(input[index + 1] ?? ''))) return undefined;
+    word += character;
+    active = true;
+  }
+  if (quote) return undefined;
+  finish();
+  return words;
 }
 
 function shortPath(path: string): string {
-  return short(path.length <= 80 ? path : `…/${path.replaceAll('\\', '/').split('/').slice(-2).join('/')}`, 80);
+  return short(path.replaceAll('\\', '/').split('/').at(-1) || path, 80);
 }
 
 function short(value: string, max: number): string {

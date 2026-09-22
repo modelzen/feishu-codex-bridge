@@ -274,3 +274,69 @@ it('streams only answer growth while preserving the native voice panel', async (
   expect(ch.contents).toHaveLength(1);
   expect(ch.contents[0].content).not.toContain('语音');
 });
+
+describe('RunCardStream terminal icon transport', () => {
+  afterEach(() => vi.useRealTimers());
+  const iconFrame = (answer: string) => card([
+    { tag: 'markdown', content: 'Shell', icon: { tag: 'standard_icon', token: 'computer_outlined' } },
+    mdStream(answer, 'answer'),
+  ], { streaming: true });
+
+  it('serializes create, streaming, live, final and explicit updates while retaining dedup and typewriter growth', async () => {
+    vi.useFakeTimers();
+    const ch = fakeChannel();
+    const creates: string[] = [];
+    ch.rawClient.cardkit.v1.card.create = async (p: { data: { data: string } }) => {
+      creates.push(p.data.data);
+      return { data: { card_id: 'c_icons' } };
+    };
+    const upload = vi.fn().mockResolvedValue({ data: { image_key: 'img_terminal' } });
+    ch.rawClient.im.v1.image = { create: upload };
+    const s = new RunCardStream();
+    await s.create(ch, 'oc_icon_paths', iconFrame('hello'), {});
+    s.streamCoalesced(ch, iconFrame('hello'), 'answer');
+    await s.drain();
+    expect(ch.updates).toHaveLength(0);
+    s.streamCoalesced(ch, iconFrame('hello world'), 'answer');
+    await s.drain();
+    expect(ch.contents).toHaveLength(1);
+    for (const [method, text] of [
+      ['streamCard', 'stream'], ['updateLiveCard', 'live'],
+      ['finalizeCard', 'final'], ['updateCard', 'explicit'],
+    ] as const) {
+      const pending = s[method](ch, iconFrame(text));
+      await vi.runAllTimersAsync();
+      expect(await pending).toBe(true);
+    }
+    expect(ch.updates).toHaveLength(4);
+    for (const data of [...creates, ...ch.updates.map((u: { data: string }) => u.data)]) {
+      expect(data).toContain('"tag":"custom_icon","img_key":"img_terminal"');
+      expect(data).not.toContain('computer_outlined');
+    }
+    expect(upload).toHaveBeenCalledTimes(1);
+  });
+
+  it('queues forced frames in invocation order and captures them before the first icon upload resolves', async () => {
+    vi.useFakeTimers();
+    const ch = fakeChannel();
+    let finish!: (response: unknown) => void;
+    ch.rawClient.im.v1.image = { create: vi.fn(() => new Promise(resolve => { finish = resolve; })) };
+    const s = new RunCardStream();
+    await s.create(ch, 'oc_icon_order', frame('initial'), {});
+    const live = iconFrame('live');
+    const first = s.updateLiveCard(ch, live);
+    const final = s.finalizeCard(ch, iconFrame('final'));
+    Object.assign(live, frame('mutated after enqueue'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ch.updates).toHaveLength(0);
+    finish({ data: { image_key: 'img_terminal' } });
+    await vi.runAllTimersAsync();
+    expect(await first).toBe(true);
+    expect(await final).toBe(true);
+    expect(ch.updates).toHaveLength(2);
+    expect(ch.updates[0].data).toContain('"content":"live"');
+    expect(ch.updates[1].data).toContain('"content":"final"');
+    expect(ch.updates[0].sequence).toBeLessThan(ch.updates[1].sequence);
+    expect(ch.updates[0].data).not.toContain('mutated after enqueue');
+  });
+});

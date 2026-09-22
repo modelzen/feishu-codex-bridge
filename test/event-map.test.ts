@@ -7,11 +7,11 @@ function notification(method: string, params: unknown): ServerNotification {
 }
 
 function itemStarted(item: ThreadItem): ServerNotification {
-  return notification('item/started', { item, threadId: 'thread-1', turnId: 'turn-1', startedAtMs: 1 });
+  return { method: 'item/started', params: { item, threadId: 'thread-1', turnId: 'turn-1', startedAtMs: 1 } };
 }
 
 function itemCompleted(item: ThreadItem): ServerNotification {
-  return notification('item/completed', { item, threadId: 'thread-1', turnId: 'turn-1', completedAtMs: 2 });
+  return { method: 'item/completed', params: { item, threadId: 'thread-1', turnId: 'turn-1', completedAtMs: 2 } };
 }
 
 describe('mapNotification', () => {
@@ -273,15 +273,67 @@ describe('mapNotification', () => {
       title: '联网搜索：飞书 2026 更新',
       kind: 'search',
     });
-    expect(mapNotification(itemStarted({ type: 'mcpToolCall', id: 'mcp-1' } as ThreadItem))).toEqual({
-      type: 'tool_use',
-      itemId: 'mcp-1',
-      title: '工具调用',
-      kind: 'tool',
+  });
+
+  it('preserves MCP identity, long arguments, textual and structured results', () => {
+    const args = { query: '完整查询'.repeat(2000), limit: 10 };
+    const started: ThreadItem = {
+      type: 'mcpToolCall', id: 'mcp-1', server: 'exa', tool: 'web_search',
+      status: 'inProgress', arguments: args, result: null, error: null, durationMs: null,
+    };
+    expect(mapNotification(itemStarted(started))).toEqual({
+      type: 'tool_use', itemId: 'mcp-1', title: 'mcp__exa__web_search',
+      detail: JSON.stringify(args, null, 2), kind: 'tool',
     });
-    expect(mapNotification(itemCompleted({ type: 'dynamicToolCall', id: 'dyn-1' } as ThreadItem))).toEqual({
-      type: 'tool_result',
-      itemId: 'dyn-1',
+    const result = {
+      content: [{ type: 'text', text: '完整返回'.repeat(4000) }],
+      structuredContent: { count: 0, nested: { complete: true } }, _meta: { source: 'exa' },
+    };
+    expect(mapNotification(itemCompleted({ ...started, status: 'completed', result, durationMs: 100 }))).toEqual({
+      type: 'tool_result', itemId: 'mcp-1', output: JSON.stringify(result, null, 2), exitCode: undefined,
+    });
+    const error = { message: '服务错误'.repeat(3000) };
+    expect(mapNotification(itemCompleted({ ...started, status: 'failed', result, error }))).toEqual({
+      type: 'tool_result', itemId: 'mcp-1', output: JSON.stringify({ result, error }, null, 2), exitCode: 1,
+    });
+    const emptyResult = { content: [], structuredContent: null, _meta: null };
+    expect(mapNotification(itemCompleted({ ...started, status: 'completed', result: emptyResult }))).toEqual({
+      type: 'tool_result', itemId: 'mcp-1', output: JSON.stringify(emptyResult, null, 2), exitCode: undefined,
+    });
+    expect(mapNotification(itemCompleted({ ...started, status: 'failed' }))).toEqual({
+      type: 'tool_result', itemId: 'mcp-1', output: undefined, exitCode: 1,
+    });
+  });
+
+  it('preserves dynamic tool names, arguments, full output, and explicit failures', () => {
+    const args = { cmd: 'echo 完整命令'.repeat(2000) };
+    const started: ThreadItem = {
+      type: 'dynamicToolCall', id: 'dyn-1', namespace: 'functions', tool: 'exec', arguments: args,
+      status: 'inProgress', contentItems: null, success: null, durationMs: null,
+    };
+    expect(mapNotification(itemStarted(started))).toEqual({
+      type: 'tool_use', itemId: 'dyn-1', title: 'functions.exec',
+      detail: JSON.stringify(args, null, 2), kind: 'tool',
+    });
+    expect(mapNotification(itemStarted({ ...started, namespace: null }))).toMatchObject({ title: 'exec' });
+    const output = '完整输出'.repeat(4000);
+    expect(mapNotification(itemCompleted({
+      ...started, status: 'completed', success: true, contentItems: [{ type: 'inputText', text: output }],
+    }))).toEqual({ type: 'tool_result', itemId: 'dyn-1', output, exitCode: undefined });
+    for (const failure of [
+      { status: 'failed', success: null }, { status: 'completed', success: false },
+    ] satisfies Array<Pick<typeof started, 'status' | 'success'>>) {
+      expect(mapNotification(itemCompleted({
+        ...started, ...failure, contentItems: [{ type: 'inputText', text: 'failure details' }],
+      }))).toEqual({ type: 'tool_result', itemId: 'dyn-1', output: 'failure details', exitCode: 1 });
+    }
+    for (const contentItems of [[], [{ type: 'inputText', text: '' }]] satisfies Array<typeof started.contentItems>) {
+      expect(mapNotification(itemCompleted({ ...started, status: 'completed', success: true, contentItems }))).toEqual({
+        type: 'tool_result', itemId: 'dyn-1', output: '', exitCode: undefined,
+      });
+    }
+    expect(mapNotification(itemCompleted({ ...started, status: 'completed', success: true }))).toEqual({
+      type: 'tool_result', itemId: 'dyn-1', output: undefined, exitCode: undefined,
     });
   });
 

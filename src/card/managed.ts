@@ -1,5 +1,6 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
+import { serializeRuntimeCard } from './runtime-card-icons';
 
 /**
  * Button-driven cards must be **CardKit 2.0 entities**, not raw interactive
@@ -92,7 +93,7 @@ export async function sendManagedCard(
   receiveIdType: 'chat_id' | 'open_id' = 'chat_id',
 ): Promise<ManagedCardSendResult> {
   stampRenderToken(card);
-  const data = JSON.stringify(card);
+  const data = await serializeRuntimeCard(card, channel.rawClient);
 
   // One attempt = create the entity + send the message that references it.
   const attempt = async (): Promise<ManagedCardSendResult> => {
@@ -155,7 +156,7 @@ export async function updateManagedCard(
     return false;
   }
   stampRenderToken(card);
-  const data = JSON.stringify(card);
+  const data = await serializeRuntimeCard(card, channel.rawClient);
   const push = async (): Promise<void> => {
     entry.sequence += 1;
     await channel.rawClient.cardkit.v1.card.update({

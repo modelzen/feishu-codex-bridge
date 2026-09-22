@@ -19,7 +19,7 @@ import { hasMarkdownTable, renderReport } from './report-render';
 import { StreamingImages } from './outbound-images';
 import type { RunCardStream } from './run-card-stream';
 import { processPanel } from './process-panel';
-import { buildProcessBody, currentAnswerIndex, processTitle, runElapsedMs } from './run-process';
+import { buildProcessPreview, currentAnswerIndex, processTitle, runElapsedMs } from './run-process';
 import { runCardGauge } from './context-gauge';
 
 /** The context-usage gauge line, only at/above the warn tier (else null). */
@@ -58,6 +58,7 @@ const PROCESS_COMPONENT_BUDGET = 120;
 
 /** Routing + render inputs for one run card. */
 export interface RunCardState {
+  processHistoryId?: string;
   rs: RunState;
   /** This display segment ended because an accepted steer opened a new card. */
   continued?: boolean;
@@ -181,10 +182,12 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
 
   const answerIdx = currentAnswerIndex(state.blocks);
   const processBlocks = state.blocks.filter((b, i) => i !== answerIdx && (rc.showTools !== false || b.kind !== 'tool'));
-  const process = buildProcessBody(processBlocks, rc.images);
+  const preview = buildProcessPreview(processBlocks, rc.images);
+  const process = preview.elements;
   const title = processTitle(state.terminal, runElapsedMs(state));
   if (process.length) elements.push(processPanel(title, process, true));
   else if (state.startedAt !== undefined) elements.push(md(`<font color='grey'>${title}</font>`));
+  if (preview.hasMore && rc.processHistoryId) elements.push(actions([button('查看全部操作', { a: 'run.process.open', h: rc.processHistoryId, p: 0 }, 'default')]));
   const answer = answerIdx >= 0 ? (state.blocks[answerIdx] as Extract<Block, { kind: 'text' }>).content : '';
   if (answer) {
     elements.push(...renderRichText(answer, rc.images, { streamTailId: ANSWER_EID, live: true }));
@@ -263,10 +266,12 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
   const blocks = rc.showTools === false ? processBlocks.filter((b) => b.kind !== 'tool') : processBlocks;
   const processBudget = rc.localFiles?.links.length
     ? Math.max(10, Math.min(PROCESS_COMPONENT_BUDGET, 170 - fileComponentCount(answerElements))) : PROCESS_COMPONENT_BUDGET;
-  const processEls = buildProcessBody(blocks, rc.images, processBudget);
+  const preview = buildProcessPreview(blocks, rc.images, processBudget);
+  const processEls = preview.elements;
   const title = processTitle(state.terminal, runElapsedMs(state));
   if (processEls.length) elements.push(processPanel(title, processEls, false));
   else if (state.startedAt !== undefined) elements.push(md(`<font color='grey'>${title}</font>`));
+  if (preview.hasMore && rc.processHistoryId) elements.push(actions([button('查看全部操作', { a: 'run.process.open', h: rc.processHistoryId, p: 0 }, 'default')]));
 
   // Terminal answer. A reply that TABLES its data goes through the report
   // renderer: card markdown has no tables, so `| a | b |` would otherwise show up
@@ -406,12 +411,12 @@ export function buildQueuedCard(qc: QueuedCardState): CardObject {
 
 function footerStatusText(status: Exclude<FooterStatus, null>): string {
   return status === 'thinking'
-    ? '正在处理'
+    ? '🧠 正在处理'
     : status === 'tool_running'
-      ? '正在调用工具'
+      ? '🧰 正在调用工具'
       : status === 'retrying'
         ? '⚠️ 瞬断，自动重试中…'
-        : '正在输出';
+        : '✍️ 正在输出';
 }
 
 function footerStatus(status: Exclude<FooterStatus, null>): CardElement {
