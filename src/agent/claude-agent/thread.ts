@@ -335,10 +335,12 @@ export class ClaudeAgentThread implements AgentThread {
     const self = this;
     async function* gen(): AsyncGenerator<AgentEvent> {
       yield { type: 'turn_started', turnId };
+      let terminalError = false;
       try {
         while (true) {
           const item = await inbox.next();
           if (item.kind === 'end' || item.kind === 'error') {
+            if (terminalError) return;
             // A deliberate ⏹ (interrupt or the hard-abort escalation) ends here too —
             // treat it as a clean `done` (the orchestrator marks it interrupted), not
             // a scary error; a genuine crash surfaces the error.
@@ -352,8 +354,17 @@ export class ClaudeAgentThread implements AgentThread {
           }
           const msg = item.msg as unknown as { type?: string; subtype?: string };
           self.lastActivityAt = Date.now();
-          for (const ev of mapper.map(item.msg)) yield ev;
+          for (const ev of mapper.map(item.msg)) {
+            if (ev.type === 'error' && !ev.willRetry) {
+              if (terminalError) continue;
+              terminalError = true;
+            }
+            yield ev;
+          }
           if (msg.type === 'result') {
+            // Drain through the turn boundary so the warm query stays aligned,
+            // but never let a contradictory success overwrite an API failure.
+            if (terminalError) return;
             const ok = msg.subtype === 'success' || self.interruptRequested;
             if (ok) {
               // Authoritative context gauge — matches Claude's native /context
@@ -429,6 +440,7 @@ export class ClaudeAgentThread implements AgentThread {
       yield { type: 'goal_update', status: 'active', objective, tokensUsed: 0, timeUsedSeconds: 0, tokenBudget: null };
       yield { type: 'turn_started', turnId };
       let tokensUsed = 0;
+      let terminalError = false;
       const finishGoal = (status: string): AgentEvent => ({
         type: 'goal_update',
         status,
@@ -441,6 +453,10 @@ export class ClaudeAgentThread implements AgentThread {
         while (true) {
           const item = await inbox.next();
           if (item.kind === 'end' || item.kind === 'error') {
+            if (terminalError) {
+              yield finishGoal('blocked');
+              return;
+            }
             // Deliberate ⏹/🎯 (clearGoal aborted the query) → finish cleanly; a real
             // crash → surface the error.
             if (self.interruptRequested) {
@@ -456,11 +472,23 @@ export class ClaudeAgentThread implements AgentThread {
           self.lastActivityAt = Date.now();
           for (const ev of mapper.map(item.msg)) {
             if (ev.type === 'usage') tokensUsed = (ev.inputTokens ?? 0) + (ev.outputTokens ?? 0);
+            if (ev.type === 'error' && !ev.willRetry) {
+              if (terminalError) continue;
+              terminalError = true;
+            }
             yield ev;
           }
           if (msg.type === 'result') {
             self.goalRunning = false;
-            const status = msg.subtype === 'success' || self.interruptRequested ? 'complete' : goalStatusFromResult(msg.subtype);
+            if (terminalError) {
+              yield finishGoal('blocked');
+              return;
+            }
+            if (msg.subtype !== 'success' && !self.interruptRequested) {
+              yield finishGoal(goalStatusFromResult(msg.subtype));
+              yield { type: 'error', message: resultErrorText(msg as Record<string, unknown>), willRetry: false };
+              return;
+            }
             try {
               const cu = await self.query.getContextUsage();
               if (cu && typeof cu.totalTokens === 'number' && typeof cu.maxTokens === 'number') {
@@ -469,7 +497,7 @@ export class ClaudeAgentThread implements AgentThread {
             } catch {
               /* best-effort */
             }
-            yield finishGoal(status);
+            yield finishGoal('complete');
             yield { type: 'done', turnId };
             return;
           }

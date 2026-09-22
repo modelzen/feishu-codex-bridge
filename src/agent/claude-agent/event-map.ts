@@ -91,6 +91,23 @@ export function createTurnMapper(ctx: ClaudeMapContext = {}): TurnMapper {
 
       case 'assistant': {
         const content = (m.message?.content ?? []) as ContentBlock[];
+        // Synthetic API failures may have no stream_event text deltas and can
+        // even precede an empty success result. Preserve the explicit SDK error
+        // instead of silently dropping its text. max_output_tokens is a
+        // recoverable truncation signal, not a terminal API rejection. A nested
+        // agent's failure is owned by its parent tool, not the whole user turn.
+        if (m.parent_tool_use_id == null && m.error !== 'max_output_tokens' && (m.error || m.isApiErrorMessage === true)) {
+          const message = content
+            .filter((b) => b.type === 'text' && typeof b.text === 'string')
+            .map((b) => b.text)
+            .join('\n')
+            .trim();
+          return [{
+            type: 'error',
+            message: message || `模型服务请求失败（${String(m.error ?? 'unknown')}）`,
+            willRetry: false,
+          }];
+        }
         const out: AgentEvent[] = [];
         for (const b of content) {
           if (b.type === 'tool_use' || b.type === 'server_tool_use') {
@@ -339,6 +356,10 @@ function contextWindowFor(model: unknown): number | null {
 /** Human-readable error text for a non-success `result` message. Used by the
  * thread when a turn ends in failure (not an interrupt). */
 export function resultErrorText(m: Record<string, unknown>): string {
+  if (Array.isArray(m.errors)) {
+    const errors = m.errors.filter((e): e is string => typeof e === 'string' && !!e.trim());
+    if (errors.length) return errors.join('\n');
+  }
   const result = m.result;
   if (typeof result === 'string' && result.trim()) return result.trim();
   const subtype = m.subtype;
