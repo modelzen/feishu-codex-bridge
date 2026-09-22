@@ -46,7 +46,7 @@ export const RC = {
 export const ANSWER_EID = 'answer';
 
 /**
- * Stable element_id of the run/queued card's control row (⏹ / 🎯 / 取消). Lets
+ * Stable element_id of the run or queued card's control row. Lets
  * a post-restart orphan card self-heal on click: the in-process maps are gone
  * by then, so the handler can only recover the entity's card_id from the
  * carrier message and delete THIS element — the rest of the card is
@@ -56,6 +56,58 @@ export const CONTROLS_EID = 'controls';
 
 const PROCESS_COMPONENT_BUDGET = 120;
 
+type StopControlPresentation = 'single' | 'with-peer' | 'goal-with-peer' | 'queue';
+
+const STOP_CONTROL: Record<StopControlPresentation, {
+  readonly label?: string;
+  readonly type: 'default' | 'primary_filled';
+  readonly icon: string;
+  readonly iconColor: 'grey' | 'white';
+  readonly tooltip: string;
+}> = {
+  single: {
+    type: 'primary_filled',
+    icon: 'stop-record_filled',
+    iconColor: 'white',
+    tooltip: '停止生成',
+  },
+  'with-peer': {
+    label: '停止',
+    type: 'primary_filled',
+    icon: 'stop-record_filled',
+    iconColor: 'white',
+    tooltip: '停止生成',
+  },
+  'goal-with-peer': {
+    label: '停止',
+    type: 'primary_filled',
+    icon: 'stop-record_filled',
+    iconColor: 'white',
+    tooltip: '立即停止并结束目标',
+  },
+  queue: {
+    label: '取消排队',
+    type: 'default',
+    icon: 'close_outlined',
+    iconColor: 'grey',
+    tooltip: '取消排队',
+  },
+};
+
+function stopControl(cardKey: string, presentation: StopControlPresentation): CardElement {
+  const control = STOP_CONTROL[presentation];
+  return {
+    tag: 'button',
+    ...(control.label ? { text: { tag: 'plain_text', content: control.label } } : {}),
+    type: control.type,
+    size: 'medium',
+    width: 'default',
+    icon: { tag: 'standard_icon', token: control.icon, color: control.iconColor },
+    hover_tips: { tag: 'plain_text', content: control.tooltip },
+    behaviors: [{ type: 'callback', value: { a: RC.stop, m: cardKey } }],
+  };
+}
+
 /** Routing + render inputs for one run card. */
 export interface RunCardState {
   rs: RunState;
@@ -63,11 +115,11 @@ export interface RunCardState {
   continued?: boolean;
   /** Independent of model text, preserved across live and terminal renders. */
   voiceMessages?: VoiceReply[];
-  /** identity for ⏹ stop routing (the card's own messageId) */
+  /** Identity for stop routing, using the card's own messageId. */
   cardKey?: string;
   /** topic thread id (known after the topic is created) */
   threadId?: string;
-  /** who started this run — only they (or an admin) may ⏹ it (design §5) */
+  /** Who started this run. Only they or an admin may stop it. */
   requesterOpenId?: string;
   /** drop tool blocks from the render (pref) */
   showTools?: boolean;
@@ -82,18 +134,18 @@ export interface RunCardState {
    * always show it when {@link model} is set; this only gates the terminal render
    * so the running-only(仅输出时) mode drops it once the turn finishes. */
   modelOnTerminal?: boolean;
-  /** suppress the ⏹ 终止 button (used by non-goal cards that opt out of stop). */
+  /** Suppress the stop control for non-goal cards that opt out of stopping. */
   hideStop?: boolean;
   /** Present only in the global `manual` reminder mode. `available` renders the
    * one-shot “完成后提醒我” button; `requested` replaces it with a visible
    * confirmation. Non-manual modes leave this unset and therefore never expose
    * the per-turn button. */
   completionReminder?: 'available' | 'requested';
-  /** goal run cards: show TWO controls — `⏹ 终止` (clear goal + cut output now)
+  /** Goal run cards show two controls: stop clears the goal and cuts output now,
    * and `🎯 结束目标` (clear goal, let the current turn finish, then stop). */
   goalControls?: boolean;
-  /** goal run cards, after 🎯 结束目标 was tapped: the goal is cleared and this
-   * turn is finishing — drop the 结束目标 button (keep ⏹ 终止) and show a notice. */
+  /** After 结束目标 is tapped, the goal is cleared and this turn is finishing.
+   * Drop the 结束目标 button, keep stop, and show a notice. */
   goalEnding?: boolean;
   /** `![](src) → image_key`, filled in by the turn's background uploader
    * ({@link ./outbound-images}.StreamingImages) as each ref resolves — so a
@@ -201,21 +253,20 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
   const gauge = gaugeEl(state);
   if (gauge) elements.push(gauge);
 
-  // ⏹ controls row pinned at the BOTTOM — it tracks the newest output where the
+  // The controls row stays at the bottom, next to the newest output where the
   // reader is looking (tradeoff: a long stream may push it below the fold; see
   // the layout note above). CONTROLS_EID anchor is position-independent.
   if (rc.cardKey && rc.goalControls) {
     if (rc.goalEnding) {
-      // 结束目标 已触发：目标已解除，本轮输出完即停。仅留 ⏹ 终止（可再点掐断）。
       elements.push(noteMd('_🎯 目标已解除，本轮输出完成后停止_'));
-      elements.push(actions([button('⏹ 终止', { a: RC.stop, m: rc.cardKey }, 'danger')], CONTROLS_EID));
+      elements.push(actions([stopControl(rc.cardKey, 'single')], CONTROLS_EID));
     } else {
       // Goal: 终止 = clear goal + cut output now; 结束目标 = clear goal, let this
       // turn finish, then stop (no auto-continue). Both routed by the card's msgId.
       elements.push(
         actions(
           [
-            button('⏹ 终止', { a: RC.stop, m: rc.cardKey }, 'danger'),
+            stopControl(rc.cardKey, 'goal-with-peer'),
             button('🎯 结束目标', { a: RC.endGoal, m: rc.cardKey }, 'default'),
           ],
           CONTROLS_EID,
@@ -231,7 +282,9 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
       elements.push(noteMd('_🔔 本轮结束后会提醒发起人_'));
     }
     const controls: CardElement[] = [];
-    if (!rc.hideStop) controls.push(button('⏹ 终止', { a: RC.stop, m: rc.cardKey }, 'danger'));
+    if (!rc.hideStop) {
+      controls.push(stopControl(rc.cardKey, rc.completionReminder === 'available' ? 'with-peer' : 'single'));
+    }
     if (rc.completionReminder === 'available') {
       controls.push(button('🔔 完成后提醒我', { a: RC.remind, m: rc.cardKey }, 'default'));
     }
@@ -358,7 +411,7 @@ export interface QueuedCardState {
   voiceMessages?: VoiceReply[];
   /** 1-based position in the global run queue (waiting layout only). */
   position?: number;
-  /** routes the ⏹ 取消 button (the card's own messageId); unset → no button
+  /** Routes the cancel button with the card's own messageId. Unset means no button
    * (the first frame, before the messageId exists). */
   cardKey?: string;
   /** ⏹ tapped while waiting — terminal「已取消排队」layout. */
@@ -374,7 +427,7 @@ export interface QueuedCardState {
 
 /**
  * Queue placeholder card — posted BEFORE the global semaphore acquire when the
- * run pool is full, so a queued run is visible and cancellable. The ⏹ 取消
+ * run pool is full, so a queued run is visible and cancellable. The cancel
  * button reuses the run card's {@link RC.stop} action: while waiting,
  * `state.interrupt` resolves to「移除 waiter + 释放预订」(see acquireRunSlot).
  * Once the slot is granted the SAME CardKit entity is repainted in place into
@@ -395,7 +448,7 @@ export function buildQueuedCard(qc: QueuedCardState): CardObject {
   ];
   if (qc.completionReminder === 'requested') els.push(noteMd('_🔔 本轮结束后会提醒发起人_'));
   if (qc.cardKey) {
-    const controls: CardElement[] = [button('⏹ 取消', { a: RC.stop, m: qc.cardKey }, 'danger')];
+    const controls: CardElement[] = [stopControl(qc.cardKey, 'queue')];
     if (qc.completionReminder === 'available') {
       controls.push(button('🔔 完成后提醒我', { a: RC.remind, m: qc.cardKey }, 'default'));
     }

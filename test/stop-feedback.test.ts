@@ -24,18 +24,30 @@ function buttons(node: unknown, acc: Record<string, any>[] = []): Record<string,
   return acc;
 }
 
-// M-4 ⏹ 静默失败反馈：orphan 卡点击自愈靠「按 element_id 删掉控件行」——
+// M-4 静默失败反馈：orphan 卡点击自愈靠「按 element_id 删掉控件行」——
 // 控件行必须带稳定的 CONTROLS_EID，且只出现在有按钮的版式上。
 describe('run card controls row — CONTROLS_EID（M-4 orphan 自愈锚点）', () => {
   it('the running run card carries exactly one controls row with CONTROLS_EID', () => {
     const rows = byEid(buildRunCard({ rs: initialState, cardKey: 'om_1' }), CONTROLS_EID);
     expect(rows).toHaveLength(1);
-    expect(JSON.stringify(rows[0])).toContain('⏹ 终止');
+    const stop = buttons(rows[0])[0];
+    expect(stop?.text).toBeUndefined();
+    expect(stop).toMatchObject({
+      type: 'primary_filled',
+      size: 'medium',
+      width: 'default',
+      icon: { tag: 'standard_icon', token: 'stop-record_filled', color: 'white' },
+      hover_tips: { tag: 'plain_text', content: '停止生成' },
+      behaviors: [{ type: 'callback', value: { a: 'run.stop', m: 'om_1' } }],
+    });
   });
 
   it('manual mode adds one-shot remind; requested state becomes a note; automatic modes expose neither', () => {
     const available = buildRunCard({ rs: initialState, cardKey: 'om_1', completionReminder: 'available' });
-    expect(buttons(available).map((b) => b.behaviors[0].value.a)).toEqual(['run.stop', 'run.remind']);
+    const availableButtons = buttons(available);
+    expect(availableButtons.map((b) => b.behaviors[0].value.a)).toEqual(['run.stop', 'run.remind']);
+    expect(availableButtons[0]?.text?.content).toBe('停止');
+    expect(availableButtons[0]?.icon?.token).toBe('stop-record_filled');
 
     const requested = buildRunCard({ rs: initialState, cardKey: 'om_1', completionReminder: 'requested' });
     expect(buttons(requested).map((b) => b.behaviors[0].value.a)).toEqual(['run.stop']);
@@ -66,10 +78,16 @@ describe('run card controls row — CONTROLS_EID（M-4 orphan 自愈锚点）', 
     expect(ending).toHaveLength(1);
   });
 
-  it('the queued placeholder card anchors its ⏹ 取消 row with CONTROLS_EID', () => {
+  it('the queued placeholder card anchors its cancel row with CONTROLS_EID', () => {
     const rows = byEid(buildQueuedCard({ position: 2, cardKey: 'om_1' }), CONTROLS_EID);
     expect(rows).toHaveLength(1);
-    expect(JSON.stringify(rows[0])).toContain('⏹ 取消');
+    expect(buttons(rows[0])[0]).toMatchObject({
+      text: { content: '取消排队' },
+      type: 'default',
+      size: 'medium',
+      icon: { token: 'close_outlined', color: 'grey' },
+      behaviors: [{ value: { a: 'run.stop', m: 'om_1' } }],
+    });
   });
 
   it('button-less layouts have no controls row to delete', () => {

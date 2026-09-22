@@ -12,7 +12,7 @@ function buttons(node: unknown, acc: Record<string, any>[] = []): Record<string,
   return acc;
 }
 
-// M-3: 排队占位卡 —— acquire 前可见、可 ⏹ 取消。
+// M-3: 排队占位卡 —— acquire 前可见、可取消。
 describe('buildQueuedCard', () => {
   it('shows the 1-based queue position and the shared-pool note while waiting', () => {
     const json = JSON.stringify(buildQueuedCard({ position: 3, cardKey: 'om_1' }));
@@ -20,10 +20,18 @@ describe('buildQueuedCard', () => {
     expect(json).toContain('全局并发池已满');
   });
 
-  it('routes the ⏹ 取消 button through the run card\'s RC.stop action (cardKey = own messageId)', () => {
+  it('renders a neutral queue cancel control through RC.stop', () => {
     const btns = buttons(buildQueuedCard({ position: 1, cardKey: 'om_1' }));
     expect(btns.length).toBe(1);
-    expect(btns[0]!.behaviors[0].value).toMatchObject({ a: RC.stop, m: 'om_1' });
+    expect(btns[0]).toMatchObject({
+      text: { tag: 'plain_text', content: '取消排队' },
+      type: 'default',
+      size: 'medium',
+      width: 'default',
+      icon: { tag: 'standard_icon', token: 'close_outlined', color: 'grey' },
+      hover_tips: { tag: 'plain_text', content: '取消排队' },
+      behaviors: [{ type: 'callback', value: { a: RC.stop, m: 'om_1' } }],
+    });
   });
 
   it('shows the one-shot reminder only when manual mode marks it available', () => {
@@ -31,6 +39,7 @@ describe('buildQueuedCard', () => {
       buildQueuedCard({ position: 1, cardKey: 'om_1', completionReminder: 'available' }),
     );
     expect(available.map((b) => b.behaviors[0].value.a)).toEqual([RC.stop, RC.remind]);
+    expect(available[0]?.text?.content).toBe('取消排队');
     expect(JSON.stringify(available)).toContain('🔔 完成后提醒我');
 
     const automaticMode = buttons(buildQueuedCard({ position: 1, cardKey: 'om_1' }));
