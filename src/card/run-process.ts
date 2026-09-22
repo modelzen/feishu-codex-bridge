@@ -126,7 +126,7 @@ function compactToolUnits(tools: readonly ToolEntry[]): ProcessUnit[] {
 
 function compactToolEntry(tool: ToolEntry): string {
   const presentation = toolPresentation(tool);
-  const command = commandFor(tool);
+  const command = tool.kind === 'command' ? tool.title : presentation.command;
   const parts = [`**${presentation.header}**`];
   if (command !== undefined) {
     parts.push(codeBlock(command, 'bash'));

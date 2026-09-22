@@ -1,6 +1,5 @@
 import type { CardElement } from './cards';
 
-/** Native disclosure chrome matching the restrained process rows in Codex. */
 export function processPanel(
   title: string,
   elements: readonly CardElement[],

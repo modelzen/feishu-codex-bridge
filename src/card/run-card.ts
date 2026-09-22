@@ -207,8 +207,6 @@ export function buildRunCard(rc: RunCardState): CardObject {
   return result;
 }
 
-/** Apply native normal (14px) body text only within run cards; metadata keeps
- * its explicit notation size, and other card families keep their own styles. */
 function runTypography(element: CardElement): CardElement {
   return {
     ...element,

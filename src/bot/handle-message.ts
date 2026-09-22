@@ -4750,9 +4750,9 @@ export function createOrchestrator(
    *
    * Differs from {@link launchRun}: turns are auto-started AND auto-continued by
    * codex (we never call turn/start — see {@link AgentThread.runGoal}); the
-   * per-turn idle watchdog is OFF (goals run long) with only a hard wall-clock cap
-   * as a backstop; the run cards carry no ⏹ button (goals have no manual stop, by
-   * design). The codex process is recycled at the end — a terminated goal leaves
+   * `GOAL_IDLE_MS` ends a goal after 30 minutes without codex activity.
+   * Goal cards let the user stop immediately or end the goal after the current
+   * turn. The codex process is recycled at the end — a terminated goal leaves
    * trailing notifications that would poison the next turn's stream — and any
    * non-complete goal is cleared first so it won't reactivate on the next resume.
    */
