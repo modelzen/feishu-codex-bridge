@@ -1,7 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import * as nodeFs from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
 import { effectiveGuestMode, effectiveMode, turnTier } from '../src/project/registry';
 import { sandboxParams, withAutoCompact } from '../src/agent/codex-appserver/backend';
 import { buildGroupSettingsCard, buildPermissionCard, buildProjectSettingsCard } from '../src/card/dm-cards';
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, realpathSync: vi.fn(actual.realpathSync) };
+});
 
 describe('effectiveMode', () => {
   it('defaults missing mode to full (legacy data unaffected)', () => {
@@ -84,6 +93,84 @@ describe('sandboxParams', () => {
       });
     });
   }
+
+  it('macOS custom launchers get exact-file reads without exposing sibling files', () => {
+    const root = mkdtempSync(join(tmpdir(), 'bridge-runtime-test-'));
+    try {
+      const launcher = join(root, 'bin', 'codex');
+      const runtime = join(root, 'runtime', 'codex');
+      mkdirSync(dirname(launcher));
+      mkdirSync(dirname(runtime));
+      writeFileSync(runtime, 'test runtime');
+      symlinkSync(runtime, launcher);
+      withPlatform('darwin', () => {
+        const p = sandboxParams('qa', false, launcher) as any;
+        const fs = p.config.permissions.feishu.filesystem;
+        expect(fs[launcher]).toBe('read');
+        expect(fs[dirname(launcher)]).toBeUndefined();
+        expect(fs[dirname(nodeFs.realpathSync(runtime))]).toBeUndefined();
+        // macOS realpath resolves /var to /private/var.
+        expect(Object.values(fs).filter((v) => v === 'read')).toHaveLength(3);
+        expect(fs[':workspace_roots']['.']).toBe('read');
+        expect(fs[':root']).toBeUndefined();
+        expect(p.config.permissions.feishu.network.enabled).toBe(false);
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('macOS only expands verified Homebrew installation directories', () => {
+    const cases = [
+      ['/opt/homebrew/bin/codex', '/opt/homebrew/Caskroom/codex/0.154.0/bin/codex', '/opt/homebrew/bin', true],
+      ['/usr/local/bin/codex', '/usr/local/Cellar/codex/0.154.0/bin/codex', '/usr/local/bin', true],
+      ['/mock-home/codex', '/opt/homebrew/Caskroom/codex/0.154.0/bin/codex', '/mock-home', false],
+      ['/opt/homebrew/bin/codex', '/mock-home/codex', '/opt/homebrew/bin', false],
+      ['/opt/homebrew/bin/codex', '/opt/homebrew/Caskroom/other/0.154.0/bin/codex', '/opt/homebrew/bin', false],
+      ['/opt/homebrew/bin/codex', '/opt/homebrew/Caskroom/codex/0.154.0/bin/codex', '/mock-home', false],
+    ] as const;
+    for (const [launcher, runtime, canonicalParent, directoryAllowed] of cases) {
+      const spy = vi.spyOn(nodeFs, 'realpathSync').mockImplementation(((path: string) =>
+        path === launcher ? runtime : canonicalParent) as typeof nodeFs.realpathSync);
+      try {
+        withPlatform('darwin', () => {
+          for (const mode of ['qa', 'write'] as const) {
+            const fs = (sandboxParams(mode, false, launcher) as any).config.permissions.feishu.filesystem;
+            expect(fs[launcher]).toBe('read');
+            expect(fs[runtime]).toBe('read');
+            expect(fs[dirname(launcher)]).toBe(directoryAllowed ? 'read' : undefined);
+            expect(fs[dirname(runtime)]).toBe(directoryAllowed ? 'read' : undefined);
+            expect(fs['/mock-home']).toBeUndefined();
+          }
+        });
+      } finally {
+        spy.mockRestore();
+      }
+    }
+  });
+
+  it('macOS reports a clear fail-closed diagnostic if the discovered executable disappears', () => {
+    const missing = Object.assign(new Error('fixture removed during upgrade'), { code: 'ENOENT' });
+    for (const failAt of ['launcher', 'parent']) {
+      const spy = vi.spyOn(nodeFs, 'realpathSync').mockImplementation(((path: string) => {
+        if (failAt === 'launcher' || path === '/mock-home') throw missing;
+        return '/mock-runtime/codex';
+      }) as typeof nodeFs.realpathSync);
+      try {
+        withPlatform('darwin', () => {
+          for (const mode of ['qa', 'write'] as const) {
+            let failure: unknown;
+            try { sandboxParams(mode, false, '/mock-home/codex'); } catch (error) { failure = error; }
+            expect(failure).toBeInstanceOf(Error);
+            expect((failure as Error).message).toContain('已拒绝启动项目权限会话');
+            expect((failure as Error).message).toContain('CODEX_BIN');
+            expect((failure as Error).cause).toBe(missing);
+          }
+          expect(sandboxParams('full', false, '/mock-home/codex')).toEqual({ sandbox: 'danger-full-access' });
+        });
+      } finally { spy.mockRestore(); }
+    }
+  });
 
   it('fail-closed on Linux/WSL: qa/write throw (reads not confined there), full still works', () => {
     withPlatform('linux', () => {

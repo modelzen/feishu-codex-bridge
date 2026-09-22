@@ -3,7 +3,7 @@ import { AppServerClient } from '../src/agent/codex-appserver/app-server-client'
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CodexAppServerBackend } from '../src/agent/codex-appserver/backend';
 import {
   refillWarmPool,
@@ -58,6 +58,7 @@ setInterval(() => {}, 1 << 30); // stay alive until killed
 
 const dirs: string[] = [];
 let prevEnv: string | undefined;
+let prevPrewarmEnv: string | undefined;
 
 /** 建一个假 codex，并把 CODEX_BIN 指过去；afterEach 统一关进程、删目录、还原 env。 */
 function makeFakeCodex(): { bin: string; runs: () => number } {
@@ -81,6 +82,8 @@ afterEach(async () => {
   await shutdownResidentClients();
   if (prevEnv === undefined) delete process.env.CODEX_BIN;
   else process.env.CODEX_BIN = prevEnv;
+  if (prevPrewarmEnv === undefined) delete process.env.FEISHU_CODEX_PREWARM;
+  else process.env.FEISHU_CODEX_PREWARM = prevPrewarmEnv;
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
@@ -146,6 +149,11 @@ describe.skipIf(process.platform === 'win32')('utility client 复用与出错即
 });
 
 describe.skipIf(process.platform === 'win32')('容量 1 预热池（M-2）', () => {
+  beforeEach(() => {
+    prevPrewarmEnv = process.env.FEISHU_CODEX_PREWARM;
+    process.env.FEISHU_CODEX_PREWARM = '1';
+  });
+
   it('补位→取走命中；池清空后再取扑空', async () => {
     const { bin, runs } = makeFakeCodex();
     await refillWarmPool();

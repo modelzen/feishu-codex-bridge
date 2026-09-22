@@ -177,6 +177,17 @@ interface WarmEntry {
 let warm: WarmEntry | null = null;
 let warming: Promise<void> | null = null;
 
+/**
+ * Codex 0.153.4 on macOS can leave an app-server unable to re-exec its sandbox
+ * helper after an ephemeral read-only thread has been started in that process.
+ * Reusing that process for a real thread then fails while loading AGENTS.md with
+ * sandbox-exec status 71 / EPERM. Keep prewarming opt-in until the upstream
+ * process-level sandbox interaction is fixed; cold app-servers are reliable.
+ */
+function prewarmEnabled(): boolean {
+  return process.env.FEISHU_CODEX_PREWARM === '1';
+}
+
 /** bin 文件指纹 = 「codex 版本」的取用时探活代理。statSync 是微秒级且跟随符号
  * 链接，能在取用热进程的瞬间发现「codex 已原地升级/被替换」；版本字符串探测
  * （codex --version ~320ms）放在取用路径会吃掉预热的全部收益，而 locate 的版本
@@ -196,6 +207,7 @@ function binFingerprint(bin: string): string | null {
  * 走冷路径。
  */
 export function takeWarmClient(bin: string): AppServerClient | null {
+  if (!prewarmEnabled()) return null;
   const entry = warm;
   if (!entry) return null;
   warm = null;
@@ -221,6 +233,7 @@ export function takeWarmClient(bin: string): AppServerClient | null {
  * 返回在途的补位 Promise（永不 reject），调用方通常 fire-and-forget。
  */
 export function refillWarmPool(): Promise<void> {
+  if (!prewarmEnabled()) return Promise.resolve();
   if (warm || warming) return warming ?? Promise.resolve();
   warming = (async () => {
     const bin = resolveCodexBin();

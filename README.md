@@ -122,6 +122,14 @@ feishu-codex-bridge doctor                      本地自检：后端 / 登录 /
 
 ---
 
+## Codex 预热与 macOS 项目权限
+
+App Server 预热默认关闭；只有 bridge 进程环境中设置 `FEISHU_CODEX_PREWARM=1` 才开启，其他值均保持关闭。修改后重启 bridge 生效。关闭时会话使用冷启动，可能增加启动等待，但避免已观察到的 macOS 预热线程与后续沙箱执行冲突。该开关不关闭模型列表查询及其缓存。
+
+macOS 的「项目内只读 / 项目内读写」会给 Codex 启动器和真实目标文件添加准确读取权限。目录读取例外仅适用于 `/opt/homebrew` 或 `/usr/local` 下的标准 Homebrew 安装：启动器父目录必须真实位于 `bin`，解析后的运行文件必须位于 `Caskroom/codex/<版本>/` 或 `Cellar/codex/<版本>/`（含 `bin/` 布局）。不会因为 `CODEX_BIN` 指向 home 或自定义目录而开放整个父目录。
+
+npm 启动器、Codex.app 与其他自定义安装只获得上述准确文件例外；其 Node、vendor 或辅助程序依赖未在此规则中额外授权，项目权限下可能无法执行。遇到此情况请使用受支持的 Homebrew 布局或先验证安装依赖，不要通过开放 home 目录解决。若安装升级或移动导致路径无法解析，会在创建会话前明确报错并拒绝启动；检查 `CODEX_BIN` / 安装后重试，不会自动降级权限。
+
 ## ⚙️ 配置与数据
 
 所有本地状态都在 `~/.feishu-codex-bridge/`（机器人配置、项目 / 会话注册表、AES-256-GCM 加密的密钥库）。卸载时删掉这个目录即可清干净。
