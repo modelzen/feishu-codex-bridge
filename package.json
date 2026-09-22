@@ -23,6 +23,7 @@
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:native-service": "node scripts/test-native-service.mjs",
     "start": "node bin/feishu-codex-bridge.mjs run",
     "prepare": "npm run build",
     "release": "bash scripts/release.sh"

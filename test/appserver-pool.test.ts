@@ -1,10 +1,11 @@
 import { UnsentRequestError } from '../src/agent/types';
 import { AppServerClient } from '../src/agent/codex-appserver/app-server-client';
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CodexAppServerBackend } from '../src/agent/codex-appserver/backend';
+import { writeNodeExecutable } from './helpers/node-executable';
 import {
   refillWarmPool,
   shutdownResidentClients,
@@ -15,7 +16,7 @@ import {
 // M-2（research/08 probe 思路的单测化）：utility client 复用/出错即重建 + 容量 1
 // 预热池（取走异步补位、bin 指纹防升级错位、预热通知不漏进会话流）。真机基准
 // （spawn/init/thread-start 计时、interrupt 终态）见 test/probe-appserver.mjs。
-// 假 codex app-server 同既有 fixture 套路：POSIX shebang 脚本，Windows 整组跳过。
+// 假 codex app-server 在所有平台通过真实可执行入口运行。
 const FAKE_SERVER = `#!/usr/bin/env node
 require('fs').appendFileSync(__filename + '.count', 'run\\n');
 let buf = '';
@@ -63,13 +64,12 @@ let prevEnv: string | undefined;
 function makeFakeCodex(): { bin: string; runs: () => number } {
   const dir = mkdtempSync(join(tmpdir(), 'appserver-pool-'));
   dirs.push(dir);
-  const bin = join(dir, 'codex');
-  writeFileSync(bin, FAKE_SERVER, { mode: 0o755 });
+  const { bin, script } = writeNodeExecutable(dir, 'codex', FAKE_SERVER);
   prevEnv = process.env.CODEX_BIN;
   process.env.CODEX_BIN = bin;
   const runs = (): number => {
     try {
-      return readFileSync(`${bin}.count`, 'utf8').trim().split('\n').filter(Boolean).length;
+      return readFileSync(`${script}.count`, 'utf8').trim().split('\n').filter(Boolean).length;
     } catch {
       return 0;
     }
@@ -84,7 +84,7 @@ afterEach(async () => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-describe.skipIf(process.platform === 'win32')('utility client 复用与出错即重建（M-2）', () => {
+describe('utility client 复用与出错即重建（M-2）', () => {
   it('listModels/listThreads/readHistory 共享一个常驻进程，只 spawn 一次', async () => {
     const { runs } = makeFakeCodex();
     const backend = new CodexAppServerBackend();
@@ -145,7 +145,7 @@ describe.skipIf(process.platform === 'win32')('utility client 复用与出错即
   });
 });
 
-describe.skipIf(process.platform === 'win32')('容量 1 预热池（M-2）', () => {
+describe('容量 1 预热池（M-2）', () => {
   it('补位→取走命中；池清空后再取扑空', async () => {
     const { bin, runs } = makeFakeCodex();
     await refillWarmPool();
@@ -179,7 +179,7 @@ describe.skipIf(process.platform === 'win32')('容量 1 预热池（M-2）', () 
     await refillWarmPool();
     expect(runs()).toBe(1);
 
-    appendFileSync(bin, '\n// upgraded\n'); // mtime+size 都变 —— 模拟原地升级
+    appendFileSync(bin, process.platform === 'win32' ? '\r\nrem upgraded\r\n' : '\n# upgraded\n'); // mtime+size 都变 —— 模拟原地升级
     expect(takeWarmClient(bin)).toBeNull();
     expect(runs()).toBe(1); // 没有偷偷用旧进程
   });
@@ -208,7 +208,7 @@ describe.skipIf(process.platform === 'win32')('容量 1 预热池（M-2）', () 
 
 it('bounds a missing RPC response without killing unrelated requests', async () => {
   const { bin } = makeFakeCodex();
-  const client = new AppServerClient({ bin, cwd: '/tmp' });
+  const client = new AppServerClient({ bin, cwd: tmpdir() });
   try {
     await client.connect();
     const hanging = client.request('hang', {}, 30);
@@ -221,11 +221,11 @@ it('bounds a missing RPC response without killing unrelated requests', async () 
 });
 
 it('classifies a locally closed request as definitely unsent', async () => {
- const client = new AppServerClient({bin:'unused',cwd:'/tmp'});
+ const client = new AppServerClient({bin:'unused',cwd:tmpdir()});
  await expect(client.request('turn/steer')).rejects.toBeInstanceOf(UnsentRequestError);
 });
 it('returning a notification iterator removes its pending read', async () => {
- const {bin} = makeFakeCodex(); const client = new AppServerClient({bin,cwd:'/tmp'});
+ const {bin} = makeFakeCodex(); const client = new AppServerClient({bin,cwd:tmpdir()});
  try {
   await client.connect();
   const abandoned = client.stream()[Symbol.asyncIterator]();

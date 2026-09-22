@@ -10,6 +10,7 @@ import {
   resolveCliBinPath,
   serviceStderrPath,
   serviceStdoutPath,
+  type ServiceDefinitionOptions,
   type ServiceStatus,
 } from './common';
 
@@ -58,12 +59,12 @@ function servicePidFile(): string {
  * minimal) + the service flag, then run the bridge with logs appended. CRLF
  * because cmd.exe is the interpreter.
  */
-export function buildLauncherCmd(): string {
+export function buildLauncherCmd(options: ServiceDefinitionOptions = {}): string {
   return [
     '@echo off',
-    `set "PATH=${process.env.PATH ?? ''}"`,
+    `set "PATH=${options.envPath ?? process.env.PATH ?? ''}"`,
     `set "${SERVICE_ENV_FLAG}=1"`,
-    `"${process.execPath}" "${resolveCliBinPath()}" run >> "${serviceStdoutPath()}" 2>> "${serviceStderrPath()}"`,
+    `"${process.execPath}" "${options.cliBinPath ?? resolveCliBinPath()}" run >> "${options.stdoutPath ?? serviceStdoutPath()}" 2>> "${options.stderrPath ?? serviceStderrPath()}"`,
     '',
   ].join('\r\n');
 }

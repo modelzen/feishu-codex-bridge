@@ -162,7 +162,9 @@ describe('click-to-get local files', () => {
     expect(rendered).not.toContain('BRIDGEFILE');
     expect(rendered).not.toContain('codex-file-citation');
     expect(rendered.match(/<font color='blue'>/g)).toHaveLength(3);
-    expect(rendered).toContain(JSON.stringify(path.replace(/_/g, '\\_')).slice(1, -1));
+    // A visible Windows separator must be escaped in Markdown, then again in JSON.
+    const markdownPath = path.replace(/\\/g, '\\\\').replace(/_/g, '\\_');
+    expect(rendered).toContain(JSON.stringify(markdownPath).slice(1, -1));
   });
 
   it('limits interactive occurrences without dropping the remaining text or creating orphan fence callbacks', async () => {

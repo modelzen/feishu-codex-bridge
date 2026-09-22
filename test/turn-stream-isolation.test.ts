@@ -1,8 +1,10 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { CodexAppServerBackend } from '../src/agent/codex-appserver/backend';
+import { shutdownResidentClients } from '../src/agent/codex-appserver/client-pool';
+import { writeNodeExecutable } from './helpers/node-executable';
 import type { AgentEvent, AgentRun, AgentThread } from '../src/agent/types';
 
 // Exercise the real JSON-RPC transport, notification queue and backend together.
@@ -58,9 +60,11 @@ readline.createInterface({input:process.stdin}).on('line', line => {
 });
 `;
 const dir = mkdtempSync(join(tmpdir(), 'turn-isolation-'));
-const bin = join(dir, 'codex');
-writeFileSync(bin, SERVER, { mode: 0o755 });
-afterAll(() => rmSync(dir, { recursive: true, force: true }));
+const { bin } = writeNodeExecutable(dir, 'codex', SERVER);
+afterAll(async () => {
+  await shutdownResidentClients();
+  rmSync(dir, { recursive: true, force: true });
+});
 
 async function withThread(fn: (thread: AgentThread) => Promise<void>): Promise<void> {
   const prev = process.env.CODEX_BIN;
@@ -81,7 +85,7 @@ async function collect(run: AgentRun): Promise<AgentEvent[]> {
   return events;
 }
 
-describe.skipIf(process.platform === 'win32')('ordinary turn notification isolation', () => {
+describe('ordinary turn notification isolation', () => {
   it('accepts only the response-identified host turn, including events buffered before the response', async () => {
     await withThread(async (thread) => {
       const run = thread.runStreamed({ text: 'first' });

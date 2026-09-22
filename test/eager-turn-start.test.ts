@@ -1,13 +1,14 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { CodexAppServerBackend } from '../src/agent/codex-appserver/backend';
+import { shutdownResidentClients } from '../src/agent/codex-appserver/client-pool';
+import { writeNodeExecutable } from './helpers/node-executable';
 
 // 一个最小的假 codex app-server：收到 turn/start 先落一个标记文件（证明请求
 // 已到达），再按 input 文本分流——'fail' 回 JSON-RPC error（测 start-failure
 // race），其余立即吐完整轮事件（测早发 + AsyncQueue 缓冲不丢）。
-// POSIX shebang 脚本，Windows 跳过（被测代码本身是平台无关的状态机）。
 const FAKE_SERVER = `#!/usr/bin/env node
 const fs = require('fs');
 let buf = '';
@@ -43,8 +44,7 @@ setInterval(() => {}, 1 << 30); // stay alive until killed
 `;
 
 const dir = mkdtempSync(join(tmpdir(), 'eager-turn-start-'));
-const bin = join(dir, 'codex');
-writeFileSync(bin, FAKE_SERVER, { mode: 0o755 });
+const { bin } = writeNodeExecutable(dir, 'codex', FAKE_SERVER);
 const marker = join(dir, 'turn-start-received');
 
 async function withFakeCodex<T>(fn: () => Promise<T>): Promise<T> {
@@ -58,11 +58,12 @@ async function withFakeCodex<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-afterAll(() => {
+afterAll(async () => {
+  await shutdownResidentClients();
   rmSync(dir, { recursive: true, force: true });
 });
 
-describe.skipIf(process.platform === 'win32')('runStreamed 提前发 turn/start（QW-1）', () => {
+describe('runStreamed 提前发 turn/start（QW-1）', () => {
   it('issues turn/start at runStreamed() call time; pre-consumption notifications buffer losslessly', async () => {
     await withFakeCodex(async () => {
       const backend = new CodexAppServerBackend();

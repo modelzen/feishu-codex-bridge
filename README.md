@@ -174,6 +174,8 @@ npm test            # vitest
 
 `git clone https://github.com/modelzen/feishu-codex-bridge.git && cd feishu-codex-bridge && npm i`（`prepare` 自动构建），前台跑 `npm start`。架构与实现见 [`docs/design/feishu-codex-bridge-design.md`](docs/design/feishu-codex-bridge-design.md) 与 [`docs/design/implementation-plan.md`](docs/design/implementation-plan.md)。
 
+每个 PR 自动在 **macOS / Windows / Linux × Node 20 / 22 / 24** 上检查类型、构建并运行测试。Node 24 任务还执行隔离的系统服务启动测试；不需要飞书凭据或模型账号。测试覆盖范围、虚拟机验收步骤及本地运行方式见 [跨平台验证指南](docs/testing/cross-platform-ci.md)。
+
 ---
 
 ## 💬 文档 & 交流

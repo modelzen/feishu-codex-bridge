@@ -1,4 +1,5 @@
-import { mkdtemp } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -28,7 +29,9 @@ import { sendManagedCard } from '../src/card/managed';
 describe('cli bridge ipc', () => {
   it('accepts a hook message and returns a response', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'fcb-ipc-'));
-    const socketPath = join(dir, 'sock');
+    const socketPath = process.platform === 'win32'
+      ? `\\\\.\\pipe\\fcb-ipc-test-${randomUUID()}`
+      : join(dir, 'sock');
     const server = await startCliBridgeIpcServer({
       socketPath,
       handleMessage: async (msg) => ({ decision: msg.source === 'codex' ? 'allow' : 'fallback_local' }),
@@ -46,6 +49,7 @@ describe('cli bridge ipc', () => {
       expect(response).toEqual({ decision: 'allow' });
     } finally {
       await server.close();
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

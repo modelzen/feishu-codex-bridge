@@ -8,6 +8,7 @@ import {
   resolveCliBinPath,
   serviceStderrPath,
   serviceStdoutPath,
+  type ServiceDefinitionOptions,
   type ServiceStatus,
 } from './common';
 
@@ -37,11 +38,11 @@ function systemdUnitPath(): string {
  * `logs` works uniformly; PATH baked in so child tools (codex, lark-cli) resolve
  * under the minimal systemd environment.
  */
-export function buildUnit(): string {
+export function buildUnit(options: ServiceDefinitionOptions = {}): string {
   const esc = (s: string): string => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   const nodePath = process.execPath;
-  const cliBinPath = resolveCliBinPath();
-  const pathEnv = process.env.PATH ?? '';
+  const cliBinPath = options.cliBinPath ?? resolveCliBinPath();
+  const pathEnv = options.envPath ?? process.env.PATH ?? '';
   return `[Unit]
 Description=feishu-codex-bridge bot
 After=network-online.target
@@ -52,8 +53,8 @@ Type=simple
 ExecStart="${esc(nodePath)}" "${esc(cliBinPath)}" run
 Restart=always
 RestartSec=5
-StandardOutput=append:${serviceStdoutPath()}
-StandardError=append:${serviceStderrPath()}
+StandardOutput=append:${options.stdoutPath ?? serviceStdoutPath()}
+StandardError=append:${options.stderrPath ?? serviceStderrPath()}
 Environment="PATH=${esc(pathEnv)}"
 
 [Install]

@@ -81,7 +81,12 @@ describe('cli bridge config helpers', () => {
 });
 
 describe('cli bridge paths', () => {
-  it('keeps cli bridge runtime files under the current bot directory', () => {
-    expect(paths.cliBridgeSocket.endsWith('/cli-bridge.sock')).toBe(true);
+  it('uses a bot-scoped native IPC endpoint', () => {
+    if (process.platform === 'win32') {
+      expect(paths.cliBridgeSocket.startsWith('\\\\.\\pipe\\feishu-cli-bridge-')).toBe(true);
+      expect(paths.cliBridgeSocket.slice(-16)).toMatch(/^[a-f0-9]{16}$/);
+    } else {
+      expect(paths.cliBridgeSocket.endsWith('/cli-bridge.sock')).toBe(true);
+    }
   });
 });

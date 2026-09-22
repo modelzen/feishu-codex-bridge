@@ -66,12 +66,16 @@ describe('acquireSingleInstanceLock 协议逻辑', () => {
     }
   });
 
-  it('pid 复用缓解：pid 活着但比 startedAt 晚启动 → 按残留锁接管（不误拒）', async () => {
+  it('pid 复用：POSIX 接管晚启动的进程，Windows 缺少启动时间时保守拒绝', async () => {
     const child = spawnSleeper();
     try {
       // 记录声称三天前就启动了，而这个 pid 的进程刚出生 → 必是复用 pid 的无关进程
       writeFileSync(file, rec(child.pid!, 'app_a', Date.now() - 3 * 86_400_000));
-      expect(() => acquireSingleInstanceLock('app_a', file)()).not.toThrow();
+      if (process.platform === 'win32') {
+        expect(() => acquireSingleInstanceLock('app_a', file)).toThrow(BridgeAlreadyRunningError);
+      } else {
+        expect(() => acquireSingleInstanceLock('app_a', file)()).not.toThrow();
+      }
     } finally {
       child.kill('SIGKILL');
       await waitExit(child);

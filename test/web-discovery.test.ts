@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -54,9 +54,10 @@ describe('web 控制台发现文件（daemon ↔ `web` 命令的接头）', () =
     expect(readWebConsole(mine)).toBeUndefined();
 
     const theirs = join(dir, 'theirs.json');
-    // 伪造「另一个 daemon」写的记录（pid=1 恒活：launchd/init）
-    writeFileSync(theirs, JSON.stringify({ port: 7866, token: 't2', pid: 1, startedAt: 1 }));
+    // This tests ownership-based deletion, not whether an OS-specific PID is alive.
+    const other = { port: 7866, token: 't2', pid: process.pid + 1, startedAt: 1 };
+    writeFileSync(theirs, JSON.stringify(other));
     clearWebConsole(theirs);
-    expect(readWebConsole(theirs)?.token).toBe('t2'); // 没被误删
+    expect(JSON.parse(readFileSync(theirs, 'utf8'))).toEqual(other); // 没被误删
   });
 });

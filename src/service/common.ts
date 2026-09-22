@@ -27,6 +27,16 @@ export interface ServiceStatus {
   raw: string;
 }
 
+/** Pure definition-builder inputs; defaults still target the installed bridge.
+ * Native smoke tests supply an isolated worker and temporary log files without
+ * registering or starting the user's bridge service. */
+export interface ServiceDefinitionOptions {
+  cliBinPath?: string;
+  stdoutPath?: string;
+  stderrPath?: string;
+  envPath?: string;
+}
+
 /** Service log files live under the app dir, identical across platforms. */
 export function serviceStdoutPath(): string {
   return join(paths.appDir, 'service.log');

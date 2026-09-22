@@ -1,13 +1,14 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { CodexAppServerBackend } from '../src/agent/codex-appserver/backend';
+import { shutdownResidentClients } from '../src/agent/codex-appserver/client-pool';
+import { writeNodeExecutable } from './helpers/node-executable';
 
 // 一个最小的假 codex app-server：应答 initialize / thread/start；收到 turn/start
 // 后只持续发 event-map 映射为 null 的原始通知（命令输出 delta），永不发可映射
 // 事件——模拟「长命令一直在输出、卡片层却看不到任何 yield」的场景（QW-5）。
-// POSIX shebang 脚本，Windows 跳过（被测代码本身是平台无关的状态机）。
 const FAKE_SERVER = `#!/usr/bin/env node
 let buf = '';
 const send = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
@@ -35,14 +36,14 @@ setInterval(() => {}, 1 << 30); // stay alive until killed
 `;
 
 const dir = mkdtempSync(join(tmpdir(), 'run-liveness-'));
-const bin = join(dir, 'codex');
-writeFileSync(bin, FAKE_SERVER, { mode: 0o755 });
+const { bin } = writeNodeExecutable(dir, 'codex', FAKE_SERVER);
 
-afterAll(() => {
+afterAll(async () => {
+  await shutdownResidentClients();
   rmSync(dir, { recursive: true, force: true });
 });
 
-describe.skipIf(process.platform === 'win32')('runStreamed 原始通知刷新 lastActivity（QW-5）', () => {
+describe('runStreamed 原始通知刷新 lastActivity（QW-5）', () => {
   it('unmapped raw notifications advance run.lastActivity() while the stream yields nothing', async () => {
     const prev = process.env.CODEX_BIN;
     process.env.CODEX_BIN = bin;
