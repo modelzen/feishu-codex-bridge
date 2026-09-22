@@ -198,36 +198,36 @@ function buttons(node: unknown, acc: RenderedButton[] = []): RenderedButton[] {
 describe('buildRunCard — goal controls', () => {
   const running = (): RunState => run([{ type: 'text_delta', itemId: 'a', delta: 'working…' }]);
 
-  it('renders a labelled blue stop control beside 结束目标 with distinct actions', () => {
+  it('renders an icon-only blue outlined stop control beside 结束目标 with distinct actions', () => {
     const btns = buttons(buildRunCard({ rs: running(), cardKey: 'g1', goalControls: true }));
     expect(btns).toHaveLength(2);
     const stop = btns.find((b) => b.a === RC.stop);
     const end = btns.find((b) => b.a === RC.endGoal);
     expect(stop).toMatchObject({
-      label: '停止',
+      label: undefined,
       m: 'g1',
-      type: 'primary_filled',
+      type: 'primary',
       size: 'medium',
       width: 'default',
       icon: 'stop-record_filled',
-      iconColor: 'white',
+      iconColor: 'blue',
       tooltip: '立即停止并结束目标',
     });
     expect(end).toMatchObject({ label: '🎯 结束目标', m: 'g1' });
   });
 
-  it('renders an icon-only blue stop control on an ordinary run card', () => {
+  it('renders an icon-only blue outlined stop control on an ordinary run card', () => {
     const btns = buttons(buildRunCard({ rs: running(), cardKey: 'm1' }));
     expect(btns).toHaveLength(1);
     expect(btns[0]).toEqual({
       label: undefined,
       a: RC.stop,
       m: 'm1',
-      type: 'primary_filled',
+      type: 'primary',
       size: 'medium',
       width: 'default',
       icon: 'stop-record_filled',
-      iconColor: 'white',
+      iconColor: 'blue',
       tooltip: '停止生成',
     });
   });
@@ -243,8 +243,9 @@ describe('buildRunCard — goal controls', () => {
     expect(btns[0]).toMatchObject({
       label: undefined,
       a: RC.stop,
-      type: 'primary_filled',
+      type: 'primary',
       icon: 'stop-record_filled',
+      iconColor: 'blue',
       tooltip: '停止生成',
     });
     expect(JSON.stringify(card)).toContain('目标已解除');

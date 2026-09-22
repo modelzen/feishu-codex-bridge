@@ -56,33 +56,25 @@ export const CONTROLS_EID = 'controls';
 
 const PROCESS_COMPONENT_BUDGET = 120;
 
-type StopControlPresentation = 'single' | 'with-peer' | 'goal-with-peer' | 'queue';
+type StopControlPresentation = 'run' | 'goal' | 'queue';
 
 const STOP_CONTROL: Record<StopControlPresentation, {
   readonly label?: string;
-  readonly type: 'default' | 'primary_filled';
+  readonly type: 'default' | 'primary';
   readonly icon: string;
-  readonly iconColor: 'grey' | 'white';
+  readonly iconColor: 'blue' | 'grey';
   readonly tooltip: string;
 }> = {
-  single: {
-    type: 'primary_filled',
+  run: {
+    type: 'primary',
     icon: 'stop-record_filled',
-    iconColor: 'white',
+    iconColor: 'blue',
     tooltip: '停止生成',
   },
-  'with-peer': {
-    label: '停止',
-    type: 'primary_filled',
+  goal: {
+    type: 'primary',
     icon: 'stop-record_filled',
-    iconColor: 'white',
-    tooltip: '停止生成',
-  },
-  'goal-with-peer': {
-    label: '停止',
-    type: 'primary_filled',
-    icon: 'stop-record_filled',
-    iconColor: 'white',
+    iconColor: 'blue',
     tooltip: '立即停止并结束目标',
   },
   queue: {
@@ -259,14 +251,14 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
   if (rc.cardKey && rc.goalControls) {
     if (rc.goalEnding) {
       elements.push(noteMd('_🎯 目标已解除，本轮输出完成后停止_'));
-      elements.push(actions([stopControl(rc.cardKey, 'single')], CONTROLS_EID));
+      elements.push(actions([stopControl(rc.cardKey, 'run')], CONTROLS_EID));
     } else {
       // Goal: 终止 = clear goal + cut output now; 结束目标 = clear goal, let this
       // turn finish, then stop (no auto-continue). Both routed by the card's msgId.
       elements.push(
         actions(
           [
-            stopControl(rc.cardKey, 'goal-with-peer'),
+            stopControl(rc.cardKey, 'goal'),
             button('🎯 结束目标', { a: RC.endGoal, m: rc.cardKey }, 'default'),
           ],
           CONTROLS_EID,
@@ -283,7 +275,7 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
     }
     const controls: CardElement[] = [];
     if (!rc.hideStop) {
-      controls.push(stopControl(rc.cardKey, rc.completionReminder === 'available' ? 'with-peer' : 'single'));
+      controls.push(stopControl(rc.cardKey, 'run'));
     }
     if (rc.completionReminder === 'available') {
       controls.push(button('🔔 完成后提醒我', { a: RC.remind, m: rc.cardKey }, 'default'));

@@ -33,10 +33,10 @@ describe('run card controls row — CONTROLS_EID（M-4 orphan 自愈锚点）', 
     const stop = buttons(rows[0])[0];
     expect(stop?.text).toBeUndefined();
     expect(stop).toMatchObject({
-      type: 'primary_filled',
+      type: 'primary',
       size: 'medium',
       width: 'default',
-      icon: { tag: 'standard_icon', token: 'stop-record_filled', color: 'white' },
+      icon: { tag: 'standard_icon', token: 'stop-record_filled', color: 'blue' },
       hover_tips: { tag: 'plain_text', content: '停止生成' },
       behaviors: [{ type: 'callback', value: { a: 'run.stop', m: 'om_1' } }],
     });
@@ -46,8 +46,10 @@ describe('run card controls row — CONTROLS_EID（M-4 orphan 自愈锚点）', 
     const available = buildRunCard({ rs: initialState, cardKey: 'om_1', completionReminder: 'available' });
     const availableButtons = buttons(available);
     expect(availableButtons.map((b) => b.behaviors[0].value.a)).toEqual(['run.stop', 'run.remind']);
-    expect(availableButtons[0]?.text?.content).toBe('停止');
+    expect(availableButtons[0]?.text).toBeUndefined();
+    expect(availableButtons[0]?.type).toBe('primary');
     expect(availableButtons[0]?.icon?.token).toBe('stop-record_filled');
+    expect(availableButtons[0]?.icon?.color).toBe('blue');
 
     const requested = buildRunCard({ rs: initialState, cardKey: 'om_1', completionReminder: 'requested' });
     expect(buttons(requested).map((b) => b.behaviors[0].value.a)).toEqual(['run.stop']);
