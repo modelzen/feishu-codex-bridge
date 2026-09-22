@@ -326,7 +326,7 @@ describe('buildRunCard — full command visibility', () => {
     for (let i = 0; i < 5; i++) expect(json).toContain(`FULLCMD_TAIL_${i}`);
   });
 
-  it('opens the complete paginated history when a run exceeds one card', () => {
+  it('keeps a large process inside the native panel without a separate viewer action', () => {
     const events: AgentEvent[] = [];
     const cmd0 = `run ${'a'.repeat(90)} BATCHED_TAIL`;
     for (let i = 0; i < 130; i++) {
@@ -335,12 +335,13 @@ describe('buildRunCard — full command visibility', () => {
     }
     events.push({ type: 'text', itemId: 'a', text: 'FINAL' });
     events.push({ type: 'done', turnId: 'x' });
-    const card = buildRunCard({ rs: run(events), processHistoryId: 'history-130' });
+    const card = buildRunCard({ rs: run(events) });
     const json = JSON.stringify(card);
-    expect(json).toContain('run.process.open');
-    expect(json).toContain('history-130');
+    expect(json).not.toContain('run.process.');
+    expect(json).not.toContain('查看全部操作');
     expect(json).toContain('BATCHED_TAIL');
-    expect(json).not.toMatch(/未显示|已省略|已截断/);
+    for (let i = 1; i < 130; i++) expect(json).toContain(`cmd ${i}\\n`);
+    expect(json).not.toContain('项过程已省略（卡片容量限制）');
     expect(Buffer.byteLength(json, 'utf8')).toBeLessThan(28000);
   });
 });

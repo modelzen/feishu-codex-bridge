@@ -1,7 +1,3 @@
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { paths } from '../src/config/paths';
 import { UnsentRequestError } from '../src/agent/types';
 import { JsonRpcError } from '../src/agent/codex-appserver/app-server-client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -112,12 +108,7 @@ function setup(policy: 'steer' | 'queue' = 'steer') {
   orchestrator = createOrchestrator(channel as never, cfg, '/test');
   return orchestrator;
 }
-let historyDirectory: string;
-let restoreHistorySpies: () => void;
-beforeEach(async () => {
-  historyDirectory = await mkdtemp(join(tmpdir(), 'bridge-process-lifecycle-'));
-  const pathSpy = vi.spyOn(paths, 'processHistoryDir', 'get').mockReturnValue(historyDirectory);
-  restoreHistorySpies = () => pathSpy.mockRestore();
+beforeEach(() => {
   vi.clearAllMocks();
   fake.groupMode = 'single';
   fake.voice.mockReset().mockImplementation(async (_channel, msg) => voiceResult('语音正文', msg.messageId));
@@ -130,8 +121,6 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await orchestrator?.shutdown();
-  restoreHistorySpies();
-  await rm(historyDirectory, { recursive: true, force: true });
 });
 // Keep synchronization polling well below the injected 150ms steer deadline.
 const until = (check: () => void) => vi.waitFor(check, { interval: 5 });
@@ -514,104 +503,13 @@ it('refreshes elapsed time during silence and stops refreshing after completion'
 });
 
 
-async function savedHistories() {
-  const names = (await readdir(historyDirectory)).filter(name => name.endsWith('.json'));
-  return Promise.all(names.map(async name => JSON.parse(await readFile(join(historyDirectory, name), 'utf8'))));
-}
-
-describe('process history lifecycle', () => {
-  it('finishes history persistence before shutdown returns without starting queued follow-ups', async () => {
-    const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
-    const o = setup('queue');
-    await o.onMessage(message('first'));
-    await until(() => expect(fake.createCard).toHaveBeenCalledOnce());
-    run.emit({ type: 'tool_use', itemId: 'last-tool', title: 'echo LAST', kind: 'command' });
-    run.emit({ type: 'tool_result', itemId: 'last-tool', output: 'COMPLETE', exitCode: 0 });
-    await until(() => expect(JSON.stringify(fake.live.mock.calls)).toContain('COMPLETE'));
-    await o.onMessage(message('queued follow-up'));
-    await o.shutdown();
-    const histories = await savedHistories();
-    expect(histories).toHaveLength(1);
-    expect(histories[0].blocks[0].tool).toMatchObject({ title: 'echo LAST', output: 'COMPLETE', status: 'done' });
-    expect(run.consumed).toHaveLength(1);
-  });
-
-  it('persists every operation, full long command and output tail without duplicating repeated tool events', async () => {
-    const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
-    fake.createCard.mockResolvedValue('ordinary-card');
-    const o = setup();
-    await o.onMessage(message('inspect all operations'));
-    await until(() => expect(fake.createCard).toHaveBeenCalledOnce());
-    const commands = Array.from({ length: 35 }, (_, index) => `printf 'command-${index} ${'x'.repeat(900)} END-${index}'`);
-    commands.forEach((title, index) => {
-      const event = { type: 'tool_use', itemId: `operation-${index}`, title, kind: 'command' } as const;
-      run.emit(event); run.emit(event);
-      run.emit({ type: 'tool_result', itemId: event.itemId, output: `${'output'.repeat(index === 34 ? 3000 : 1)} TAIL-${index}`, exitCode: 0 });
-    });
-    run.turns[0]!.resolve();
-    await vi.waitFor(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()), { timeout: 10000, interval: 10 });
-    const histories = await savedHistories();
-    expect(histories).toHaveLength(1);
-    expect(histories[0].context).toMatchObject({ messageId: 'ordinary-card', chatId: 'chat', cwd: '/test', requesterOpenId: 'owner' });
-    expect(histories[0].blocks.map((block: { tool: { title: string } }) => block.tool.title)).toEqual(commands);
-    expect(histories[0].blocks.at(-1).tool).toMatchObject({ status: 'done', output: `${'output'.repeat(3000)} TAIL-34` });
-  });
-
-  it('binds steer history to each source card and keeps completed operations in their original segment', async () => {
-    const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
-    fake.createCard.mockResolvedValueOnce('before-steer').mockResolvedValueOnce('after-steer');
-    const o = setup();
-    await o.onMessage(message('first'));
-    await until(() => expect(fake.createCard).toHaveBeenCalledOnce());
-    run.emit({ type: 'tool_use', itemId: 'before', title: 'echo BEFORE', kind: 'command' });
-    run.emit({ type: 'tool_result', itemId: 'before', output: 'BEFORE', exitCode: 0 });
-    await until(() => expect(JSON.stringify(fake.live.mock.calls)).toContain('echo BEFORE'));
-    await o.onMessage(message('follow-up'));
-    await until(() => expect(fake.createCard).toHaveBeenCalledTimes(2));
-    run.emit({ type: 'tool_use', itemId: 'after', title: 'echo AFTER', kind: 'command' });
-    run.emit({ type: 'tool_result', itemId: 'after', output: 'AFTER', exitCode: 0 });
-    run.turns[0]!.resolve();
-    await vi.waitFor(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()), { timeout: 10000, interval: 10 });
-    const histories = await savedHistories();
-    expect(histories).toHaveLength(2);
-    expect(histories.find(record => record.context.messageId === 'before-steer')?.blocks).toEqual([
-      { kind: 'tool', tool: { id: 'before', title: 'echo BEFORE', kind: 'command', status: 'done', output: 'BEFORE', exitCode: 0 } },
-    ]);
-    expect(histories.find(record => record.context.messageId === 'after-steer')?.blocks).toEqual([
-      { kind: 'tool', tool: { id: 'after', title: 'echo AFTER', kind: 'command', status: 'done', output: 'AFTER', exitCode: 0 } },
-    ]);
-    expect(run.consumed).toHaveLength(1);
-  });
-});
-
-it('flushes separate complete snapshots for each goal turn', async () => {
-  const run = thread();
-  const goalThread = {
-    ...run.t,
-    runGoal: vi.fn((objective: string) => run.t.runStreamed({ text: objective })),
-    clearGoal: vi.fn(async () => undefined),
-  };
-  fake.backend.resumeThread.mockResolvedValue(goalThread);
-  fake.createCard.mockResolvedValueOnce('goal-first').mockResolvedValueOnce('goal-second');
-  const o = setup();
-  await o.onMessage(message('/goal inspect two steps'));
-  await until(() => expect(goalThread.runGoal).toHaveBeenCalledOnce());
-  run.emit({ type: 'tool_use', itemId: 'goal-operation-1', title: 'echo FIRST', kind: 'command' });
-  run.emit({ type: 'tool_result', itemId: 'goal-operation-1', output: 'FIRST COMPLETE', exitCode: 0 });
-  run.emit({ type: 'done', turnId: 'turn-1' });
-  run.emit({ type: 'turn_started', turnId: 'turn-2' });
-  run.emit({ type: 'tool_use', itemId: 'goal-operation-2', title: 'echo SECOND', kind: 'command' });
-  run.emit({ type: 'tool_result', itemId: 'goal-operation-2', output: 'SECOND COMPLETE', exitCode: 0 });
-  run.emit({ type: 'done', turnId: 'turn-2' });
-  run.turns[0]!.resolve();
-  await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'goal-final', expect.anything()));
-  const histories = await savedHistories();
-  expect(histories).toHaveLength(2);
-  expect(histories.find(record => record.context.messageId === 'goal-first')?.blocks).toEqual([
-    { kind: 'tool', tool: { id: 'goal-operation-1', title: 'echo FIRST', kind: 'command', status: 'done', output: 'FIRST COMPLETE', exitCode: 0 } },
-  ]);
-  expect(histories.find(record => record.context.messageId === 'goal-second')?.blocks).toEqual([
-    { kind: 'tool', tool: { id: 'goal-operation-2', title: 'echo SECOND', kind: 'command', status: 'done', output: 'SECOND COMPLETE', exitCode: 0 } },
-  ]);
-  expect(goalThread.clearGoal).toHaveBeenCalledOnce();
+it('does not start queued follow-ups while shutdown closes an active run', async () => {
+  const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
+  const o = setup('queue');
+  await o.onMessage(message('first'));
+  await until(() => expect(fake.createCard).toHaveBeenCalledOnce());
+  await o.onMessage(message('queued follow-up'));
+  await o.shutdown();
+  expect(run.consumed).toHaveLength(1);
+  expect(run.t.close).toHaveBeenCalled();
 });
