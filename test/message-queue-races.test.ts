@@ -491,15 +491,33 @@ it('buffers output and completion while the new steer card is being created', as
 
 
 it('refreshes elapsed time during silence and stops refreshing after completion', async () => {
-  const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t); const o = setup();
-  await o.onMessage(message('first')); await until(() => expect(fake.createCard).toHaveBeenCalledOnce());
-  await vi.waitFor(() => expect(JSON.stringify(fake.live.mock.calls.at(-1)![1])).toContain('已处理 1秒'), { timeout: 1500, interval: 20 });
-  run.turns[0]!.resolve();
-  await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()));
-  expect(JSON.stringify(fake.final.mock.calls.at(-1)![1])).toContain('用时 1秒');
-  const writes = fake.live.mock.calls.length;
-  await new Promise(resolve => setTimeout(resolve, 1100));
-  expect(fake.live).toHaveBeenCalledTimes(writes);
+  vi.useFakeTimers({ now: new Date('2026-01-01T00:00:00Z') });
+  try {
+    const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t); const o = setup();
+    const idleTimers = vi.getTimerCount();
+    await o.onMessage(message('first'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.createCard).toHaveBeenCalledOnce();
+    expect(run.consumed).toHaveLength(1);
+    const initialWrites = fake.live.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fake.live).toHaveBeenCalledTimes(initialWrites + 1);
+    expect(JSON.stringify(fake.live.mock.calls.at(-1)![1])).toContain('已处理 1秒');
+    run.turns[0]!.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything());
+    expect(JSON.stringify(fake.final.mock.calls.at(-1)![1])).toContain('用时 1秒');
+    expect(vi.getTimerCount()).toBe(idleTimers);
+    const writes = fake.live.mock.calls.length;
+    const finalWrites = fake.final.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(fake.live).toHaveBeenCalledTimes(writes);
+    expect(fake.final).toHaveBeenCalledTimes(finalWrites);
+    expect(JSON.stringify(fake.final.mock.calls.at(-1)![1])).toContain('用时 1秒');
+  } finally {
+    await orchestrator.shutdown();
+    vi.useRealTimers();
+  }
 });
 
 
