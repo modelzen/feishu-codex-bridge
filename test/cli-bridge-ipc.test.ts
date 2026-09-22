@@ -1,4 +1,5 @@
-import { mkdtemp, stat } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import net from 'node:net';
@@ -17,8 +18,7 @@ const sampleMsg: CliHookMessage = {
 };
 
 describe('cli bridge ipc resilience', () => {
-  it('restricts Unix socket permissions to the current user', async () => {
-    if (process.platform === 'win32') return;
+  it.skipIf(process.platform === 'win32')('restricts Unix socket permissions to the current user', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'fcb-ipc-mode-'));
     const socketPath = join(dir, 'sock');
     const server = await startCliBridgeIpcServer({
@@ -29,6 +29,7 @@ describe('cli bridge ipc resilience', () => {
       expect((await stat(socketPath)).mode & 0o777).toBe(0o600);
     } finally {
       await server.close();
+      await rm(dir, { recursive: true, force: true });
     }
   });
 
@@ -39,7 +40,9 @@ describe('cli bridge ipc resilience', () => {
   // while a connection is still held open inside handleMessage.
   it('survives a client that disconnects mid-wait and still closes promptly', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'fcb-ipc-res-'));
-    const socketPath = join(dir, 'sock');
+    const socketPath = process.platform === 'win32'
+      ? `\\\\.\\pipe\\fcb-ipc-test-${randomUUID()}`
+      : join(dir, 'sock');
 
     let releaseHandler = (): void => {};
     const blocked = new Promise<void>((resolve) => {
@@ -60,20 +63,25 @@ describe('cli bridge ipc resilience', () => {
     });
 
     const client = net.createConnection(socketPath);
-    await new Promise<void>((resolve, reject) => {
-      client.once('connect', resolve);
-      client.once('error', reject);
-    });
-    // Swallow the inevitable ECONNRESET on the client side after we destroy it.
-    client.on('error', () => undefined);
-    client.write(JSON.stringify(sampleMsg) + '\n');
+    try {
+      await new Promise<void>((resolve, reject) => {
+        client.once('connect', resolve);
+        client.once('error', reject);
+      });
+      // Swallow the inevitable ECONNRESET on the client side after we destroy it.
+      client.on('error', () => undefined);
+      client.write(JSON.stringify(sampleMsg) + '\n');
 
-    await entered; // the server is now blocked inside handleMessage, socket held open
-    client.destroy(); // abrupt disconnect during the pending wait — must not crash
+      await entered; // the server is now blocked inside handleMessage, socket held open
+      client.destroy(); // abrupt disconnect during the pending wait — must not crash
 
-    // close() must resolve even though a handler is still blocked on that socket.
-    await expect(server.close()).resolves.toBeUndefined();
-
-    releaseHandler();
+      // close() must resolve even though a handler is still blocked on that socket.
+      await expect(server.close()).resolves.toBeUndefined();
+    } finally {
+      releaseHandler();
+      client.destroy();
+      await server.close();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

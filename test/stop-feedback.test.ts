@@ -14,6 +14,16 @@ function byEid(node: unknown, eid: string, acc: Record<string, any>[] = []): Rec
   return acc;
 }
 
+function buttons(node: unknown, acc: Record<string, any>[] = []): Record<string, any>[] {
+  if (Array.isArray(node)) node.forEach((n) => buttons(n, acc));
+  else if (node && typeof node === 'object') {
+    const o = node as Record<string, any>;
+    if (o.tag === 'button') acc.push(o);
+    for (const k of Object.keys(o)) buttons(o[k], acc);
+  }
+  return acc;
+}
+
 // M-4 ⏹ 静默失败反馈：orphan 卡点击自愈靠「按 element_id 删掉控件行」——
 // 控件行必须带稳定的 CONTROLS_EID，且只出现在有按钮的版式上。
 describe('run card controls row — CONTROLS_EID（M-4 orphan 自愈锚点）', () => {
@@ -21,6 +31,28 @@ describe('run card controls row — CONTROLS_EID（M-4 orphan 自愈锚点）', 
     const rows = byEid(buildRunCard({ rs: initialState, cardKey: 'om_1' }), CONTROLS_EID);
     expect(rows).toHaveLength(1);
     expect(JSON.stringify(rows[0])).toContain('⏹ 终止');
+  });
+
+  it('manual mode adds one-shot remind; requested state becomes a note; automatic modes expose neither', () => {
+    const available = buildRunCard({ rs: initialState, cardKey: 'om_1', completionReminder: 'available' });
+    expect(buttons(available).map((b) => b.behaviors[0].value.a)).toEqual(['run.stop', 'run.remind']);
+
+    const requested = buildRunCard({ rs: initialState, cardKey: 'om_1', completionReminder: 'requested' });
+    expect(buttons(requested).map((b) => b.behaviors[0].value.a)).toEqual(['run.stop']);
+    expect(JSON.stringify(requested)).toContain('本轮结束后会提醒发起人');
+
+    const automatic = buildRunCard({ rs: initialState, cardKey: 'om_1' });
+    expect(buttons(automatic).map((b) => b.behaviors[0].value.a)).toEqual(['run.stop']);
+  });
+
+  it('goal cards never expose the ordinary completion-reminder button', () => {
+    const goal = buildRunCard({
+      rs: initialState,
+      cardKey: 'om_1',
+      goalControls: true,
+      completionReminder: 'available',
+    });
+    expect(JSON.stringify(goal)).not.toContain('完成后提醒我');
   });
 
   it('goal cards (both layouts) anchor their controls with CONTROLS_EID', () => {

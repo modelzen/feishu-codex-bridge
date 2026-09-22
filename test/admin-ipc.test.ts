@@ -28,8 +28,15 @@ describe('admin IPC · 请求/响应关联', () => {
       return op.kind === 'status' ? { connection: 'connected' } : { done: true };
     });
     expect(await caller.call({ kind: 'setNoMention', project: 'demo', on: true })).toEqual({ done: true });
+    expect(await caller.call({ kind: 'setCompletionReminder', mode: 'failures', longTaskMinutes: 3 })).toEqual({
+      done: true,
+    });
     expect(await caller.call({ kind: 'status' })).toEqual({ connection: 'connected' });
-    expect(seen).toEqual([{ kind: 'setNoMention', project: 'demo', on: true }, { kind: 'status' }]);
+    expect(seen).toEqual([
+      { kind: 'setNoMention', project: 'demo', on: true },
+      { kind: 'setCompletionReminder', mode: 'failures', longTaskMinutes: 3 },
+      { kind: 'status' },
+    ]);
   });
 
   it('并发请求按 id 各回各家（乱序响应不串台）', async () => {

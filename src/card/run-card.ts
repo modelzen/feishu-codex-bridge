@@ -1,3 +1,5 @@
+import type { VoiceReply } from '../voice/types';
+import { voiceReplyElements } from './voice-reply';
 import {
   actions,
   button,
@@ -20,7 +22,12 @@ import {
   type Terminal,
   type ToolEntry,
 } from './run-state';
+import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { renderRichText } from './markdown-render';
+import { fileComponentCount, renderFileAnswer, type InlineFiles } from './inline-files';
+import { hasMarkdownTable, renderReport } from './report-render';
+import { StreamingImages } from './outbound-images';
+import type { RunCardStream } from './run-card-stream';
 import { toolBodyMd, toolHeaderText, toolSummaryLine } from './tool-render';
 import { runCardGauge } from './context-gauge';
 
@@ -32,6 +39,8 @@ function gaugeEl(state: RunState): CardElement | null {
 /** Action ids for the in-topic run card. */
 export const RC = {
   stop: 'run.stop',
+  /** manual completion-reminder mode: notify this turn's requester when it ends. */
+  remind: 'run.remind',
   /** goal-only: clear the goal but let the in-flight turn finish (no auto-continue). */
   endGoal: 'goal.end',
 } as const;
@@ -85,6 +94,8 @@ const SUMMARY_BODY_MAX = 6000;
 /** Routing + render inputs for one run card. */
 export interface RunCardState {
   rs: RunState;
+  /** Independent of model text, preserved across live and terminal renders. */
+  voiceMessages?: VoiceReply[];
   /** identity for ⏹ stop routing (the card's own messageId) */
   cardKey?: string;
   /** topic thread id (known after the topic is created) */
@@ -106,15 +117,68 @@ export interface RunCardState {
   modelOnTerminal?: boolean;
   /** suppress the ⏹ 终止 button (used by non-goal cards that opt out of stop). */
   hideStop?: boolean;
+  /** Present only in the global `manual` reminder mode. `available` renders the
+   * one-shot “完成后提醒我” button; `requested` replaces it with a visible
+   * confirmation. Non-manual modes leave this unset and therefore never expose
+   * the per-turn button. */
+  completionReminder?: 'available' | 'requested';
   /** goal run cards: show TWO controls — `⏹ 终止` (clear goal + cut output now)
    * and `🎯 结束目标` (clear goal, let the current turn finish, then stop). */
   goalControls?: boolean;
   /** goal run cards, after 🎯 结束目标 was tapped: the goal is cleared and this
    * turn is finishing — drop the 结束目标 button (keep ⏹ 终止) and show a notice. */
   goalEnding?: boolean;
-  /** `![](src) → image_key` for the final answer's images (populated at terminal
-   * after upload; absent while streaming, so refs show as text until then). */
+  /** `![](src) → image_key`, filled in by the turn's background uploader
+   * ({@link ./outbound-images}.StreamingImages) as each ref resolves — so a
+   * running card swaps its placeholder for a real `img` element mid-stream, and
+   * the terminal card shows every image that made it. An unresolved ref renders
+   * as text, never as raw `![](…)` markdown (see {@link renderRichText}). */
   images?: ReadonlyMap<string, string>;
+  /** Prepared at terminal, before rendering can discard local link targets. */
+  localFiles?: InlineFiles;
+}
+
+/**
+ * Wire a turn's background image uploader onto its run card.
+ *
+ * Two things have to happen together, and forgetting the first is invisible at
+ * the terminal frame but glaring mid-turn:
+ *
+ *  1. `rc.images` must point at the worker's live map. The worker mutates that
+ *     one map in place, so `buildRunCard(rc)` sees each `src → image_key` the
+ *     moment it lands. Without it every repaint still renders the unresolved
+ *     placeholder `🖼️ x.jpg（图片处理中…）`, and the picture only shows up in the
+ *     terminal frame — i.e. the running card looks stuck even though the uploads
+ *     all succeeded.
+ *  2. A resolved key repaints the LIVE card ({@link RunCardStream.updateLiveCard}),
+ *     which no-ops once the turn has been finalized, so a late upload can't fight
+ *     the terminal frame.
+ *
+ * Lives next to {@link buildRunCard} because that is what it repaints with; the
+ * uploader itself ({@link ./outbound-images}.StreamingImages) is injectable so a
+ * test can drive this without a network or a codex process.
+ */
+export function attachRunImages(opts: {
+  stream: Pick<RunCardStream, 'setImageWorker' | 'updateLiveCard'>;
+  rc: RunCardState;
+  channel: LarkChannel;
+  /** `src[] → image_key`. Injected so this wiring is testable without a network;
+   * production passes `(s) => uploadOutboundImages(channel, s, runCwd, mode)`
+   * (see {@link ./outbound-images}). */
+  upload: (sources: string[]) => Promise<Map<string, string>>;
+}): StreamingImages {
+  const { stream, rc, channel, upload } = opts;
+  const worker = new StreamingImages(upload, () => {
+    // The map is mutated in place, so the frame built below already carries every
+    // key that has landed — including the ones that arrived before this repaint.
+    rc.images = worker.images;
+    void stream.updateLiveCard(channel, buildRunCard(rc)).catch(() => undefined);
+  });
+  // Point at the live map up-front too: any frame built from here on sees keys as
+  // they arrive, without waiting for a repaint.
+  rc.images = worker.images;
+  stream.setImageWorker(worker, () => runningAnswerText(rc.rs));
+  return worker;
 }
 
 /**
@@ -122,7 +186,7 @@ export interface RunCardState {
  * calls as collapsible panels; text streams in order). Modeled on
  * zara/feishu-claude-code-bridge `src/card/run-renderer.ts`. While running, each
  * whole-card update instantly shows the current full text (no typewriter — see
- * the streaming_mode note in {@link ../card/cards}); growth tracks the model in
+ * the streaming_mode note in {@link ./cards}); growth tracks the model in
  * throttled chunks.
  *
  * Two layouts: while RUNNING everything streams expanded (reasoning, tools and
@@ -135,18 +199,20 @@ export function buildRunCard(rc: RunCardState): CardObject {
   const state = rc.rs;
   const running = state.terminal === 'running';
   const elements = running ? renderRunning(state, rc) : renderTerminal(state, rc);
-  return card(elements, { streaming: running, summary: summaryText(state) });
+  return card([...voiceReplyElements(rc.voiceMessages), ...elements], { streaming: running, summary: summaryText(state) });
 }
 
 /**
- * Live layout: reasoning panel, tool panels, ONE streamed answer element,
- * footer (status + model), then the ⏹ controls row pinned at the BOTTOM. Text
- * blocks are concatenated into a single {@link mdStream} element
- * ({@link ANSWER_EID}) so the answer can be driven by the element-level
- * typewriter (cardElement.content) — that needs one stable, append-only text
- * element, which is incompatible with interleaving text and tool panels. Tools
- * therefore render above the answer (matching the terminal fold), not inline
- * between text runs.
+ * Live layout: reasoning panel, tool panels, the streamed answer, footer
+ * (status + model), then the ⏹ controls row pinned at the BOTTOM. Text blocks
+ * are concatenated into one answer run whose TRAILING markdown element carries
+ * {@link ANSWER_EID}, so growth is driven by the element-level typewriter
+ * (cardElement.content) — that needs one stable, append-only text element, which
+ * is incompatible with interleaving text and tool panels. Tools therefore render
+ * above the answer (matching the terminal fold), not inline between text runs.
+ * An uploaded image splits the run into `md / img / md…`; only the last segment
+ * keeps the stream id, and a mid-turn upload is a structure change (whole-card
+ * update) after which the new tail resumes streaming.
  *
  * Controls-at-bottom rationale: a reader's eye tracks the newest output, which
  * grows at the bottom, so the stop button sits right where they're looking. The
@@ -165,21 +231,24 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
 
   const showTools = rc.showTools !== false;
   const tools: ToolEntry[] = [];
-  const textParts: string[] = [];
   for (const b of state.blocks) {
     if (b.kind === 'tool') {
       if (showTools) tools.push(b.tool);
-    } else if (b.content.trim()) {
-      textParts.push(b.content);
     }
   }
   if (tools.length > 0) elements.push(...renderToolGroup(tools, false));
 
-  // Single streamed answer element. Only emitted once there's text, so its first
-  // appearance is one whole-card update that establishes the element; subsequent
-  // growth streams via cardElement.content. Stable element_id ⇒ append-only prefix.
-  const answer = textParts.join('\n\n');
-  if (answer) elements.push(mdStream(answer, ANSWER_EID));
+  // The answer: one markdown element per text run, with real `img` elements where
+  // a reference has already been uploaded. The trailing text element carries
+  // ANSWER_EID so its growth streams through the native typewriter; a ref whose
+  // upload is still in flight shows a placeholder and an incomplete `![…](path`
+  // is held back (never raw `![]()` — the client parses that as a broken image
+  // node and the card looks frozen; issue #14). The ```feishu-card fences stay
+  // visible here and are hoisted at terminal.
+  const answer = runningAnswerText(state);
+  if (answer) {
+    elements.push(...renderRichText(answer, rc.images, { streamTailId: ANSWER_EID, live: true }));
+  }
 
   // Footer: status (left) + 模型·effort footnote (right) share one row when the
   // 显示模型 pref is on; either alone falls back to a single line.
@@ -213,8 +282,20 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
         ),
       );
     }
-  } else if (rc.cardKey && !rc.hideStop) {
-    elements.push(actions([button('⏹ 终止', { a: RC.stop, m: rc.cardKey }, 'danger')], CONTROLS_EID));
+  } else if (rc.cardKey) {
+    // Ordinary turns only: the one-shot reminder is deliberately absent from
+    // goal cards (goal has its own terminal summary) and from every non-manual
+    // global strategy. Once tapped, make the state explicit instead of leaving
+    // a button that looks tappable twice.
+    if (rc.completionReminder === 'requested') {
+      elements.push(noteMd('_🔔 本轮结束后会提醒发起人_'));
+    }
+    const controls: CardElement[] = [];
+    if (!rc.hideStop) controls.push(button('⏹ 终止', { a: RC.stop, m: rc.cardKey }, 'danger'));
+    if (rc.completionReminder === 'available') {
+      controls.push(button('🔔 完成后提醒我', { a: RC.remind, m: rc.cardKey }, 'default'));
+    }
+    if (controls.length > 0) elements.push(actions(controls, CONTROLS_EID));
   }
 
   return elements;
@@ -232,14 +313,18 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
   const elements: CardElement[] = [];
 
   const answerIdx = lastTextIndex(state.blocks);
-  const answer = answerIdx >= 0 ? (state.blocks[answerIdx] as Extract<Block, { kind: 'text' }>).content.trim() : '';
+  const answer = rc.localFiles?.text ?? (answerIdx >= 0 ? (state.blocks[answerIdx] as Extract<Block, { kind: 'text' }>).content.trim() : '');
+  const answerElements = rc.localFiles ? renderFileAnswer(rc.localFiles, rc.images)
+    : hasMarkdownTable(answer) ? renderReport(answer, { images: rc.images }) : renderRichText(answer, rc.images);
 
   // Everything except the final answer block is "process". (A block after the
   // answer can only be a trailing tool call — keep it folded with the rest.)
   const processBlocks = state.blocks.filter((_, i) => i !== answerIdx);
   const blocks = rc.showTools === false ? processBlocks.filter((b) => b.kind !== 'tool') : processBlocks;
   const reasoning = reasoningContent(state);
-  const processEls = buildProcessBody(reasoning, blocks);
+  const processBudget = rc.localFiles?.links.length
+    ? Math.max(10, Math.min(PROCESS_COMPONENT_BUDGET, 170 - fileComponentCount(answerElements))) : PROCESS_COMPONENT_BUDGET;
+  const processEls = buildProcessBody(reasoning, blocks, rc.images, processBudget);
   if (processEls.length > 0) {
     const toolCount = blocks.reduce((n, b) => (b.kind === 'tool' ? n + 1 : n), 0);
     elements.push(
@@ -252,10 +337,17 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
     );
   }
 
-  // Terminal answer: split out uploaded images into img elements and drop any
-  // ```feishu-card fence (it's hoisted into a standalone clean card). Streaming
-  // still renders plain md (renderRunning) — images aren't uploaded until now.
-  if (answer) elements.push(...renderRichText(answer, rc.images));
+  // Terminal answer. A reply that TABLES its data goes through the report
+  // renderer: card markdown has no tables, so `| a | b |` would otherwise show up
+  // as raw pipes, and an image written inside a table can't be rendered there at
+  // all (feishu's table nests nothing) — the report renderer hoists those to the
+  // end as image pills. Everything else is the normal markdown path: uploaded
+  // images become pills in place, and a ref that never resolved (path outside the
+  // project, missing/oversized file, failed upload) renders as text — never raw
+  // `![](…)`, which the client would resolve as a broken image node.
+  if (answer) {
+    elements.push(...answerElements);
+  }
 
   if (state.terminal === 'interrupted') {
     elements.push(noteMd('_⏹ 已被中断_'));
@@ -310,25 +402,47 @@ function lastTextIndex(blocks: Block[]): number {
 }
 
 /**
+ * The running card's answer text: every non-empty text block in order, joined —
+ * exactly what {@link renderRunning} feeds to the answer elements. The image
+ * uploader scans THIS string, so a ref starts uploading as soon as the model has
+ * written it (see {@link ../card/outbound-images}.StreamingImages).
+ */
+export function runningAnswerText(state: RunState): string {
+  const parts: string[] = [];
+  for (const b of state.blocks) {
+    if (b.kind === 'text' && b.content.trim()) parts.push(b.content);
+  }
+  return parts.join('\n\n');
+}
+
+/**
  * Body of the terminal "过程" panel. Renders reasoning + interleaved text/tool
  * groups (tools finalized). Guards the ~30KB per-element limit: if the rich body
  * (with tool-output bodies) exceeds {@link PROCESS_BODY_BUDGET}, rebuild it with
  * every tool group degraded to a header-only summary.
  */
-function buildProcessBody(reasoning: string, blocks: Block[]): CardElement[] {
-  const rich = processElements(reasoning, blocks, false);
-  if (estimateSize(rich) <= PROCESS_BODY_BUDGET && estimateComponents(rich) <= PROCESS_COMPONENT_BUDGET) {
+function buildProcessBody(reasoning: string, blocks: Block[], images?: ReadonlyMap<string, string>, componentBudget = PROCESS_COMPONENT_BUDGET): CardElement[] {
+  const rich = processElements(reasoning, blocks, false, images);
+  if (estimateSize(rich) <= PROCESS_BODY_BUDGET && estimateComponents(rich) <= componentBudget) {
     return rich;
   }
-  return processElements(reasoning, blocks, true);
+  return processElements(reasoning, blocks, true, images);
 }
 
-function processElements(reasoning: string, blocks: Block[], compactTools: boolean): CardElement[] {
+function processElements(
+  reasoning: string,
+  blocks: Block[],
+  compactTools: boolean,
+  images?: ReadonlyMap<string, string>,
+): CardElement[] {
   const out: CardElement[] = [];
   if (reasoning) out.push(reasoningPanel(reasoning, false));
   for (const group of groupBlocks(blocks)) {
     if (group.kind === 'text') {
-      if (group.content.trim()) out.push(md(group.content));
+      // Progress-message images stay visible in the folded 过程 panel (they were
+      // streamed into the live card, so dropping them at terminal would make them
+      // vanish on the user).
+      if (group.content.trim()) out.push(...renderRichText(group.content, images));
     } else {
       out.push(...renderToolGroup(group.tools, true, compactTools));
     }
@@ -383,6 +497,7 @@ export function buildRunCardPlain(rc: RunCardState): CardObject {
 
 /** Render inputs for the queue placeholder card (M-3 排队可见可取消). */
 export interface QueuedCardState {
+  voiceMessages?: VoiceReply[];
   /** 1-based position in the global run queue (waiting layout only). */
   position?: number;
   /** routes the ⏹ 取消 button (the card's own messageId); unset → no button
@@ -395,6 +510,8 @@ export interface QueuedCardState {
   /** goal runs only: slot granted — the goal's own (lazily created) run cards
    * take over, this entity is repainted into a short started note. */
   started?: boolean;
+  /** Same manual-only, per-turn reminder control as {@link RunCardState}. */
+  completionReminder?: 'available' | 'requested';
 }
 
 /**
@@ -408,16 +525,24 @@ export interface QueuedCardState {
  */
 export function buildQueuedCard(qc: QueuedCardState): CardObject {
   if (qc.cancelled) {
-    const els: CardElement[] = [noteMd('_⏹ 已取消排队_')];
+    const els: CardElement[] = [...voiceReplyElements(qc.voiceMessages), noteMd('_⏹ 已取消排队_')];
     if (qc.dropped) els.push(noteMd(`_⚠️ ${qc.dropped} 条排队消息已丢弃，请重发。_`));
     return card(els, { summary: '已取消排队' });
   }
   if (qc.started) return card([noteMd('_🎯 排队结束，目标已开始执行_')], { summary: '已开始执行' });
   const els: CardElement[] = [
+    ...voiceReplyElements(qc.voiceMessages),
     md(`⏳ 排队中（第 **${qc.position ?? 1}** 位）`),
     noteMd('全局并发池已满（所有群/话题共享），轮到后自动开始。'),
   ];
-  if (qc.cardKey) els.push(actions([button('⏹ 取消', { a: RC.stop, m: qc.cardKey }, 'danger')], CONTROLS_EID));
+  if (qc.completionReminder === 'requested') els.push(noteMd('_🔔 本轮结束后会提醒发起人_'));
+  if (qc.cardKey) {
+    const controls: CardElement[] = [button('⏹ 取消', { a: RC.stop, m: qc.cardKey }, 'danger')];
+    if (qc.completionReminder === 'available') {
+      controls.push(button('🔔 完成后提醒我', { a: RC.remind, m: qc.cardKey }, 'default'));
+    }
+    els.push(actions(controls, CONTROLS_EID));
+  }
   return card(els, { summary: '排队中' });
 }
 

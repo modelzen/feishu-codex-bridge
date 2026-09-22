@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentEvent } from '../src/agent/types';
-import { buildRunCard, RC } from '../src/card/run-card';
+import { ANSWER_EID, buildRunCard, RC } from '../src/card/run-card';
 import {
   initialState,
   markIdleTimeout,
@@ -426,5 +426,96 @@ describe('模型 · 推理强度 footnote（模型显示三档）', () => {
     expect(json).toContain('超强');
     expect(json).toContain('purple');
     expect(json).not.toContain('undefined');
+  });
+});
+
+// issue #14：`![](src)` 在飞书卡片里是「图片节点」，src 不是 image_key 就渲染成坏图，
+// 而且流式卡片会看着卡在引用处。所以运行卡：已上传的换成 img 元素、未上传的给占位、
+// 引用还没写完的按住不发；终态未解析的降级成「文字 + 反引号路径」，绝不发裸 `![]()`。
+describe('buildRunCard — 图片（issue #14）', () => {
+  const withImage = (): RunState =>
+    run([{ type: 'text_delta', itemId: 'a', delta: '预览：\n\n![拼图](video_frames/contact_sheet.jpg)' }]);
+  const withImageDone = (): RunState =>
+    run([
+      { type: 'text_delta', itemId: 'a', delta: '预览：\n\n![拼图](video_frames/contact_sheet.jpg)' },
+      { type: 'done', turnId: 't1' },
+    ]);
+  const KEYS = new Map([['video_frames/contact_sheet.jpg', 'img_v2_key']]);
+
+  it('running：已上传的引用渲染成小标签（标题 = alt），展开体是真图', () => {
+    const els = bodyEls(buildRunCard({ rs: withImage(), cardKey: 'm1', images: KEYS }));
+    const pill = els.find((e) => e.tag === 'collapsible_panel') as Record<string, any>;
+    expect(pill.header.title.content).toBe("<font color='blue'>拼图</font>"); // 链接样式：蓝字
+    expect(pill.header.width).toBe('auto_when_fold');
+    expect(pill.expanded).toBe(false);
+    expect(pill.elements[0]).toMatchObject({ tag: 'img', img_key: 'img_v2_key', mode: 'fit_horizontal', preview: true });
+    expect(JSON.stringify(els)).not.toContain('![');
+  });
+
+  it('running：还在上传的引用只给占位，不发裸 markdown', () => {
+    const json = JSON.stringify(bodyEls(buildRunCard({ rs: withImage(), cardKey: 'm1' })));
+    expect(json).not.toContain('![');
+    expect(json).toContain('图片处理中');
+  });
+
+  it('running：图后的文字仍是打字机元素（ANSWER_EID 落在最后一段 markdown）', () => {
+    const rs = run([
+      { type: 'text_delta', itemId: 'a', delta: '前 ![拼图](shot.jpg) 后' },
+    ]);
+    const els = bodyEls(buildRunCard({ rs, cardKey: 'm1', images: new Map([['shot.jpg', 'k']]) }));
+    // answer run first (footer + ⏹ 控件跟在后面)
+    expect(els.slice(0, 3).map((e) => e.tag)).toEqual(['markdown', 'collapsible_panel', 'markdown']);
+    expect(els[0]!.element_id).toBeUndefined();
+    expect(els[2]!.element_id).toBe(ANSWER_EID);
+  });
+
+  it('terminal：已上传的引用同样是小标签（展开体里是真图）', () => {
+    const els = bodyEls(buildRunCard({ rs: withImageDone(), images: KEYS }));
+    expect(JSON.stringify(els)).toContain('"img_key":"img_v2_key"');
+    expect(els.some((e) => e.tag === 'collapsible_panel')).toBe(true);
+  });
+
+  it('terminal：未解析的引用降级成文字 + 反引号路径（不出现裸 ![]()）', () => {
+    const json = JSON.stringify(bodyEls(buildRunCard({ rs: withImageDone() })));
+    expect(json).not.toContain('![');
+    expect(json).toContain('未能显示：`video_frames/contact_sheet.jpg`');
+  });
+});
+
+// 表格类回答走 report 渲染器；表格里放不下的图统一挪到回答末尾（渲染层改写，不靠提示词）
+describe('buildRunCard — 表格与图片（渲染层改写）', () => {
+  const TABLE_ANSWER = [
+    '项目里共有 **32 个图片文件**。',
+    '',
+    '## 1. 根目录（1 个）',
+    '',
+    '| 文件 | 尺寸 | 说明 |',
+    '|---|---|---|',
+    '| [contact_sheet.jpg](video_frames/contact_sheet.jpg) | 1480×3943 | 拼图总览 |',
+  ].join('\n');
+  const KEYS = new Map([['video_frames/contact_sheet.jpg', 'img_v2_sheet']]);
+
+  const doneWith = (text: string): RunState => run([{ type: 'text', itemId: 'a', text }, { type: 'done', turnId: 't1' }]);
+
+  it('有 GFM 表格 → 渲染成原生 table，而不是一坨竖线', () => {
+    const els = bodyEls(buildRunCard({ rs: doneWith(TABLE_ANSWER), images: KEYS }));
+    expect(els.some((e) => e.tag === 'table')).toBe(true);
+    expect(JSON.stringify(els)).not.toContain('|------|');
+  });
+
+  it('表格里放不下的图 → 单元格只剩文字，图在小标签里出现在回答末尾', () => {
+    const els = bodyEls(buildRunCard({ rs: doneWith(TABLE_ANSWER), images: KEYS }));
+    const tableEl = els.find((e) => e.tag === 'table') as Record<string, any>;
+    expect(tableEl.rows[0].c0).toBe('contact_sheet.jpg');
+    const pill = els.find((e) => e.tag === 'collapsible_panel') as Record<string, any>;
+    expect(pill.header.title.content).toContain('contact_sheet.jpg'); // 链接样式：蓝字标题
+    expect(pill.elements[0]).toMatchObject({ tag: 'img', img_key: 'img_v2_sheet' });
+    expect(els.indexOf(pill)).toBeGreaterThan(els.indexOf(tableEl)); // 在表格之后
+  });
+
+  it('没有表格的回答仍走普通 markdown 路径（图留在原位）', () => {
+    const els = bodyEls(buildRunCard({ rs: doneWith('看这个：\n\n![拼图](video_frames/contact_sheet.jpg)'), images: KEYS }));
+    expect(els.some((e) => e.tag === 'table')).toBe(false);
+    expect(els.some((e) => e.tag === 'collapsible_panel')).toBe(true);
   });
 });

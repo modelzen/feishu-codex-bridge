@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildQueuedCard, RC } from '../src/card/run-card';
-import { pickIdleSessions } from '../src/bot/handle-message';
+import { activateQueuedTurn, pickIdleSessions, type QueuedTurn } from '../src/bot/handle-message';
 
 function buttons(node: unknown, acc: Record<string, any>[] = []): Record<string, any>[] {
   if (Array.isArray(node)) node.forEach((n) => buttons(n, acc));
@@ -24,6 +24,25 @@ describe('buildQueuedCard', () => {
     const btns = buttons(buildQueuedCard({ position: 1, cardKey: 'om_1' }));
     expect(btns.length).toBe(1);
     expect(btns[0]!.behaviors[0].value).toMatchObject({ a: RC.stop, m: 'om_1' });
+  });
+
+  it('shows the one-shot reminder only when manual mode marks it available', () => {
+    const available = buttons(
+      buildQueuedCard({ position: 1, cardKey: 'om_1', completionReminder: 'available' }),
+    );
+    expect(available.map((b) => b.behaviors[0].value.a)).toEqual([RC.stop, RC.remind]);
+    expect(JSON.stringify(available)).toContain('🔔 完成后提醒我');
+
+    const automaticMode = buttons(buildQueuedCard({ position: 1, cardKey: 'om_1' }));
+    expect(automaticMode.map((b) => b.behaviors[0].value.a)).toEqual([RC.stop]);
+  });
+
+  it('replaces the reminder button with an explicit enabled note after it is requested', () => {
+    const card = buildQueuedCard({ position: 2, cardKey: 'om_1', completionReminder: 'requested' });
+    expect(buttons(card).map((b) => b.behaviors[0].value.a)).toEqual([RC.stop]);
+    const json = JSON.stringify(card);
+    expect(json).toContain('本轮结束后会提醒发起人');
+    expect(json).not.toContain('完成后提醒我');
   });
 
   it('has no button before the messageId exists (first frame)', () => {
@@ -74,5 +93,27 @@ describe('pickIdleSessions', () => {
   it('never reaps a key without a touch timestamp (caller stamps it first)', () => {
     const out = pickIdleSessions(['unknown'], new Map(), () => false, IDLE, NOW);
     expect(out).toEqual([]);
+  });
+});
+
+describe('queued follow-up requester isolation', () => {
+  it('moves control ownership to that turn and clears the previous manual override', () => {
+    const state = { requesterOpenId: 'ou_first', completionReminderRequested: true };
+    const queued: QueuedTurn = {
+      input: { text: '[本条消息的发信人：某用户（open_id：ou_second）]\n\nsecond turn' },
+      titleSource: { text: 'second turn', rawContentType: 'text' },
+      requesterOpenId: 'ou_second',
+      requestedAt: 123_000,
+      summary: 'second turn',
+    };
+
+    activateQueuedTurn(state, queued);
+
+    expect(state).toEqual({ requesterOpenId: 'ou_second', completionReminderRequested: false });
+    // Timing/title stay attached to the same turn object used by notification.
+    expect(queued.requestedAt).toBe(123_000);
+    expect(queued.summary).toBe('second turn');
+    expect(queued.titleSource.text).toBe('second turn');
+    expect(queued.input.text).toContain('open_id');
   });
 });

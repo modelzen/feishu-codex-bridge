@@ -1,13 +1,27 @@
-import { card, hr, image, md, note, type CardElement, type CardObject, type HeaderTemplate } from './cards';
+import { card, columns, hr, imagePill, md, mdStream, note, type CardElement, type CardObject, type HeaderTemplate } from './cards';
+import {
+  codeSpans,
+  extractCardFences,
+  fileName,
+  hasImageRef,
+  neutraliseRefsInCode,
+  splitImageRefs,
+  unresolvedRefText,
+} from './md-scan';
 
 /**
  * Markdown → card-element rendering for outbound replies. Two jobs:
  *
  *  1. {@link renderRichText} — turn a markdown answer into card elements,
  *     splitting out `![alt](src)` images (resolved to `img_key` via the upload
- *     map) into real `img` elements interleaved with the text. Unresolved
- *     sources keep their literal markdown (graceful degradation). It also
- *     strips ```feishu-card fences, which are hoisted into their own card.
+ *     map) into real `img` elements interleaved with the text. A source that
+ *     isn't in the map NEVER falls back to raw `![](src)` markdown: the feishu
+ *     client parses that syntax into an image node and resolves the target as an
+ *     `image_key`, so a filesystem path renders as a broken image and can stall
+ *     the element's typewriter (issue #14 "一显示就卡"). An unresolved ref
+ *     becomes an explicit 「未能显示」 plus its path as inline code — visible,
+ *     copyable, and never an image node.
+ *     It also strips ```feishu-card fences, which are hoisted into their own card.
  *
  *  2. {@link buildCleanCard} — parse one ```feishu-card fence's markdown into a
  *     standalone card: a leading heading becomes the card header, `---` → hr,
@@ -15,39 +29,39 @@ import { card, hr, image, md, note, type CardElement, type CardObject, type Head
  *     bridge owns this mapping so the emitted card is always valid schema 2.0 —
  *     codex only writes markdown, never hand-rolled (often wrong) card JSON.
  *
- * Both share the same image-aware text splitter and the `src → image_key` map
+ * Both share the same scanner ({@link ./md-scan}) and the `src → image_key` map
  * produced by {@link ./outbound-images}.
  */
 
 type ImageMap = ReadonlyMap<string, string>;
 const NO_IMAGES: ImageMap = new Map();
 
-/** `![alt](src)` — group 1 = alt, group 2 = src (possibly `<…>`-wrapped). Mirrors
- * the source-scanning regex in outbound-images so the two stay in lockstep. */
-const IMG_RE = /!\[([^\]]*)\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)/g;
-/** A ```feishu-card fenced block; group 1 = the inner markdown. */
-const FENCE_RE = /```feishu-card[^\n]*\n([\s\S]*?)```/g;
+export interface RenderOptions {
+  /** element_id for the LAST markdown element. A running card's answer grows
+   * through the element-level typewriter, which needs one stable, append-only
+   * text element (see {@link ./run-card-stream}); the trailing segment is the
+   * one that keeps growing, so the id rides there. */
+  streamTailId?: string;
+  /** Live (running-card) render, which differs from the terminal render in three
+   * ways: a ref whose upload hasn't landed yet becomes a short placeholder, an
+   * unterminated `![…](…)` tail (the model is still writing the path) is held
+   * back instead of being streamed as broken syntax, and ```feishu-card fences
+   * stay visible (they are only hoisted into standalone cards at terminal). */
+  live?: boolean;
+}
 
-function cleanSrc(raw: string): string {
-  let s = raw.trim();
-  if (s.startsWith('<') && s.endsWith('>')) s = s.slice(1, -1).trim();
-  return s;
+/** Live placeholder for a ref whose upload is still in flight. */
+function pendingPlaceholder(alt: string): string {
+  return `🖼️ ${alt.trim() || '图片'}（图片处理中…）`;
 }
 
 /**
- * Pull every ```feishu-card fence out of `text`. Returns the fences' inner
- * markdown (trimmed) and `text` with the fences removed (so the run card never
- * shows a card spec as a raw code block — it's rendered as a clean card
- * instead).
+ * Pill title for a resolved ref: the markdown alt the model wrote, falling back
+ * to the file name when the alt is empty (`![](video_frames/key/12.jpg)` →
+ * `12.jpg`) — a pill must never be title-less.
  */
-export function extractCardFences(text: string): { fences: string[]; stripped: string } {
-  const fences: string[] = [];
-  const re = new RegExp(FENCE_RE.source, 'g');
-  const stripped = text.replace(re, (_full, inner: string) => {
-    fences.push(inner.trim());
-    return '';
-  });
-  return { fences, stripped };
+function pillTitle(alt: string, src: string): string {
+  return alt.trim() || fileName(src);
 }
 
 /**
@@ -55,12 +69,15 @@ export function extractCardFences(text: string): { fences: string[]; stripped: s
  * images with `img` elements and stripping any ```feishu-card fences. Plain
  * text (no images, no fences) short-circuits to a single markdown element.
  */
-export function renderRichText(text: string, images: ImageMap = NO_IMAGES): CardElement[] {
-  const body = extractCardFences(text).stripped;
-  if (!body.includes('![')) {
+export function renderRichText(text: string, images: ImageMap = NO_IMAGES, opts: RenderOptions = {}): CardElement[] {
+  // A running card keeps the fence visible; only the terminal render hoists it.
+  const raw = opts.live ? text : extractCardFences(text).stripped;
+  const body = neutraliseRefsInCode(raw, codeSpans(raw));
+  if (!hasImageRef(body)) {
     const t = body.trim();
-    return t ? [md(t)] : [];
+    return t ? [opts.streamTailId ? mdStream(t, opts.streamTailId) : md(t)] : [];
   }
+  const { parts } = splitImageRefs(body, opts.live === true);
   const els: CardElement[] = [];
   let buf = '';
   const flush = (): void => {
@@ -68,26 +85,76 @@ export function renderRichText(text: string, images: ImageMap = NO_IMAGES): Card
     if (t) els.push(md(t));
     buf = '';
   };
-  const re = new RegExp(IMG_RE.source, 'g');
-  let last = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(body)) !== null) {
-    buf += body.slice(last, m.index);
-    const alt = m[1] ?? '';
-    const src = cleanSrc(m[2] ?? '');
-    const key = images.get(src);
-    if (key) {
-      flush();
-      els.push(image(key, alt));
-    } else {
-      // Unresolved (path outside cwd / fetch failed / not yet uploaded): keep
-      // the literal markdown so the reference isn't silently dropped.
-      buf += m[0];
+  /** Is there another image ref further along the SAME source line as index `i`?
+   * Only then is a row worth opening — an image that ends its line stays a plain
+   * block element, so its expanded picture keeps the full card width, and any
+   * text after it stays a normal markdown element (which the running card's
+   * element typewriter needs: see {@link RenderOptions.streamTailId}). */
+  const imageFollowsOnLine = (i: number): boolean => {
+    for (let j = i + 1; j < parts.length; j++) {
+      const q = parts[j]!;
+      if (q.kind === 'image') return true;
+      if (q.text.includes('\n')) return false;
     }
-    last = m.index + m[0].length;
+    return false;
+  };
+  let row: CardElement[] | null = null;
+  const closeRow = (): void => {
+    if (!row) return;
+    // Images on ONE line are laid out as one wrapping row; a lone pill is just
+    // itself (a column_set around a single element only adds spacing).
+    els.push(row.length === 1 ? row[0]! : columns(row.map((el) => ({ elements: [el] })), { flexMode: 'flow', spacing: 'small' }));
+    row = null;
+  };
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i]!;
+    if (p.kind === 'text') {
+      const nl = p.text.indexOf('\n');
+      // While a row is open, only text that leads to another image on this line
+      // joins the row; otherwise the line is over and the rest is normal text.
+      if (row && nl < 0 && imageFollowsOnLine(i)) {
+        if (p.text.trim()) row.push(md(p.text.trim()));
+        continue;
+      }
+      if (row) {
+        if (nl > 0) {
+          const head = p.text.slice(0, nl);
+          if (head.trim()) row.push(md(head.trim()));
+        }
+        closeRow();
+        buf += nl < 0 ? p.text : p.text.slice(nl);
+        continue;
+      }
+      buf += p.text;
+      continue;
+    }
+    const key = images.get(p.src);
+    if (key) {
+      if (row) {
+        if (buf.trim()) row.push(md(buf.trim()));
+        buf = '';
+      } else {
+        flush();
+        row = [];
+      }
+      row.push(imagePill({ imgKey: key, title: pillTitle(p.alt, p.src), alt: p.alt }));
+      if (!imageFollowsOnLine(i)) closeRow();
+    } else if (opts.live) {
+      // Still uploading (or rejected): show what it is without teaching the
+      // client to parse a broken image node.
+      buf += pendingPlaceholder(p.alt);
+    } else {
+      buf += unresolvedRefText(p.alt, p.src);
+    }
   }
-  buf += body.slice(last);
+  closeRow();
   flush();
+  // Keep the growing trailing markdown addressable so later text deltas return to
+  // CardKit's element typewriter instead of a whole-card update.
+  if (opts.streamTailId) {
+    const tail = els[els.length - 1];
+    if (tail?.tag === 'markdown') els[els.length - 1] = mdStream(String(tail.content), opts.streamTailId);
+  }
   return els;
 }
 
@@ -112,7 +179,7 @@ export function buildCleanCard(
   const elements = renderCleanBody(bodyMarkdown, images);
   // A card needs at least one body element — fall back to the title (or a
   // spacer) so a title-only fence still produces a valid card.
-  const body = elements.length > 0 ? elements : [md(title || '­')];
+  const body = elements.length > 0 ? elements : [md(title || ' ')];
 
   return card(body, {
     ...(title ? { header: { title, template } } : {}),

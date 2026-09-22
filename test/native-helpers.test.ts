@@ -29,14 +29,15 @@ async function makeHelper(rel: string, mode: number): Promise<string> {
 const isExec = async (p: string): Promise<boolean> => ((await stat(p)).mode & 0o111) !== 0;
 
 describe('fixNativeHelperPerms', () => {
-  it('把丢了 +x 的 spawn-helper（0644）补成可执行', async () => {
+  // Windows chmod only controls the read-only attribute, not POSIX execute bits.
+  it.skipIf(process.platform === 'win32')('把丢了 +x 的 spawn-helper（0644）补成可执行', async () => {
     const helper = await makeHelper('node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper', 0o644);
     expect(await isExec(helper)).toBe(false);
     await fixNativeHelperPerms(root);
     expect(await isExec(helper)).toBe(true);
   });
 
-  it('多平台目录都修（darwin-arm64 + darwin-x64）', async () => {
+  it.skipIf(process.platform === 'win32')('多平台目录都修（darwin-arm64 + darwin-x64）', async () => {
     const a = await makeHelper('node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper', 0o644);
     const b = await makeHelper('node_modules/node-pty/prebuilds/darwin-x64/spawn-helper', 0o600);
     await fixNativeHelperPerms(root);
@@ -44,7 +45,7 @@ describe('fixNativeHelperPerms', () => {
     expect(await isExec(b)).toBe(true);
   });
 
-  it('只扫顶层 node_modules/node-pty：嵌在其他包 node_modules 下的不动', async () => {
+  it.skipIf(process.platform === 'win32')('只扫顶层 node_modules/node-pty：嵌在其他包 node_modules 下的不动', async () => {
     // npm 默认 hoist，node-pty 在顶层 node_modules；src 只扫顶层那一处。
     const nested = await makeHelper(
       'node_modules/some-backend/node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper',
@@ -54,7 +55,7 @@ describe('fixNativeHelperPerms', () => {
     expect(await isExec(nested)).toBe(false);
   });
 
-  it('已是可执行 → 幂等不报错', async () => {
+  it.skipIf(process.platform === 'win32')('已是可执行 → 幂等不报错', async () => {
     const helper = await makeHelper('node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper', 0o755);
     await fixNativeHelperPerms(root);
     expect(await isExec(helper)).toBe(true);

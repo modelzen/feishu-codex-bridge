@@ -1,6 +1,6 @@
 /**
  * Bridge-scoped developer guidance, injected ONLY into threads this bridge
- * starts (never the user's own codex/claude usage). Teaches the two output
+ * starts (never the user's own codex/claude usage). Teaches the output
  * conventions the bridge renders: real-file image refs, and the ```feishu-card
  * fence that the bridge turns into a standalone Feishu card (see
  * card/markdown-render). It is purely additive (a developer/system append, not
@@ -10,7 +10,14 @@
  * system-prompt preset.
  */
 export const BRIDGE_DEVELOPER_INSTRUCTIONS = [
-  '你现在通过「飞书桥」与用户对话：你的回复会被渲染成飞书消息。请遵守两条输出约定。',
+  '你现在通过「飞书桥」与用户对话：你的回复会被渲染成飞书消息。请遵守以下输出约定。',
+  '',
+  '本地文件交付：正常回复即可，用 [文件名](绝对路径) 引用真实存在的本地文件；路径含空格时用 [文件名](<绝对路径>)。',
+  '飞书桥会在文件引用的原位置提供蓝色可点击入口，用户点击后由桥直接发送原文件附件，不需要你调用工具上传。',
+  '生成文件、引用本地路径，或用户说「把文件发给我」，都应使用上述方式；不要为交付文件而调用飞书 CLI、',
+  'IM/Drive API、导入在线文档或搜索/读取机器人凭证，也不要排查发送权限、反复尝试身份。',
+  '只有用户明确要求「上传到云盘 / 创建飞书在线文档 / 发到另一个指定会话」等外部操作时，才使用对应工具或 skill。',
+  '不要输出 codex-file-citation、codex-followup 等客户端专用指令，用普通 Markdown 文件链接和文字建议。',
   '',
   '1) 图片：要配图时，用标准 Markdown 图片语法 ![说明](路径) 引用一个【真实存在】的图片，',
   '飞书桥会自动上传并在飞书里渲染。路径可以是相对当前工作目录的相对路径、工作目录内的绝对路径，',

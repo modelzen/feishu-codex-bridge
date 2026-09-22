@@ -1,3 +1,4 @@
+import { VOICE_TITLE, VOICE_DESCRIPTION, VOICE_NOTICE, VOICE_DOC_URL } from '../voice/view';
 /**
  * Web 控制台前端 —— 单文件内嵌 HTML（零依赖、零构建）。
  *
@@ -83,6 +84,7 @@ export const UI_PURE_JS = `
     if (code === 'abort') return null;
     if (code === 'expired_token') return '二维码已过期，请重新生成。';
     if (code === 'access_denied') return '你在飞书里取消或拒绝了创建。';
+    if (code === 'identity_missing') return '未获取到你的飞书身份，机器人没有保存。请重新扫码并确认授权。';
     return message || '创建失败，请重试。';
   }
 
@@ -605,6 +607,11 @@ export const UI_HTML = `<!doctype html>
   .drawer-mask.open { display: block; }
   .drawer h3 { margin: 0 0 4px; font-size: 16px; }
   .opt-row { display: flex; gap: 8px; margin: 6px 0 2px; flex-wrap: wrap; }
+  .compact-input {
+    width: 84px; border: 1px solid var(--border-2); border-radius: 8px; padding: 7px 9px;
+    font: 13px var(--mono); background: #0c0e0c; color: var(--text);
+  }
+  .compact-input:focus { outline: 0; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
   .backend-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
   .backend-row .grow { flex: 1; min-width: 0; }
   .bk-group { margin: 6px 0 2px; }
@@ -642,6 +649,33 @@ export const UI_HTML = `<!doctype html>
   }
   #confirmMask { z-index: 40; }
   #wizMask.open, #confirmMask.open { display: block; }
+  .voice-card h2 { margin-bottom: 6px; }
+  .voice-description { color: var(--text-2); font-size: 13px; line-height: 1.7; }
+  .voice-notice { margin-top: 6px; color: var(--text-3); font-size: 12px; line-height: 1.8; }
+  .voice-notice a { display: inline-block; margin-left: 4px; white-space: nowrap; text-underline-offset: 3px; }
+  .voice-controls { display: flex; align-items: center; margin-top: 18px; padding: 14px 0; border-top: 1px solid var(--border); }
+  .voice-switch { position: relative; min-height: 28px; border: 0; border-radius: 5px; background: transparent; color: var(--text); cursor: pointer; padding: 3px 4px 3px 48px; font: inherit; font-size: 13px; }
+  .voice-switch::before { content: ''; position: absolute; left: 0; top: 50%; margin-top: -10px; width: 36px; height: 20px; border-radius: 12px; background: var(--text-3); transition: background .15s; }
+  .voice-switch::after { content: ''; position: absolute; left: 3px; top: 50%; margin-top: -7px; width: 14px; height: 14px; border-radius: 50%; background: white; transition: transform .15s; }
+  .voice-switch[aria-checked="true"]::before { background: var(--accent); }
+  .voice-switch[aria-checked="true"]::after { transform: translateX(16px); }
+  .voice-switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+  .voice-switch:disabled { opacity: .5; cursor: default; }
+  .voice-status { padding: 13px 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); color: var(--text-2); font-size: 12.5px; line-height: 1.7; overflow-wrap: anywhere; }
+  .voice-status-line { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .voice-code { color: var(--text-3); font: 11px var(--mono); }
+  .voice-permission { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; }
+  .voice-permission-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .voice-hint { color: var(--text-3); font-size: 12px; line-height: 1.6; }
+  .voice-permission .btn, .voice-footer .btn { min-width: 84px; min-height: 32px; justify-content: center; flex-shrink: 0; text-decoration: none; }
+  .voice-footer { display: flex; justify-content: flex-end; margin-top: 14px; padding-right: 15px; }
+  .voice-card .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .voice-stopped { margin-top: 10px; }
+  @media (max-width: 480px) {
+    .voice-card { padding: 18px; }
+    .voice-permission { align-items: flex-start; flex-direction: column; gap: 10px; }
+    .voice-permission-actions { align-self: flex-end; }
+  }
   .switch { cursor: pointer; user-select: none; }
   .bot-row { display: flex; align-items: center; gap: 8px; padding: 9px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
   .bot-row:last-child { border-bottom: 0; }
@@ -666,7 +700,6 @@ export const UI_HTML = `<!doctype html>
   }
   .wiz input::placeholder { color: var(--text-3); }
   .wiz input:focus { outline: 0; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
-  .wiz .radio-row { display: flex; gap: 16px; margin: 6px 0; font-size: 13px; }
   .wiz .actions { display: flex; gap: 10px; margin-top: 18px; align-items: center; }
   .wiz .actions .grow { flex: 1; }
   .qrbox {
@@ -676,7 +709,6 @@ export const UI_HTML = `<!doctype html>
   .qrbox .qr-count { color: #555; }
   .qrbox svg { display: block; }
   .qr-count { font-size: 12px; color: var(--text-2); }
-  .adv-toggle { font-size: 12px; color: var(--blue); cursor: pointer; user-select: none; margin-top: 10px; display: inline-block; }
   .check-item {
     display: flex; align-items: flex-start; gap: 10px; padding: 10px 0;
     border-bottom: 1px solid var(--border);
@@ -739,7 +771,7 @@ export const UI_HTML = `<!doctype html>
 <div class="drawer-mask" id="drawerMask"></div>
 <div class="drawer" id="drawer"></div>
 
-<!-- ➕ 添加机器人向导：内容由 JS 按步骤渲染（扫码 / 手填 → checklist → 完成） -->
+<!-- ➕ 添加机器人向导：内容由 JS 按步骤渲染（扫码 → checklist → 完成） -->
 <div id="wizMask"><div class="wiz" id="wizBody"></div></div>
 
 <!-- 二次确认弹窗（重启 daemon / 删除机器人等破坏性操作） -->
@@ -2081,6 +2113,10 @@ ${UI_PURE_JS}
     left.appendChild(projCard);
     renderProjects(projList, pcount, b);
 
+    // 🔔 普通任务结束提醒（每 bot 独立）。选择即保存；仅 long 额外展示分钟阈值。
+    renderVoiceCard(right, b);
+    renderCompletionReminderCard(right, b);
+
     cols.appendChild(left);
     cols.appendChild(right);
     root.appendChild(cols);
@@ -2099,6 +2135,69 @@ ${UI_PURE_JS}
     var a = el('a', 'btn', label || '🔗 在飞书中打开');
     a.href = botOpenLink(appId, tenant); a.target = '_blank'; a.rel = 'noopener';
     return a;
+  }
+
+  var voiceBusy = {};
+  function renderVoiceCard(root, b) {
+    var box = el('div', 'card voice-card');
+    var heading = el('h2', null, ${JSON.stringify(VOICE_TITLE)}); box.appendChild(heading);
+    box.appendChild(el('div', 'voice-description', ${JSON.stringify(VOICE_DESCRIPTION)}));
+    var notice = el('div', 'voice-notice', ${JSON.stringify(VOICE_NOTICE)} + ' ');
+    var doc = el('a', null, '飞书 ASR 文档'); doc.href = ${JSON.stringify(VOICE_DOC_URL)};
+    doc.target = '_blank'; doc.rel = 'noopener noreferrer'; notice.appendChild(doc);
+    box.appendChild(notice);
+    var controls = el('div', 'voice-controls'); box.appendChild(controls);
+    var status = el('div', 'voice-status', '正在读取状态…');
+    status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite'); box.appendChild(status);
+    if (!b.running) box.appendChild(el('div', 'voice-hint voice-stopped', '请先启动此机器人。'));
+    root.appendChild(box);
+    fetch('/api/bots/' + encodeURIComponent(b.appId) + '/voice').then(function (r) {
+      if (!r.ok) throw new Error('读取失败'); return r.json();
+    }).then(function (v) {
+      if (!box.isConnected) return;
+      var h = v.feishu;
+      var testing = h.state === 'testing';
+      var cooling = h.retryAt && h.retryAt > Date.now();
+      var toggle = el('button', 'voice-switch', v.enabled ? '已开启' : '已关闭');
+      toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-label', ${JSON.stringify(VOICE_TITLE)});
+      toggle.setAttribute('aria-checked', String(v.enabled));
+      toggle.disabled = !b.running || !!voiceBusy[b.appId] || (!v.enabled && testing);
+      toggle.onclick = function () { voiceWrite(b.appId, { action: v.enabled ? 'disable' : 'enable' }); };
+      controls.appendChild(toggle);
+      var test = el('button', 'btn sm', testing ? '检测中…' : '测试');
+      test.disabled = !v.enabled || !b.running || !!voiceBusy[b.appId] || testing || !!cooling;
+      test.onclick = function () { voiceWrite(b.appId, { action: 'test' }); };
+      status.textContent = '';
+      status.style.display = v.enabled ? '' : 'none';
+      var statusLine = el('div', 'voice-status-line');
+      statusLine.appendChild(el('span', null, h.state === 'missing_permission' ? '缺少语音识别权限' : v.result));
+      if (h.code) statusLine.appendChild(el('span', 'voice-code', h.code));
+      status.appendChild(statusLine);
+      if (cooling) status.appendChild(el('div', 'voice-hint', '可重试时间：' + new Date(h.retryAt).toLocaleTimeString()));
+      if (v.enabled && h.state === 'missing_permission') {
+        var permission = el('div', 'voice-permission');
+        permission.appendChild(el('div', 'voice-hint', '授权并发布应用后，点击重新检测。'));
+        var permissionActions = el('div', 'voice-permission-actions');
+        var grant = el('a', 'btn sm primary', '去授权'); grant.href = v.grantUrl;
+        grant.target = '_blank'; grant.rel = 'noopener noreferrer'; permissionActions.appendChild(grant);
+        var recheck = el('button', 'btn sm', '重新检测');
+        recheck.disabled = !b.running || !!voiceBusy[b.appId];
+        recheck.onclick = function () { voiceWrite(b.appId, { action: 'refreshPermission' }); };
+        permissionActions.appendChild(recheck); permission.appendChild(permissionActions); status.appendChild(permission);
+      }
+      if (v.enabled) {
+        var testingControls = el('div', 'voice-footer'); testingControls.appendChild(test); box.appendChild(testingControls);
+      }
+    }).catch(function () { status.textContent = '无法读取状态，请刷新重试。'; });
+  }
+  function voiceWrite(botId, body) {
+    voiceBusy[botId] = true;
+    renderRoute();
+    fetch('/api/bots/' + encodeURIComponent(botId) + '/voice', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    }).then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.message || '设置失败'); return j; }); })
+      .catch(function (err) { toast(err.message || '请求失败'); })
+      .finally(function () { delete voiceBusy[botId]; loadState(); });
   }
 
   function renderBotOverview(card, b) {
@@ -2150,6 +2249,58 @@ ${UI_PURE_JS}
       if (!bk.ok && bk.hint) row.appendChild(el('span', 'note', bk.hint));
       box.appendChild(row);
     });
+  }
+
+  function renderCompletionReminderCard(root, b) {
+    var reminder = b.completionReminder || { mode: 'failures', longTaskMinutes: 3 };
+    var card = el('div', 'card');
+    card.appendChild(el('h2', null, '🔔 完成提醒'));
+    card.appendChild(el('div', 'note', '任务结束后是否另发一条消息 @ 发起人。每个机器人独立设置，保存后立即生效。'));
+    var modes = [
+      { label: '仅手动', value: 'manual' },
+      { label: '长任务', value: 'long' },
+      { label: '失败或超时', value: 'failures' },
+      { label: '每次结束', value: 'always' },
+    ];
+    card.appendChild(optButtons(modes, reminder.mode, function (mode) {
+      postWrite('/api/bots/' + encodeURIComponent(b.appId) + '/completion-reminder', {
+        mode: mode,
+        longTaskMinutes: reminder.longTaskMinutes,
+      });
+    }));
+
+    var descriptions = {
+      manual: '运行卡显示「完成后提醒我」，只有本轮发起人点过才通知。',
+      long: '任务耗时达到阈值后通知；运行卡不显示提醒按钮。',
+      failures: '仅任务失败或假死超时时通知；运行卡不显示提醒按钮。',
+      always: '每次正常结束、失败或超时都通知；运行卡不显示提醒按钮。',
+    };
+    card.appendChild(el('div', 'note', descriptions[reminder.mode] || descriptions.failures));
+
+    if (reminder.mode === 'long') {
+      var threshold = el('div', 'statline');
+      threshold.appendChild(el('span', null, '长任务阈值'));
+      var input = el('input', 'compact-input');
+      input.type = 'number'; input.min = '1'; input.max = '1440'; input.step = '1';
+      input.value = String(reminder.longTaskMinutes);
+      input.setAttribute('aria-label', '长任务阈值（分钟）');
+      threshold.appendChild(input);
+      threshold.appendChild(el('span', 'note', '分钟（1–1440）'));
+      var save = el('button', 'btn primary sm', '保存阈值');
+      save.onclick = function () {
+        var minutes = Number(input.value);
+        if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) {
+          toast('❌ 长任务阈值请输入 1–1440 的整数分钟');
+          return;
+        }
+        postWrite('/api/bots/' + encodeURIComponent(b.appId) + '/completion-reminder', {
+          mode: 'long', longTaskMinutes: minutes,
+        });
+      };
+      threshold.appendChild(save);
+      card.appendChild(threshold);
+    }
+    root.appendChild(card);
   }
 
   function renderProjects(box, countEl, b) {
@@ -2314,14 +2465,12 @@ ${UI_PURE_JS}
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  //  ➕ 添加机器人向导（扫码为主 + 手填降级折叠 → checklist → 完成）
+  //  ➕ 添加机器人向导（扫码 → checklist → 完成）
   // ════════════════════════════════════════════════════════════════════════════
-  var wizStep = 1;          // 1=扫码/手填 2=checklist 3=完成
+  var wizStep = 1;          // 1=扫码 2=checklist 3=完成
   var wizBotId = null;
   var wizPoll = null;       // setup-status 轮询定时器
   var wizSetup = null;
-  var wizTenant = 'feishu';
-  var wizManualOpen = false;
   var wizEs = null;         // 扫码 SSE EventSource
   var wizQrSessionId = null;
   var wizCountdown = null;  // 二维码过期倒计时
@@ -2329,7 +2478,7 @@ ${UI_PURE_JS}
   var wizRestartPrompted = false; // 完成步是否已弹过「重启拉起」确认（一次性）
 
   // 添加机器人是写操作：Feishu Bridge 没在跑时控制台为只读，不能加（与「没启动只读」一致）。
-  // 没在跑就引导先启动，而不是打开向导让用户白填一通再被 501 挡回。
+  // 没在跑就引导先启动，而不是打开向导让用户扫码后再被 501 挡回。
   function tryAddBot() {
     if (daemon && daemon.running) { openWizard(); return; }
     confirmDialog({
@@ -2344,7 +2493,7 @@ ${UI_PURE_JS}
   }
 
   function openWizard() {
-    wizStep = 1; wizBotId = null; wizSetup = null; wizManualOpen = false;
+    wizStep = 1; wizBotId = null; wizSetup = null;
     wizAutoEnabled = false; wizRestartPrompted = false;
     stopWizPoll(); stopWizQr();
     $('wizMask').classList.add('open');
@@ -2382,12 +2531,12 @@ ${UI_PURE_JS}
     return renderWizDone();
   }
 
-  // ── ① 扫码（默认主 CTA）+ 手填折叠（降级 fallback）─────────────────────────
+  // ── ① 扫码注册 ────────────────────────────────────────────────────────────
   function renderWizScan() {
     var w = $('wizBody');
     w.textContent = '';
     w.appendChild(el('h3', null, '➕ 添加机器人'));
-    w.appendChild(el('div', 'note', '用飞书 App 扫一下二维码 —— 自动创建应用、拿密钥入库、设你为管理员。'));
+    w.appendChild(el('div', 'note', '用飞书 App 扫一下二维码 —— 创建或复用应用、拿密钥入库，并自动将你设为管理员。'));
     w.appendChild(wizStepBar(1));
 
     var qrWrap = el('div', 'qrbox');
@@ -2403,13 +2552,6 @@ ${UI_PURE_JS}
     var statusLine = el('div', 'note'); statusLine.id = 'wizScanStatus';
     statusLine.style.textAlign = 'center';
     w.appendChild(statusLine);
-
-    // 手填降级（折叠次级入口）
-    var toggle = el('span', 'adv-toggle', wizManualOpen ? '收起手填 ▲' : '已有飞书应用？手动填 App ID/Secret →');
-    toggle.onclick = function () { wizManualOpen = !wizManualOpen; renderWizManual(manualBox); toggle.textContent = wizManualOpen ? '收起手填 ▲' : '已有飞书应用？手动填 App ID/Secret →'; };
-    w.appendChild(toggle);
-    var manualBox = el('div'); w.appendChild(manualBox);
-    renderWizManual(manualBox);
 
     var actions = el('div', 'actions');
     var cancel = el('button', 'btn', '取消');
@@ -2502,66 +2644,6 @@ ${UI_PURE_JS}
     re.style.marginTop = '8px';
     re.onclick = function () { wrap.textContent = ''; wrap.appendChild(el('div', 'note', '正在生成二维码…')); startWizQr(); };
     wrap.appendChild(re);
-  }
-
-  // ── 手填降级（折叠面板，接既有 POST /api/bots）──────────────────────────────
-  function renderWizManual(box) {
-    box.textContent = '';
-    if (!wizManualOpen) return;
-    box.appendChild(el('hr', 'hr'));
-    box.appendChild(el('label', null, 'App ID'));
-    var idIn = el('input'); idIn.type = 'text'; idIn.id = 'wizAppId'; idIn.placeholder = 'cli_xxxxxxxxxxxxxxxx'; idIn.autocomplete = 'off';
-    box.appendChild(idIn);
-    box.appendChild(el('label', null, 'App Secret'));
-    var secIn = el('input'); secIn.type = 'password'; secIn.id = 'wizAppSecret'; secIn.placeholder = '••••••••••••••••'; secIn.autocomplete = 'new-password';
-    box.appendChild(secIn);
-    box.appendChild(el('div', 'note', '🔒 密钥仅用于一次性探活验证后，加密存储在本机 keystore（AES-256-GCM）；不回显、不进日志。'));
-    box.appendChild(el('label', null, '版本'));
-    var radioRow = el('div', 'radio-row');
-    [['feishu', '飞书（feishu.cn）'], ['lark', 'Lark（larksuite.com）']].forEach(function (pair) {
-      var lbl = el('label'); lbl.style.fontWeight = '400'; lbl.style.margin = '0';
-      var r = el('input'); r.type = 'radio'; r.name = 'wizTenant'; r.value = pair[0];
-      if (pair[0] === wizTenant) r.checked = true;
-      r.onchange = function () { wizTenant = pair[0]; };
-      lbl.appendChild(r); lbl.appendChild(document.createTextNode(' ' + pair[1]));
-      radioRow.appendChild(lbl);
-    });
-    box.appendChild(radioRow);
-    var msg = el('div', 'note'); msg.id = 'wizFormMsg'; msg.style.color = 'var(--red)';
-    box.appendChild(msg);
-    var submit = el('button', 'btn primary', '验证并添加'); submit.id = 'wizSubmit';
-    submit.style.marginTop = '8px';
-    submit.onclick = submitWizForm;
-    box.appendChild(submit);
-  }
-
-  function submitWizForm() {
-    var appId = (($('wizAppId') || {}).value || '').trim();
-    var appSecret = (($('wizAppSecret') || {}).value || '').trim();
-    var msg = $('wizFormMsg');
-    if (msg) msg.textContent = '';
-    if (!appId || !appSecret) { if (msg) msg.textContent = 'App ID 与 App Secret 都要填。'; return; }
-    var btn = $('wizSubmit');
-    btn.textContent = '验证中…'; btn.className = 'btn primary disabled'; btn.disabled = true;
-    fetch('/api/bots', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ appId: appId, appSecret: appSecret, tenant: wizTenant }),
-    }).then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
-      .then(function (resp) {
-        if ($('wizAppSecret')) $('wizAppSecret').value = '';
-        if (resp.status === 201 && resp.body.ok) {
-          stopWizQr();
-          wizBotId = resp.body.bot.appId;
-          wizStep = 2; renderWizard(); startWizPoll();
-        } else {
-          btn.textContent = '验证并添加'; btn.className = 'btn primary'; btn.disabled = false;
-          if (msg) msg.textContent = '❌ ' + (resp.body.message || ('添加失败（HTTP ' + resp.status + '）'));
-        }
-      })
-      .catch(function () {
-        btn.textContent = '验证并添加'; btn.className = 'btn primary'; btn.disabled = false;
-        if (msg) msg.textContent = '❌ 请求失败，请重试。';
-      });
   }
 
   // ── ② checklist（复用 getSetupStatus 5s 轮询）─────────────────────────────

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +10,8 @@ import { AdminWriteError } from '../src/admin/ops';
 // 内存 stub：server 层单测不碰真实文件/注册表（service 自有专门的集成测试）。
 function stubService(): AdminService {
   return {
+    async getVoice() { return { enabled: false, feishu: { state: 'unchecked' as const, message: '尚未检测' }, result: '尚未测试', grantUrl: 'https://open.feishu.cn/' }; },
+    async setVoice() {},
     async listBots() {
       return [
         {
@@ -21,6 +23,7 @@ function stubService(): AdminService {
           current: true,
           running: true,
           pid: 4242,
+          completionReminder: { mode: 'failures' as const, longTaskMinutes: 3 },
         },
       ];
     },
@@ -60,6 +63,9 @@ function stubService(): AdminService {
     async setAutoCompact() {
       throw new NotWiredYetError('🗜️ 自动压缩开关');
     },
+    async setCompletionReminder() {
+      throw new NotWiredYetError('🔔 完成提醒');
+    },
     async doctorBackends() {
       return [{ id: 'codex-appserver', name: 'Codex', ok: true, version: '1.0.0', isDefault: true }];
     },
@@ -80,22 +86,6 @@ function stubService(): AdminService {
     },
     async tailLogs() {
       return '{"ts":"2026-06-13T00:00:00Z","level":"info","phase":"ws","event":"connected"}\n';
-    },
-    async registerBot(input) {
-      if (!input.appId || !input.appSecret) {
-        return { ok: false as const, code: 'invalid_input' as const, reason: 'App ID 与 App Secret 都不能为空。' };
-      }
-      if (input.appSecret === 'bad') {
-        return { ok: false as const, code: 'credential_rejected' as const, reason: '凭据校验失败：code=10003' };
-      }
-      return {
-        ok: true as const,
-        name: 'newbot',
-        appId: input.appId,
-        tenant: (input.tenant ?? 'feishu') as 'feishu' | 'lark',
-        botName: '新机器人',
-        missingScopes: [],
-      };
     },
     async getSetupStatus(botId) {
       return {
@@ -233,7 +223,14 @@ async function jsonOf(res: Response): Promise<any> {
 }
 
 beforeAll(async () => {
-  logDir = mkdtempSync(join(tmpdir(), 'web-server-test-logs-'));
+  const temporaryLogDir = mkdtempSync(join(tmpdir(), 'web-server-test-logs-'));
+  // Plain realpathSync only resolves symlinks; .native also expands RUNNER~1.
+  // libuv's directory watcher otherwise aborts on short/long path mismatches:
+  // https://github.com/libuv/libuv/issues/5010
+  logDir = realpathSync.native(temporaryLogDir);
+  if (process.platform === 'win32' && process.env.CI) {
+    console.info('Windows log watcher paths', JSON.stringify({ input: temporaryLogDir, native: logDir }));
+  }
   web = createWebServer({ service: stubService(), token: TOKEN, logDir });
   const { port, url } = await web.listen(0); // 临时端口，起了就关，绝不占固定口
   base = `http://127.0.0.1:${port}`;
@@ -329,6 +326,7 @@ describe('web server · 只读 API', () => {
     const bot = body.bots[0];
     expect(bot.appId).toBe('cli_a');
     expect(bot.running).toBe(true);
+    expect(bot.completionReminder).toEqual({ mode: 'failures', longTaskMinutes: 3 });
     expect(bot.projects).toHaveLength(1);
     const p = bot.projects[0];
     expect(p).toMatchObject({
@@ -405,6 +403,16 @@ describe('web server · 写操作占位（只读预览：daemon 未跑）', () =
     const res = await get('/api/project/demo/backend', { method: 'POST', body: '{}' });
     expect(res.status).toBe(401);
   });
+
+  it('POST /api/bots/:id/completion-reminder 在只读预览 → 501', async () => {
+    const res = await authed('/api/bots/cli_a/completion-reminder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'failures', longTaskMinutes: 3 }),
+    });
+    expect(res.status).toBe(501);
+    expect((await jsonOf(res)).error).toBe('not_wired_yet');
+  });
 });
 
 describe('web server · 写操作真实现（daemon 进程内 service）', () => {
@@ -421,6 +429,9 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
     };
     svc.setNoMention = async () => {
       throw new AdminWriteError('项目「demo」不存在');
+    };
+    svc.setCompletionReminder = async (botId, value) => {
+      written.push({ botId, completionReminder: value });
     };
     writeWeb = createWebServer({ service: svc, token: TOKEN, logDir });
     const { port } = await writeWeb.listen(0);
@@ -453,44 +464,49 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
     expect(body.error).toBe('write_rejected');
     expect(body.message).toContain('不存在');
   });
+
+  it('完成提醒保存 → 200，并把每 bot 设置交给 service', async () => {
+    const res = await fetch(`${writeBase}/api/bots/cli_a/completion-reminder`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'long', longTaskMinutes: 7 }),
+    });
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({
+      ok: true,
+      completionReminder: { mode: 'long', longTaskMinutes: 7 },
+    });
+    expect(written).toContainEqual({
+      botId: 'cli_a',
+      completionReminder: { mode: 'long', longTaskMinutes: 7 },
+    });
+  });
+
+  it.each([
+    [{ mode: 'smart', longTaskMinutes: 3 }, 'mode'],
+    [{ mode: 'long', longTaskMinutes: 0 }, 'longTaskMinutes'],
+    [{ mode: 'long', longTaskMinutes: 1441 }, 'longTaskMinutes'],
+    [{ mode: 'long', longTaskMinutes: 2.5 }, 'longTaskMinutes'],
+  ])('完成提醒非法输入 %# → 400（%s）', async (input, field) => {
+    const res = await fetch(`${writeBase}/api/bots/cli_a/completion-reminder`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    expect(res.status).toBe(400);
+    expect((await jsonOf(res)).message).toContain(field);
+  });
 });
 
-describe('web server · 添加机器人向导（day-0）', () => {
-  function postBots(body: unknown, withAuth = true): Promise<Response> {
-    return fetch(`${base}/api/bots`, {
+describe('web server · 扫码初始化与机器人管理', () => {
+  it('POST /api/bots 手填注册入口已下线 → 404', async () => {
+    const res = await authed('/api/bots', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(withAuth ? { Authorization: `Bearer ${TOKEN}` } : {}),
-      },
-      body: JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ appId: 'cli_manual1111', appSecret: 'secret' }),
     });
-  }
-
-  it('POST /api/bots 注册成功 → 201 { ok, bot:{appId,name,botName} }', async () => {
-    const res = await postBots({ appId: 'cli_new111111', appSecret: 'goodsecret', tenant: 'feishu' });
-    expect(res.status).toBe(201);
-    const body = await jsonOf(res);
-    expect(body.ok).toBe(true);
-    expect(body.bot.appId).toBe('cli_new111111');
-    expect(body.bot.botName).toBe('新机器人');
-  });
-
-  it('POST /api/bots 缺字段 → 400 invalid_input', async () => {
-    const res = await postBots({ appId: '', appSecret: '' });
-    expect(res.status).toBe(400);
-    expect((await jsonOf(res)).error).toBe('invalid_input');
-  });
-
-  it('POST /api/bots 探活失败 → 409 credential_rejected', async () => {
-    const res = await postBots({ appId: 'cli_bad1111111', appSecret: 'bad', tenant: 'feishu' });
-    expect(res.status).toBe(409);
-    expect((await jsonOf(res)).error).toBe('credential_rejected');
-  });
-
-  it('POST /api/bots 同样要鉴权：无 token → 401', async () => {
-    const res = await postBots({ appId: 'cli_x', appSecret: 'y' }, false);
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(404);
+    expect((await jsonOf(res)).error).toBe('not_found');
   });
 
   it('GET /api/bots/:appId/setup-status：聚合三/四态 checklist', async () => {
@@ -836,4 +852,27 @@ describe('web server · 日志', () => {
     expect(buf).toContain('data: {"event":"second-line"}');
     ac.abort();
   }, 10_000);
+});
+
+describe('voice settings HTTP boundary', () => {
+  it('requires authentication even for voice status', async () => {
+    expect((await get('/api/bots/cli_a/voice')).status).toBe(401);
+  });
+  it('returns diagnostics without credentials', async () => {
+    const res = await authed('/api/bots/cli_a/voice');
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ enabled: false });
+  });
+  it('accepts enable/test and never echoes submitted secrets', async () => {
+    for (const body of [{ action: 'enable' }, { action: 'test' }, { action: 'disable' }, { action: 'refreshPermission' }]) {
+      const res = await authed('/api/bots/cli_a/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      expect(res.status).toBe(200); expect(await res.text()).not.toContain('private-key');
+    }
+  });
+  it('rejects removed provider configuration and unexpected operations before dispatch', async () => {
+    for (const body of [{ action: 'configureDoubao', credentials: {} }, { action: 'switchPlan', plan: 'free' }]) {
+      const res = await authed('/api/bots/cli_a/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      expect(res.status).toBe(400);
+    }
+  });
 });

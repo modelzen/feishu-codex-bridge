@@ -61,6 +61,10 @@ export const paths = {
   get sessionsFile(): string {
     return join(currentBotDir, 'sessions.json');
   },
+  /** Durable local-file references attached to this bot's reply cards. */
+  get outboundFilesDir(): string {
+    return join(currentBotDir, 'outbound-files');
+  },
   /** project(群) → cwd + 默认参数 注册表（当前 bot） */
   get projectsFile(): string {
     return join(currentBotDir, 'projects.json');

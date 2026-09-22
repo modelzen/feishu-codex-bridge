@@ -3,6 +3,16 @@ import { catalogById } from '../agent/catalog';
 import type { AgentBackend, BackendProbe, PermissionMode, ReasoningEffort } from '../agent/types';
 import { tierLabel, type BackendProbeRow } from '../card/dm-cards';
 import {
+  COMPLETION_REMINDER_LONG_TASK_MAX_MINUTES,
+  COMPLETION_REMINDER_LONG_TASK_MIN_MINUTES,
+  getCompletionReminderConfig,
+  type AppConfig,
+  type AppPreferences,
+  type CompletionReminderMode,
+  type ResolvedCompletionReminderConfig,
+} from '../config/schema';
+import { saveConfig } from '../config/store';
+import {
   effectiveGuestMode,
   effectiveMode,
   getProjectByName,
@@ -27,6 +37,7 @@ import {
 
 /** Web/IPC 写操作的序列化形态（supervisor → bot 子进程经 process.send 转发）。 */
 export type AdminWriteOp =
+  | { kind: 'voice'; value: import('../voice/types').VoiceAction }
   | { kind: 'switchBackend'; project: string; backend: string }
   | {
       kind: 'setPermissionMode';
@@ -36,7 +47,12 @@ export type AdminWriteOp =
       network?: boolean;
     }
   | { kind: 'setNoMention'; project: string; on: boolean }
-  | { kind: 'setAutoCompact'; project: string; on: boolean };
+  | { kind: 'setAutoCompact'; project: string; on: boolean }
+  | {
+      kind: 'setCompletionReminder';
+      mode: CompletionReminderMode;
+      longTaskMinutes: number;
+    };
 
 /** 写操作被校验拒绝（中文原因可直接上卡/上 HTTP body）。HTTP 层映射 409；
  * IPC 层凭 code 还原类型。 */
@@ -52,7 +68,46 @@ export class AdminWriteError extends Error {
  * 盘上一致）；!ok 带中文拒因。不抛错——DM 与 Web 对拒因的呈现方式不同。 */
 export type AdminWriteOutcome = { ok: true; project: Project } | { ok: false; reason: string };
 
+/** bot 全局偏好写入的返回；与项目写共用 `{ok:false,reason}` 拒绝协议。 */
+export type AdminPreferencesWriteOutcome =
+  | { ok: true; completionReminder: ResolvedCompletionReminderConfig }
+  | { ok: false; reason: string };
+
+/**
+ * Serialize every read-modify-persist-commit of one bot's preferences. The
+ * mutator runs only after all earlier writes have settled, so it always reads
+ * the latest LIVE preferences; LIVE cfg is replaced only after its matching
+ * snapshot has reached disk. A failed write leaves LIVE untouched and does not
+ * poison later writes in the queue.
+ */
+export type AppPreferencesWriter = (mutate: (preferences: AppPreferences) => void) => Promise<AppPreferences>;
+
+export function createAppPreferencesWriter(opts: {
+  cfg: AppConfig;
+  /** Test injection; production defaults to the atomic config writer. */
+  persistConfig?: (cfg: AppConfig) => Promise<void>;
+}): AppPreferencesWriter {
+  let chain: Promise<unknown> = Promise.resolve();
+  const persist = opts.persistConfig ?? saveConfig;
+
+  return (mutate) => {
+    const run = chain.then(async () => {
+      const preferences: AppPreferences = { ...(opts.cfg.preferences ?? {}) };
+      mutate(preferences);
+      await persist({ ...opts.cfg, preferences });
+      opts.cfg.preferences = preferences;
+      return preferences;
+    });
+    chain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+}
+
 const TIERS: readonly PermissionMode[] = ['qa', 'write', 'full'];
+const COMPLETION_REMINDER_MODES: readonly CompletionReminderMode[] = ['manual', 'long', 'failures', 'always'];
 
 /**
  * 项目后端切换的纯校验（exported for tests）：① 目标 id 在注册表里；② 目标后端
@@ -246,15 +301,73 @@ export async function performSetModelDefault(opts: {
   return { ok: true, project: await freshOr(opts.projectName, { ...p, defaultModel: opts.model, defaultEffort: opts.effort }) };
 }
 
+/**
+ * 🔔 设置普通任务结束提醒。该偏好属于每个 bot 的 config.json，而非项目注册表：
+ * 必须在持有 LIVE `cfg` 的 bot 进程内执行，先原子落盘，再替换同一个 cfg 对象的
+ * preferences 引用，使正在运行的任务链路下一次读取就能看到新策略。Web/supervisor
+ * 只能投递 {@link AdminWriteOp}，不得跨进程直写配置文件。
+ */
+export async function performSetCompletionReminder(opts: {
+  cfg: AppConfig;
+  mode: CompletionReminderMode;
+  /** Omit for a mode-only update; the writer merges the latest queued threshold. */
+  longTaskMinutes?: number;
+  /** 测试注入；生产缺省走 config/store 的原子 saveConfig。 */
+  persistConfig?: (cfg: AppConfig) => Promise<void>;
+  /** 与其它 DM/Web preferences 写共享的串行 writer。 */
+  writePreferences?: AppPreferencesWriter;
+}): Promise<AdminPreferencesWriteOutcome> {
+  if (!COMPLETION_REMINDER_MODES.includes(opts.mode)) {
+    return { ok: false, reason: `未知完成提醒策略「${String(opts.mode)}」` };
+  }
+  if (
+    opts.longTaskMinutes !== undefined &&
+    (!Number.isInteger(opts.longTaskMinutes) ||
+      opts.longTaskMinutes < COMPLETION_REMINDER_LONG_TASK_MIN_MINUTES ||
+      opts.longTaskMinutes > COMPLETION_REMINDER_LONG_TASK_MAX_MINUTES)
+  ) {
+    return {
+      ok: false,
+      reason:
+        `长任务阈值必须是 ${COMPLETION_REMINDER_LONG_TASK_MIN_MINUTES}–` +
+        `${COMPLETION_REMINDER_LONG_TASK_MAX_MINUTES} 之间的整数分钟`,
+    };
+  }
+
+  // 不直接先 mutate LIVE cfg：若落盘失败，运行态仍保留旧值，不会出现“本轮生效、重启丢失”。
+  const writePreferences =
+    opts.writePreferences ?? createAppPreferencesWriter({ cfg: opts.cfg, persistConfig: opts.persistConfig });
+  await writePreferences((preferences) => {
+    const current = getCompletionReminderConfig({ ...opts.cfg, preferences });
+    preferences.completionReminder = {
+      mode: opts.mode,
+      longTaskMinutes: opts.longTaskMinutes ?? current.longTaskMinutes,
+    };
+  });
+  return { ok: true, completionReminder: getCompletionReminderConfig(opts.cfg) };
+}
+
+export interface AdminWriteExecutorDeps {
+  voiceAction?: (action: import('../voice/types').VoiceAction) => Promise<void>;
+  backendFor: (id?: string) => AgentBackend;
+  evictLiveSessionsForChat: (chatId: string) => Promise<void>;
+  /** LIVE bot config；setCompletionReminder 需要它来热更新运行态。 */
+  cfg?: AppConfig;
+  /** 测试注入；生产缺省由 performSetCompletionReminder 调 saveConfig。 */
+  persistConfig?: (cfg: AppConfig) => Promise<void>;
+  /** 与 DM 设置共用，避免 Web/DM 并发读改写丢字段。 */
+  writePreferences?: AppPreferencesWriter;
+}
+
 /** Orchestrator.adminExecute 的实现体：AdminWriteOp → 对应 perform*；拒绝抛
  * {@link AdminWriteError}（HTTP 409 / IPC code 还原）。Web/IPC 专用入口——DM
  * 回调直接调 perform* 拿 outcome 渲染卡片，不走这里。 */
-export function createAdminWriteExecutor(deps: {
-  backendFor: (id?: string) => AgentBackend;
-  evictLiveSessionsForChat: (chatId: string) => Promise<void>;
-}): (op: AdminWriteOp) => Promise<void> {
+export function createAdminWriteExecutor(deps: AdminWriteExecutorDeps): (op: AdminWriteOp) => Promise<void> {
+  const writePreferences =
+    deps.writePreferences ??
+    (deps.cfg ? createAppPreferencesWriter({ cfg: deps.cfg, persistConfig: deps.persistConfig }) : undefined);
   return async (op) => {
-    const outcome = await runAdminWriteOp(op, deps);
+    const outcome = await runAdminWriteOp(op, { ...deps, writePreferences });
     if (!outcome.ok) throw new AdminWriteError(outcome.reason);
   };
 }
@@ -262,9 +375,13 @@ export function createAdminWriteExecutor(deps: {
 /** AdminWriteOp 分发（exported for tests）。 */
 export async function runAdminWriteOp(
   op: AdminWriteOp,
-  deps: { backendFor: (id?: string) => AgentBackend; evictLiveSessionsForChat: (chatId: string) => Promise<void> },
-): Promise<AdminWriteOutcome> {
+  deps: AdminWriteExecutorDeps,
+): Promise<AdminWriteOutcome | AdminPreferencesWriteOutcome | { ok: true }> {
   switch (op.kind) {
+    case 'voice':
+      if (!deps.voiceAction) return { ok: false, reason: '语音服务未就绪' };
+      try { await deps.voiceAction(op.value); return { ok: true }; }
+      catch (err) { return { ok: false, reason: err instanceof Error ? err.message : '语音设置失败' }; }
     case 'switchBackend':
       return performBackendSwitch({ projectName: op.project, target: op.backend, backendFor: deps.backendFor });
     case 'setPermissionMode':
@@ -282,6 +399,15 @@ export async function runAdminWriteOp(
         projectName: op.project,
         on: op.on,
         evictLiveSessionsForChat: deps.evictLiveSessionsForChat,
+      });
+    case 'setCompletionReminder':
+      if (!deps.cfg) return { ok: false, reason: 'bot 运行配置不可用，无法即时更新完成提醒' };
+      return performSetCompletionReminder({
+        cfg: deps.cfg,
+        mode: op.mode,
+        longTaskMinutes: op.longTaskMinutes,
+        persistConfig: deps.persistConfig,
+        writePreferences: deps.writePreferences,
       });
   }
 }

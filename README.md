@@ -72,6 +72,7 @@ feishu-codex-bridge web
 - **流式卡片**：推理 / 命令 / 文件改动 / 结果实时刷新到一张可折叠卡片；⏹ 随时终止，卡死有 watchdog 自动回收，异常不波及其他群。
 - **免 @ + 自主目标**：话题 / 单会话群里可直接说话不必每次 @；`/goal <目标>` 让它自主多轮干到完成。
 - **多模态**：消息里直接发图片（读图）、发文件附件（下载到本地交给 agent 打开分析）。
+- **按需获取本地文件**：把正常回答里的本地文件引用原地替换为蓝色交互文字，保留文件名/路径、前后说明和顺序，不追加文末文件区或独立按钮。首次点击由 bridge 发送原文件附件到当前会话，不启动 agent、不导入在线文档；发送中防连点，成功后各处同文件入口都定位已发送消息，发送记录跨重启保存。支持 Markdown 链接、绝对路径、反引号路径/文件名（含空格）及 Codex 文件引用；每轮最多 10 处交互入口，单文件不超过 30 MB。获取时检查任务发起人/管理员身份、当前项目权限和文件变化。[识别规则与测试步骤](docs/testing/local-file-access.md)。
 - **☕ 咖啡一下（反向桥）**：离开电脑时，把你本机正在跑的 Claude Code / Codex CLI 的「需要审批 / 提问 / 任务完成」接管到飞书私聊 —— 在手机上点确认 / 回答它就继续，机器保持不睡。
 - **文档评论回复**：在飞书云文档（doc / docx / sheet / bitable 多维表格，含 wiki）的评论里 @ 机器人，它读评论、跑 agent、把答案回到同一条评论线程。
 - **双控制台**：私聊机器人弹交互菜单（新建项目 / 设置 / 用量 / 诊断 / 重连）；网页控制台还能管后台服务、看实时日志、扫码加机器人。
@@ -113,7 +114,7 @@ feishu-codex-bridge start                       后台 daemon：装系统服务�
 feishu-codex-bridge status|logs|restart|stop    daemon 生命周期（logs -f 跟随日志）
 feishu-codex-bridge update [--check]            更新到最新版（npm i -g）并自动重启 daemon
 feishu-codex-bridge web [--port <端口>]          打开本机网页控制台（默认端口 51847）
-feishu-codex-bridge bot init|list|use|rm        多机器人：注册 / 列表 / 选要连接的 / 移除
+feishu-codex-bridge bot init|list|use|rm        多机器人：扫码注册 / 列表 / 选要连接的 / 移除
 feishu-codex-bridge doctor                      本地自检：后端 / 登录 / 当前机器人
 ```
 
@@ -173,6 +174,8 @@ npm test            # vitest
 
 `git clone https://github.com/modelzen/feishu-codex-bridge.git && cd feishu-codex-bridge && npm i`（`prepare` 自动构建），前台跑 `npm start`。架构与实现见 [`docs/design/feishu-codex-bridge-design.md`](docs/design/feishu-codex-bridge-design.md) 与 [`docs/design/implementation-plan.md`](docs/design/implementation-plan.md)。
 
+每个 PR 自动在 **macOS / Windows / Linux × Node 20 / 22 / 24** 上检查类型、构建并运行测试。Node 24 任务还执行隔离的系统服务启动测试；不需要飞书凭据或模型账号。测试覆盖范围、虚拟机验收步骤及本地运行方式见 [跨平台验证指南](docs/testing/cross-platform-ci.md)。
+
 ---
 
 ## 💬 文档 & 交流
@@ -190,3 +193,17 @@ npm test            # vitest
 ## 📄 License
 
 [MIT](LICENSE) © modelzen
+
+### 语音转文字
+
+给 agent 发语音时，先转为文字再发送给 agent。
+
+网页控制台：选择机器人 → **语音转文字**。飞书私聊控制台：**设置 → 语音转文字 → 去开启 / 去关闭**。
+
+- 开关：开启后自动检查权限，缺少权限时显示 **去授权** 和 **重新检测**；授权并发布应用后，点击重新检测即可刷新权限状态，不上传音频。
+- 测试：仅在开启后显示，用内置短音频验证转写并显示结果。
+- 若机器人所属租户为飞书免费版，则不支持调用。[飞书 ASR 文档](https://open.feishu.cn/document/server-docs/ai/speech_to_text-v1/file_recognize?lang=zh-CN)
+
+设置即时生效。识别不可用时保留原语音附件交给 agent。agent 接收转写原文，不附加复述要求。
+bridge 在回复卡片顶部添加默认展开、可收起的浅灰“语音消息”原文块，流式和最终回复均保留；结果不保证与飞书客户端一致。支持 60 秒、20 MB 以内的纯语音。
+Windows/macOS 无需额外安装 ffmpeg 或 Python。

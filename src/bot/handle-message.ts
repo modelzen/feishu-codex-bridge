@@ -1,3 +1,8 @@
+import { registerVoiceConsole } from './voice-console';
+import { createVoiceService } from '../voice/service';
+import { ingestVoice, createIntakeQueue, type IngestedContext } from '../voice/inbound';
+import type { VoiceReply } from '../voice/types';
+import { steerWithDeadline, isRejectedSteer } from './steer-delivery';
 import type {
   BotAddedEvent,
   CardActionEvent,
@@ -9,6 +14,7 @@ import type {
 import { DEFAULT_BACKEND_ID, backendIds, createBackend, isBackendEntryInstalled } from '../agent';
 import { catalogById, projectCreatableBackends, visibleCatalog } from '../agent/catalog';
 import {
+  DEFAULT_PERMISSION_MODE,
   REASONING_EFFORTS,
   type AgentBackend,
   type AgentInput,
@@ -20,9 +26,11 @@ import {
 } from '../agent/types';
 import type { SelectOption } from '../card/cards';
 import {
+  createAppPreferencesWriter,
   createAdminWriteExecutor,
   performBackendSwitch,
   performSetAutoCompact,
+  performSetCompletionReminder,
   performSetModelDefault,
   performSetNoMention,
   performSetPermissionMode,
@@ -35,14 +43,20 @@ import {
   getPendingPolicy,
   getModelDisplay,
   getRunIdleTimeoutMs,
+  getSessionTitleConfig,
+  getSessionTitleEfforts,
   getShowToolCalls,
   getCommentsConfig,
+  getCompletionReminderConfig,
+  shouldShowCompletionReminderButton,
   isAdmin,
   isChatAllowed,
   isUserAllowedInProject,
   resolveOwner,
   RUN_IDLE_TIMEOUT_MAX_SEC,
   RUN_IDLE_TIMEOUT_MIN_SEC,
+  COMPLETION_REMINDER_LONG_TASK_MAX_MINUTES,
+  COMPLETION_REMINDER_LONG_TASK_MIN_MINUTES,
   secretKeyForApp,
   canEnableCliBridge,
   getCliBridgePreferences,
@@ -50,9 +64,10 @@ import {
   type AppConfig,
   type AppPreferences,
   type CommentsConfig,
+  type CompletionReminderMode,
   type PendingPolicy,
+  type SessionTitleBackendConfig,
 } from '../config/schema';
-import { saveConfig } from '../config/store';
 import { CardDispatcher } from '../card/dispatcher';
 import { sendManagedCard, updateManagedCard } from '../card/managed';
 import { RunRender } from '../card/run-render';
@@ -66,6 +81,7 @@ import {
   buildResumeErrorCard,
   buildResumeLaunchingCard,
   MC,
+  reasoningEffortLabel,
   RES,
   type HelpScope,
   type ModelCardState,
@@ -79,12 +95,14 @@ import {
   buildRunCardPlain,
   CONTROLS_EID,
   RC,
+  attachRunImages,
   type RunCardState,
 } from '../card/run-card';
 import { buildGoalDoneCard } from '../card/goal-card';
 import { RunCardStream } from '../card/run-card-stream';
-import { buildCleanCard, extractCardFences } from '../card/markdown-render';
-import { imageSources, uploadOutboundImages } from '../card/outbound-images';
+import { buildCleanCard } from '../card/markdown-render';
+import { extractCardFences } from '../card/md-scan';
+import { uploadOutboundImages } from '../card/outbound-images';
 import {
   buildAutoCompactCard,
   buildCompactFailedCard,
@@ -116,11 +134,15 @@ import {
   buildRestartingCard,
   buildRmConfirmCard,
   buildCoffeeSettingsCard,
+  buildCompletionReminderCustomCard,
+  buildSessionTitleSettingsCard,
   buildSettingsCard,
   buildUpdateCard,
   buildWatchdogCustomCard,
   DM,
   GS,
+  parseSessionTitleFormValue,
+  resolveCommentModelFormValue,
   type BackendProbeRow,
   type DoctorInfo,
 } from '../card/dm-cards';
@@ -128,6 +150,10 @@ import { cliBridgeSettingsSection, CLI } from '../cli-bridge/cards';
 import { inspectCliBridgeHooks, installCliBridgeHooks, resolveBridgeHookCommand } from '../cli-bridge/hooks';
 import type { CliBridgeRuntimeHooks } from '../cli-bridge/service';
 export type { CliBridgeRuntimeHooks };
+import {
+  sendCompletionReminderReply,
+  type CompletionReminderReplyInput,
+} from './completion-reminder';
 import {
   acquireUpdateLock,
   currentVersion,
@@ -150,6 +176,7 @@ import { serviceStdoutPath, serviceStderrPath } from '../service/common';
 import { bridgeVersion } from '../core/version';
 import { webConsoleUrl } from '../web/discovery';
 import { paths } from '../config/paths';
+import { OutboundFiles } from './outbound-files';
 import { getSecret } from '../config/keystore';
 import { buildScopeGrantUrl, JOIN_GROUP_SCOPES } from '../config/scopes';
 import { validateAppCredentials } from '../utils/feishu-auth';
@@ -166,7 +193,21 @@ import {
 import { createProject, joinExistingGroup } from '../project/lifecycle';
 import { refreshBranch } from '../project/announcement';
 import { leaveChat, transferOwnership } from '../project/group-ops';
-import { getSession, listSessions, patchSession, upsertSession, type SessionRecord } from './session-store';
+import {
+  clearSessionTitleJobKey,
+  getSession,
+  listSessions,
+  patchSession,
+  sessionTitleJobKey,
+  upsertSession,
+  type SessionRecord,
+  type SessionTitlePolicySnapshot,
+} from './session-store';
+import { SessionTitleCoordinator } from './session-title-coordinator';
+import {
+  sessionTitleSourceFromMessage,
+  type SessionTitleSource,
+} from './session-title';
 import { handleDmConsole } from './dm-console';
 import { fetchInteractiveCardText, isDegradedCardContent } from './card-content';
 import {
@@ -367,14 +408,82 @@ export function safeBackendId(formValue: Record<string, unknown> | undefined): s
 // 写同一套逻辑的单一事实源。原处 re-export 保持既有 import 路径（含测试）不变。
 export { BACKEND_PROBE_TIMEOUT_MS, probeBackends, validateBackendSwitch } from '../admin/ops';
 
+/** One ordinary turn waiting behind the current turn in the same session. The
+ * requester and enqueue clock travel with the input so completion @ mentions,
+ * manual-reminder ownership and long-task timing never leak from turn one. */
+export interface QueuedTurn {
+  voice?: VoiceReply;
+  input: AgentInput;
+  /** Un-woven SDK message source used only if this becomes the first accepted
+   * host turn. Never recover a title from AgentInput.text. */
+  titleSource: SessionTitleSource;
+  requesterOpenId?: string;
+  requestedAt: number;
+  /** Clean user-authored label; never derive reminder copy from woven input. */
+  summary?: string;
+}
+
+/** Switch the mutable session control state to a queued follow-up. Exported as
+ * a tiny pure-ish seam so requester isolation (and manual-override reset) stays
+ * testable without booting a real agent process. */
+export function activateQueuedTurn(
+  state: { requesterOpenId?: string; completionReminderRequested?: boolean },
+  turn: QueuedTurn,
+): void {
+  state.requesterOpenId = turn.requesterOpenId;
+  state.completionReminderRequested = false;
+}
+
+/** Only the exact turn initiator may opt that turn into the manual reminder. */
+export function isCompletionReminderRequester(operatorOpenId?: string, requesterOpenId?: string): boolean {
+  return Boolean(operatorOpenId && requesterOpenId && operatorOpenId === requesterOpenId);
+}
+
+/**
+ * Settle an ordinary turn after its event stream closes. A dead backend can
+ * close the async iterator without ever emitting `done` or a fatal `error`; in
+ * that case treating a still-running render as success produces a false
+ * “completed” card and success reminder. Preserve every explicit terminal
+ * emitted by the backend, but turn an otherwise-unexplained process exit into
+ * a fatal error.
+ */
+export function settleOrdinaryTurnRender(
+  render: RunRender,
+  input: { interrupted: boolean; timedOut: boolean; idleTimeoutSeconds: number; procDead: boolean },
+): void {
+  if (input.interrupted) render.interrupt();
+  else if (input.timedOut) render.timeout(input.idleTimeoutSeconds);
+  else if (input.procDead && render.terminal() === 'running') {
+    render.apply({ type: 'error', message: 'agent 进程异常退出，请重发本条消息', willRetry: false });
+  } else {
+    // finalize() is a no-op for explicit done/error terminals.
+    render.finalize();
+  }
+}
+
+/** Failure feedback includes unprocessed follow-ups; they must never disappear
+ * behind an error referring only to the original message. */
+function runFailureMessage(err: unknown, dropped: number): string {
+  const error = `❌ ${err instanceof Error ? err.message : String(err)}`;
+  return dropped > 0 ? `${error}\n\n⚠️ ${dropped} 条排队消息未执行，请重发。` : error;
+}
+
 interface ActiveState {
+  /** Captured with the steer target so a late ACK cannot decorate another turn. */
+  voiceReply?: { run: AgentRun; add: (voice: VoiceReply) => void };
+  /** Prevent a late ASR result from restarting a stopped conversation. */
+  intakeCancelled?: boolean;
   /** unset only during the brief "reserved, still resolving the thread" window */
   thread?: AgentThread;
   run?: AgentRun;
   /** follow-up turns queued mid-run; each carries its own text + downloaded images */
-  queue: AgentInput[];
+  queue: QueuedTurn[];
   /** who started this run — gates destructive ⏹ (design §5) */
   requesterOpenId?: string;
+  /** Manual mode, current turn only. May be set while the initial run is still
+   * waiting in the global concurrency queue; reset when a queued follow-up
+   * becomes the current turn. */
+  completionReminderRequested?: boolean;
   /** ⏹ 终止: interrupt the in-flight codex turn. Set per-turn while a run is in
    * flight. codex 0.139+ 在 turn/interrupt 后以 turn/completed(status:
    * "interrupted") 干净收尾（08b 探针实测；旧版「no mappable terminal」行为已
@@ -596,6 +705,52 @@ export function createOrchestrator(
    * routed yet (status card, /usage, models prewarm, resume-picker pick) keep
    * using it directly — identical to the pre-registry behavior. */
   const backend = backendFor();
+  const sessionTitles = new SessionTitleCoordinator({ backendFor: (id) => backendFor(id) });
+
+  /** Snapshot the selected backend's title policy when its native session is
+   * created. Later DM-setting changes affect future sessions only. */
+  function sessionTitlePolicy(backendId: string): SessionTitlePolicySnapshot {
+    const selected = getSessionTitleConfig(cfg, backendId);
+    return selected.enabled
+      ? { strategy: 'model', model: selected.model, effort: selected.effort }
+      : { strategy: 'truncate' };
+  }
+
+  /** Title bookkeeping is auxiliary: disk/backend failures never block the
+   * user's main conversation. */
+  async function registerSessionTitle(
+    be: AgentBackend,
+    sessionId: string,
+    cwd: string,
+    source?: SessionTitleSource,
+  ): Promise<string | undefined> {
+    try {
+      return await sessionTitles.register({
+        backend: be.id,
+        sessionId,
+        cwd,
+        source,
+        policy: sessionTitlePolicy(be.id),
+      });
+    } catch (err) {
+      log.fail('agent', err, { phase: 'session-title-register', backend: be.id, sessionId });
+      return undefined;
+    }
+  }
+
+  async function attachSessionTitleSource(
+    backendId: string,
+    sessionId: string,
+    source: SessionTitleSource,
+  ): Promise<string | undefined> {
+    const key = sessionTitleJobKey(backendId, sessionId);
+    try {
+      return (await sessionTitles.attachSource(key, source)) ? key : undefined;
+    } catch (err) {
+      log.fail('agent', err, { phase: 'session-title-attach', backend: backendId, sessionId });
+      return undefined;
+    }
+  }
   /** 后端 id → 展示名（项目设置卡）。手编 projects.json 写了未知 id 时原样显示。 */
   const backendDisplayName = (id?: string): string => {
     try {
@@ -630,6 +785,13 @@ export function createOrchestrator(
   // the idle timeout applies immediately to every group/thread — no daemon
   // restart. `cfg` is the same object `applyPref` mutates, so this sees edits.
   const currentIdleMs = (): number => getRunIdleTimeoutMs(cfg) ?? 0;
+  // One queue for every DM/Web mutation of this bot's preferences. Each write
+  // reads the latest committed LIVE snapshot, persists its own next snapshot,
+  // then commits it to LIVE — concurrent clicks cannot erase one another.
+  const writePreferences = createAppPreferencesWriter({ cfg });
+  const voice = createVoiceService(cfg, writePreferences);
+  const orderContext = createIntakeQueue();
+  const orderTurns = createIntakeQueue();
   // pendingPolicy is read per-message (settings card can change it live)
   /** pending /resume cards, keyed by the card's messageId */
   const resumePending = new Map<string, ResumeCardState>();
@@ -642,6 +804,20 @@ export function createOrchestrator(
   /** CardKit entity backing each run card, by messageId — drives the native
    * typewriter stream and whole-card (button/settings) updates. */
   const runStreams = new Map<string, RunCardStream>();
+  /** Live manual-reminder card repaint, keyed like runsByCard. The closure is
+   * swapped when a queue placeholder flips into a run card, so a double click
+   * can only mutate the one current turn and never an older/future card. */
+  const completionReminderRefreshers = new Map<string, () => void>();
+  /** Repaint every live queue/run card after the global mode changes. This makes
+   * the product rule immediate: manual shows the one-shot button; every other
+   * mode removes it without waiting for the agent's next streamed event. */
+  const refreshCompletionReminderCards = (): void => {
+    for (const refresh of completionReminderRefreshers.values()) refresh();
+  };
+  /** Network attempts are marked before awaiting Feishu: one terminal card can
+   * never produce duplicate reminder replies, even if a surrounding cleanup or
+   * callback path is re-entered. */
+  const completionReminderSent = new RecentIdCache(4096, 24 * 60 * 60_000);
   /** the latest settings-bearing run card per topic thread */
   const lastRunCard = new Map<string, string>();
   /** latest context usage per session (sessionKey → tokens), for `/context`.
@@ -649,6 +825,15 @@ export function createOrchestrator(
   const lastUsage = new Map<string, { used: number; window: number | null }>();
   /** inbound message/comment dedup (at-least-once delivery, see RecentIdCache) */
   const seenInbound = new RecentIdCache();
+
+  /** Render the one-shot affordance only while the current global mode is
+   * manual. Non-manual modes return undefined, so their cards have no button. */
+  const completionReminderView = (state: ActiveState): 'available' | 'requested' | undefined =>
+    shouldShowCompletionReminderButton(cfg)
+      ? state.completionReminderRequested
+        ? 'requested'
+        : 'available'
+      : undefined;
 
   /** 模型列表直通后端：两个后端内部都已缓存成功结果（codex 的 modelCache、
    * claude 的静态常量），这层不再缓存——codex 瞬时不可用时返回的 STATIC_MODELS
@@ -830,7 +1015,7 @@ export function createOrchestrator(
         startReservedRun(msg, goalObjective, ts.sessionKey, true, project, ts, undefined, undefined, undefined, true);
         return;
       }
-      handleTurn(msg, text, ts.sessionKey, true, project, ts);
+      void handleTurn(msg, text, ts.sessionKey, true, project, ts).catch((err) => log.fail('intake', err));
       return;
     }
 
@@ -880,7 +1065,7 @@ export function createOrchestrator(
         startReservedRun(msg, goalObjective, ts.sessionKey, false, project, ts, undefined, undefined, undefined, true);
         return;
       }
-      handleTurn(msg, text, ts.sessionKey, false, project, ts);
+      void handleTurn(msg, text, ts.sessionKey, false, project, ts).catch((err) => log.fail('intake', err));
       return;
     }
     // Main group area: /resume opens the history picker; /settings opens the
@@ -1033,11 +1218,15 @@ export function createOrchestrator(
    *     skipped, never thrown.
    * Both are gated (messageHasFiles / replyToMessageId) so the common text path
    * stays await-free. 话题上文 is woven separately in startReservedRun (it is
-   * session-scoped, not per-message). Returns `text` unchanged when there's
-   * nothing to add.
+   * session-scoped, not per-message). Voice display metadata stays separate
+   * from the woven agent input.
    */
-  async function ingestContext(msg: NormalizedMessage, text: string): Promise<string> {
-    let body = text;
+  function ingestContext(msg: NormalizedMessage, text: string): Promise<IngestedContext> {
+    return orderContext(msg.threadId ?? msg.chatId, () => ingestContextImpl(msg, text));
+  }
+  async function ingestContextImpl(msg: NormalizedMessage, text: string): Promise<IngestedContext> {
+    const ingested = msg.rawContentType === 'audio' ? await ingestVoice(channel, msg, voice) : { text };
+    let body = ingested.text;
     if (messageHasFiles(msg)) {
       const files = await collectInboundFiles(channel, msg);
       body = weaveFileManifest(text, files);
@@ -1057,7 +1246,7 @@ export function createOrchestrator(
     // codex can match the roster (approve-gate) and @ them back. Covers both the
     // first-turn (startReservedRun) and mid-turn (handleTurn) paths.
     body = weaveSender(body, msg);
-    return body;
+    return { ...ingested, text: body };
   }
 
   /**
@@ -1065,7 +1254,18 @@ export function createOrchestrator(
    * the chatId (single, `flat`). steer/queue mid-turn; otherwise reserve + run.
    * `flat` = reply by quoting (no reply_in_thread / topic), for single groups.
    */
-  async function handleTurn(
+  function handleTurn(msg: NormalizedMessage, text: string, sessionKey: string, flat: boolean, project: Project | undefined, perm: TurnPerm): Promise<void> {
+    const owner = active.get(sessionKey);
+    return orderTurns(sessionKey, async () => {
+      if (owner?.intakeCancelled) {
+        await channel.send(msg.chatId, { markdown: '排队期间会话已停止，请重发本条消息。' }, { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
+        return;
+      }
+      await prepareTurn(msg, text, sessionKey, flat, project, perm);
+    });
+  }
+
+  async function prepareTurn(
     msg: NormalizedMessage,
     text: string,
     sessionKey: string,
@@ -1086,15 +1286,19 @@ export function createOrchestrator(
       // carry them. Awaited here — the session is already held by a running
       // turn, so there's no reservation race to protect; gated on
       // messageHasImages so the common text path stays await-free and fast.
-      const images = messageHasImages(msg) ? await collectInboundImages(channel, msg) : undefined;
-      // Download file attachments too and weave their paths into the text (codex
-      // reads them by path). Both awaits happen before re-reading the session.
-      const woven = await ingestContext(msg, text);
+      const [images, woven] = await Promise.all([
+        messageHasImages(msg) ? collectInboundImages(channel, msg) : Promise.resolve(undefined),
+        ingestContext(msg, text),
+      ]);
+      if (existing.intakeCancelled) {
+        await channel.send(msg.chatId, { markdown: '本条消息处理期间会话已停止，请重发。' }, { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
+        return;
+      }
       // The turn may have finished while media downloaded — re-read the session.
       // If it's gone, start a fresh run (carrying what we already fetched).
       const cur = active.get(sessionKey);
       if (!cur) {
-        startReservedRun(msg, woven, sessionKey, flat, project, perm, images, true, text);
+        startReservedRun(msg, woven.text, sessionKey, flat, project, perm, images, woven, text);
         return;
       }
       // A goal may have started while media downloaded — same prompt as above.
@@ -1102,24 +1306,50 @@ export function createOrchestrator(
         await replyGoalBusy(msg, flat);
         return;
       }
-      if (getPendingPolicy(cfg) === 'steer' && cur.run && cur.thread) {
-        const tid = cur.run.turnId();
-        if (tid) {
-          try {
-            await cur.thread.steer({ text: woven, images }, tid);
-            log.info('intake', 'steer', { tid, images: images?.length ?? 0 });
-            return;
-          } catch (err) {
-            log.warn('intake', 'steer-failed', { err: String(err) });
-          }
-        }
-      }
-      cur.queue.push({ text: woven, images });
-      log.info('intake', 'queued', { depth: cur.queue.length });
+      void deliverPreparedTurn(msg, woven, images, text, sessionKey, flat, project, perm, cur)
+        .catch((err) => log.fail('intake', err));
       return;
     }
 
     startReservedRun(msg, text, sessionKey, flat, project, perm);
+  }
+
+  // Keep preparation ordered, but do not pin the lane on an uncertain steer ACK.
+  // Explicit stale-turn rejection may still requeue onto a replacement owner.
+  async function deliverPreparedTurn(
+    msg: NormalizedMessage, woven: IngestedContext, images: string[] | undefined, text: string,
+    sessionKey: string, flat: boolean, project: Project | undefined, perm: TurnPerm, cur: ActiveState,
+  ): Promise<void> {
+    if (getPendingPolicy(cfg) === 'steer' && cur.run && cur.thread && cur.thread.supportsSteer !== false) {
+      const tid = cur.run.turnId();
+      if (tid) {
+        const voiceReply = cur.voiceReply?.run === cur.run ? cur.voiceReply : undefined;
+        try {
+          await steerWithDeadline(cur.thread, { text: woven.text, images }, tid);
+          if (woven.voice) voiceReply?.add(woven.voice);
+          log.info('intake', 'steer', { tid, images: images?.length ?? 0 });
+          return;
+        } catch (err) {
+          log.warn('intake', 'steer-failed', { err: String(err) });
+          if (!isRejectedSteer(err)) {
+            void channel.send(msg.chatId,
+              { markdown: '⚠️ 本条消息的接收确认失败，可能已进入模型。为避免重复执行，未自动重投；请先核对本轮结果。' },
+              { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
+            return;
+          }
+        }
+      }
+    }
+    if (cur.intakeCancelled) return;
+    // steer() awaited an RPC: the previous run may have ended, or a new
+    // run/goal may now own this key. Re-enter the synchronous reservation
+    // path so the input is queued on the current owner or starts a new run.
+    // A pre-write rejection can race a dead consumer's terminal cleanup.
+    if (cur.thread && !cur.thread.isAlive() && active.get(sessionKey) === cur) {
+      active.delete(sessionKey);
+      if (sessions.get(sessionKey) === cur.thread) sessions.delete(sessionKey);
+    }
+    startReservedRun(msg, woven.text, sessionKey, flat, project, perm, images, woven, text);
   }
 
   /** 🎯 goal 运行中收到消息的统一提示（goal 会话不入队，见 ActiveState.isGoal）。 */
@@ -1152,10 +1382,16 @@ export function createOrchestrator(
     project: Project | undefined,
     perm: TurnPerm,
     preloadedImages?: string[],
-    preIngested?: boolean,
+    preIngested?: IngestedContext,
     summaryText?: string,
     goal?: boolean,
   ): void {
+    // A goal title is the already-extracted objective. Ordinary turns retain
+    // the SDK content type so merge-forward/media envelopes can be decoded
+    // without applying broad regexes to normal user text.
+    const titleSource: SessionTitleSource = goal
+      ? { text, rawContentType: 'text' }
+      : sessionTitleSourceFromMessage(msg, summaryText ?? text);
     const existing = active.get(sessionKey);
     if (existing) {
       // A goal can't co-run with (or queue behind) a turn on the same session —
@@ -1175,7 +1411,14 @@ export function createOrchestrator(
       // A run appeared between handleTurn's check and here (we awaited an image
       // download) — queue onto it rather than launch a second turn. `text` is
       // already file-woven when preIngested (handleTurn's fall-through).
-      existing.queue.push({ text, images: preloadedImages });
+      existing.queue.push({
+        input: { text, images: preloadedImages },
+        voice: preIngested?.voice,
+        titleSource,
+        requesterOpenId: msg.senderId,
+        requestedAt: msg.createTime || Date.now(),
+        summary: stripFileTokens(summaryText ?? text).slice(0, 80) || undefined,
+      });
       log.info('intake', 'queued', { depth: existing.queue.length });
       return;
     }
@@ -1202,7 +1445,7 @@ export function createOrchestrator(
             : Promise.resolve(undefined);
         // File attachments / quoted message woven into the prompt. Skipped when
         // preIngested (handleTurn already wove them into `text`).
-        const ingestP = preIngested ? Promise.resolve(text) : ingestContext(msg, text);
+        const ingestP = preIngested ? Promise.resolve(preIngested) : ingestContext(msg, text);
         let tResolveDone = tIntake;
         const resolveP = resolveThread(sessionKey, msg.chatId, {
           mode: perm.mode,
@@ -1236,9 +1479,25 @@ export function createOrchestrator(
           priorP,
           historyP,
         ]);
-        let firstText = ingested;
+        let firstText = ingested.text;
         let thread = resolved;
+        let titleJobKey: string | undefined;
         const neverSeen = !thread;
+        let model = prior?.model;
+        let effort = prior?.effort;
+        // Match new-topic initialization for single-session groups. Older flat
+        // sessions may also lack these fields; bind the next ordinary turn to
+        // explicit defaults so the card describes what we actually request.
+        if (!thread || (flat && !goal && !model)) {
+          const be = backendFor(prior?.backend ?? project?.backend);
+          const defaults = pickDefault(await listModels(be), {
+            model: project?.defaultModel,
+            effort: project?.defaultEffort,
+          });
+          model ??= defaults.model;
+          effort ??= defaults.effort;
+          if (prior) await patchSession(sessionKey, { model, effort });
+        }
         // codex's history is EMPTY when the session is brand-new (neverSeen) OR a
         // resume failed and we fell back to a new thread (recreated) — both want
         // the FULL topic woven as opening context, not just the delta.
@@ -1248,17 +1507,21 @@ export function createOrchestrator(
           // a fresh session bound to the resolved cwd, on the project's backend.
           const cwd = project?.cwd ?? fallbackCwd;
           const be = backendFor(project?.backend);
-          thread = await be.startThread({ cwd, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
+          thread = await be.startThread({ cwd, model, effort, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
           trackSession(sessionKey, thread);
           // 自愈观测：来源=全新会话（无持久化记录），与 resume-ok/resume-recreate
           // 互斥——三者其一 + agent 层的 spawn/prewarm-hit 即可还原完整恢复路径。
           log.info('agent', 'session-fresh', { sessionKey, sessionId: thread.sessionId, backend: be.id });
+          titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource);
           await upsertSession({
             threadId: sessionKey,
             chatId: msg.chatId,
             cwd,
             sessionId: thread.sessionId,
             backend: be.id,
+            titleJobKey,
+            model,
+            effort,
             // `text` is already file-woven when preIngested; use the raw
             // `summaryText` (handleTurn's original) so the session label isn't
             // manifest boilerplate + a temp path.
@@ -1267,6 +1530,40 @@ export function createOrchestrator(
             createdAt: Date.now(),
             updatedAt: Date.now(),
           });
+        } else if (recreated) {
+          // resume 失败后创建的是一个全新的 HOST 会话；它属于升级后的新会话，
+          // 应独立登记标题任务（旧 sessionId 的 ledger/标题绝不复用）。
+          const be = backendFor(prior?.backend ?? project?.backend);
+          const cwd = project?.cwd ?? prior?.cwd ?? fallbackCwd;
+          titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource);
+          // Full replacement drops the old session's titleJobKey even if title
+          // registration failed; carrying it across would let a later turn attach
+          // source to the wrong native session.
+          if (prior) {
+            await upsertSession({
+              ...prior,
+              model,
+              effort,
+              cwd,
+              sessionId: thread.sessionId,
+              backend: be.id,
+              ...(titleJobKey ? { titleJobKey } : { titleJobKey: undefined }),
+              updatedAt: Date.now(),
+            });
+          }
+        } else {
+          // `/clear` 先创建一个没有首条提问的 waiting_source job；只有它能在
+          // 此处被补源。手动 `/resume` 没有 ledger row，attach 返回 false，因而
+          // 不会给导入/历史会话自动改名。
+          const be = backendFor(prior?.backend ?? project?.backend);
+          const expected = sessionTitleJobKey(be.id, thread.sessionId);
+          if (prior?.titleJobKey === expected) {
+            await attachSessionTitleSource(be.id, thread.sessionId, titleSource);
+            // Even when the source was attached by an earlier run that got
+            // cancelled before runStreamed, carry the durable key forward so
+            // this first actually-issued turn can activate it.
+            titleJobKey = expected;
+          }
         }
         // 话题上文：在话题里 @bot 时，把 bot 还没喂给 codex 的人对人消息补进开场。
         // codexEmpty（新会话 / resume 失败重建）→ 用最近 N 条全量（即投机结果）；
@@ -1296,23 +1593,39 @@ export function createOrchestrator(
           replyInThread: !flat,
           flat,
           thread,
+          model,
+          effort,
           firstText,
+          voice: ingested.voice,
           images,
           knownThreadId: sessionKey,
+          // The run's cwd: the project directory the agent works in. MUST be
+          // carried here — it is also what resolves a reply's relative
+          // `![](images/plot.png)` before upload, and what gets persisted as this
+          // session's cwd. Omitting it silently fell back to the bridge process's
+          // own cwd (the launchd service has none → `/`), so every relative image
+          // ref was resolved against `/` and rejected as image-outside-cwd.
+          cwd: project?.cwd ?? prior?.cwd ?? fallbackCwd,
+          mode: perm.mode,
+          summary: stripFileTokens(summaryText ?? text).slice(0, 80) || '(本轮任务)',
           requesterOpenId: msg.senderId,
+          requestedAt: msg.createTime || tIntake,
           // 编织完成 → turn/start 之间不再读盘：首轮直接用预取的会话记录
-          // （prior=undefined 即确知是全新会话，刚 upsert 的记录还没有 model）。
+          // （新会话及旧单会话的缺失值由上面的 model/effort 补齐）。
           firstRec: prior ?? null,
+          titleJobKey,
+          titleSource,
           timing: { tResolve: tResolveDone - tIntake, tWeave: Date.now() - tIntake },
         };
         if (goal) await launchGoalRun(launchOpts);
         else await launchRun(launchOpts, reaction);
       } catch (err) {
-        active.delete(sessionKey); // release the reservation so the session isn't wedged
+        if (active.get(sessionKey) === reserved) active.delete(sessionKey);
+        const dropped = reserved.queue.splice(0).length;
         reaction?.done();
         log.fail('intake', err);
         await channel
-          .send(msg.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: msg.messageId, replyInThread: !flat })
+          .send(msg.chatId, { markdown: runFailureMessage(err, dropped) }, { replyTo: msg.messageId, replyInThread: !flat })
           .catch(() => undefined);
       }
     });
@@ -1415,6 +1728,9 @@ export function createOrchestrator(
    * Detached — onMessage must return fast (see {@link handleTurn}); a new
    * topic has a unique reply target so no same-topic reservation is needed. */
   function startTopicDirectly(msg: NormalizedMessage, text: string, project?: Project, goal?: boolean): void {
+    const titleSource: SessionTitleSource = goal
+      ? { text, rawContentType: 'text' }
+      : sessionTitleSourceFromMessage(msg, text);
     void withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       // 🫳 Typing on receive (⏳ OneSecond if a slot isn't free) → ✅ DONE once
       // the topic is created (onTopicCreated, below). For this path the acked
@@ -1456,11 +1772,13 @@ export function createOrchestrator(
       let effort: ReasoningEffort;
       let images: string[] | undefined;
       let firstText: string;
+      let voiceReply: VoiceReply | undefined;
       try {
         const [started, imgs, ingested] = await Promise.all([threadP, imagesP, ingestP]);
         ({ thread, model, effort } = started);
         images = imgs;
-        firstText = ingested || '你好，我们开始吧。';
+        firstText = ingested.text || '你好，我们开始吧。';
+        voiceReply = ingested.voice;
       } catch (err) {
         reaction?.done();
         // 失败路互不拖死：threadP 若已成功则回收孤儿进程，若失败吞掉其 rejection。
@@ -1472,20 +1790,26 @@ export function createOrchestrator(
         return;
       }
       log.info('card', 'start', { project: project?.name ?? '(unregistered)', model, effort, images: images?.length ?? 0, goal: Boolean(goal) });
+      const titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource);
       const launchOpts: LaunchOpts = {
         chatId: msg.chatId,
         replyTo: msg.messageId,
         replyInThread: true,
         thread,
         firstText,
+        voice: voiceReply,
         images,
         model,
         effort,
         cwd,
+        mode: perm.mode,
         summary: stripFileTokens(text).slice(0, 80) || '(空)',
         requesterOpenId: msg.senderId,
+        requestedAt: msg.createTime || tIntake,
         roleSuffix: perm.roleSuffix,
         backendId: be.id,
+        titleJobKey,
+        titleSource,
         timing: { tResolve: tResolveDone - tIntake, tWeave: Date.now() - tIntake },
       };
       if (goal) await launchGoalRun(launchOpts);
@@ -1771,12 +2095,17 @@ export function createOrchestrator(
         }
         trackSession(sessionKey, fresh);
         lastUsage.delete(sessionKey); // context gauge → 0 until the next turn
+        // `/clear` has no user question to title from. Park a policy-snapshotted
+        // waiting job; the next real message supplies the source and activates it
+        // only after that host turn is issued.
+        const titleJobKey = await registerSessionTitle(be, fresh.sessionId, cwd);
         await upsertSession({
           threadId: sessionKey,
           chatId: msg.chatId,
           cwd,
           sessionId: fresh.sessionId,
           backend: be.id,
+          titleJobKey,
           model: rec?.model,
           effort: rec?.effort,
           summary: '(新会话)',
@@ -1822,6 +2151,15 @@ export function createOrchestrator(
 
   // ── card actions ──────────────────────────────────────────────────
   const dispatcher = new CardDispatcher(channel, cfg);
+  const outboundFiles = new OutboundFiles(paths.outboundFilesDir);
+  void outboundFiles.recover(channel);
+  outboundFiles.register(dispatcher, async (record, openId) => {
+    if (!openId || !isChatAllowed(cfg, record.chatId)) return undefined;
+    const project = await getProjectByChatId(record.chatId);
+    if (!project || project.cwd !== record.cwd || !isUserAllowedInProject(cfg, project, openId)) return undefined;
+    if (openId !== record.requesterOpenId && !isAdmin(cfg, openId)) return undefined;
+    return turnTier(project, isAdmin(cfg, openId)).mode;
+  });
   cliBridge?.register(dispatcher);
   const PENDING_TTL_MS = 30 * 60_000; // abandoned config cards expire after 30 min
   // Goal runs have NO total wall-clock cap (a healthy goal may legitimately run
@@ -2046,6 +2384,45 @@ export function createOrchestrator(
       st.interrupt?.();
       log.info('card', 'action', { actionId: 'run.stop', stopped: Boolean(st.interrupt) });
     })
+    // “仅手动”模式的单轮完成提醒。这不是破坏性操作，但也不允许
+    // 管理员替别人订阅：只有这一轮的真实发起人能开启。
+    .on(RC.remind, ({ evt, value }) => {
+      const key = typeof value.m === 'string' ? value.m : evt.messageId;
+      if (!runAllowed(evt)) return;
+      const st = runsByCard.get(key);
+      if (!st) {
+        if (!runControlNotes.seen(`remind-ended:${key}:${evt.operator?.openId ?? ''}`)) {
+          void channel
+            .send(evt.chatId, { markdown: 'ℹ️ 该任务已结束，无需再开启完成提醒。' }, { replyTo: evt.messageId })
+            .catch(() => undefined);
+        }
+        log.info('card', 'action', { actionId: RC.remind, ended: true });
+        return;
+      }
+      const op = evt.operator?.openId;
+      if (!isCompletionReminderRequester(op, st.requesterOpenId)) {
+        if (!runControlNotes.seen(`remind-deny:${key}:${op ?? ''}`)) {
+          void channel
+            .send(evt.chatId, { markdown: '⚠️ 仅本轮发起人可开启完成提醒。' }, { replyTo: evt.messageId })
+            .catch(() => undefined);
+        }
+        log.info('card', 'action', { actionId: RC.remind, denied: true });
+        return;
+      }
+      // Settings may have changed after this frame was rendered. Refuse a
+      // stale manual button and repaint it away instead of creating a hidden
+      // per-turn override under long/failures/always.
+      if (!shouldShowCompletionReminderButton(cfg)) {
+        completionReminderRefreshers.get(key)?.();
+        log.info('card', 'action', { actionId: RC.remind, stale: true });
+        return;
+      }
+      if (!st.completionReminderRequested) {
+        st.completionReminderRequested = true;
+        completionReminderRefreshers.get(key)?.();
+      }
+      log.info('card', 'action', { actionId: RC.remind, requested: true });
+    })
     // 🎯 结束目标 (goal cards): clear the goal, let the current turn finish, then
     // stop — no auto-continue. Owner-or-admin gated like ⏹.
     .on(RC.endGoal, ({ evt, value }) => {
@@ -2097,14 +2474,57 @@ export function createOrchestrator(
     evt: CardActionEvent,
     mut: (p: AppPreferences) => void,
     opts?: { render?: boolean },
-  ): void {
-    if (!dmAdmin(evt.operator?.openId)) return;
-    const prefs: AppPreferences = { ...(cfg.preferences ?? {}) };
-    mut(prefs);
-    cfg.preferences = prefs;
-    // persist in the background; the card only needs the in-memory cfg
-    void saveConfig(cfg).catch((err) => log.fail('console', err, { phase: 'save-config' }));
-    if (opts?.render !== false) void patch(evt, renderSettings);
+  ): Promise<boolean> {
+    if (!dmAdmin(evt.operator?.openId)) return Promise.resolve(false);
+    const saved = writePreferences(mut).then(
+      () => true,
+      (err) => {
+        log.fail('console', err, { phase: 'save-config' });
+        return false;
+      },
+    );
+    if (opts?.render !== false) {
+      void patch(evt, async () => {
+        await saved;
+        return renderSettings();
+      });
+    }
+    return saved;
+  }
+
+  // CLI service state and its persisted enabled flag are one transition. Keep
+  // rapid on/off clicks ordered; if persistence fails after the side effect,
+  // compensate back to the last committed config so runtime and disk agree.
+  let cliEnabledTransition: Promise<unknown> = Promise.resolve();
+  function setCliBridgeEnabled(evt: CardActionEvent, enabled: boolean): Promise<void> {
+    const run = cliEnabledTransition.then(async () => {
+      if (getCliBridgePreferences(cfg).enabled === enabled) return;
+      try {
+        if (enabled) await cliBridge?.start?.();
+        else await cliBridge?.shutdown?.();
+
+        const saved = await applyPref(
+          evt,
+          (p) => {
+            p.cliBridge = { ...(p.cliBridge ?? {}), enabled };
+          },
+          { render: false },
+        );
+        if (!saved) {
+          // Best-effort rollback of the runtime side effect. The persisted and
+          // LIVE config deliberately stayed unchanged on write failure.
+          if (enabled) await cliBridge?.shutdown?.();
+          else await cliBridge?.start?.();
+        }
+      } catch (err) {
+        log.fail('cli-bridge', err, { phase: enabled ? 'enable' : 'disable' });
+      }
+    });
+    cliEnabledTransition = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   // 「☕ 咖啡一下」那组控件现在独立成二级卡（buildCoffeeSettingsCard），主设置卡只放入口。
@@ -2113,6 +2533,31 @@ export function createOrchestrator(
   let cliHookStatuses: Awaited<ReturnType<typeof inspectCliBridgeHooks>> | undefined;
   function renderSettings(): object {
     return buildSettingsCard(cfg);
+  }
+
+  /** A submitted CardKit form locks its card id, so any result containing more
+   * controls must be sent as a fresh managed card. Button-only settings still
+   * use `patch` and remain in-place. */
+  function sendFreshSettingsResult(
+    evt: CardActionEvent,
+    render: () => object | Promise<object>,
+    phase: string,
+  ): void {
+    void (async () => {
+      const next = await render();
+      await sendManagedCard(channel, evt.chatId, next);
+    })().catch((err) => log.fail('console', err, { phase }));
+  }
+
+  /** Old interactive cards can be abandoned without a callback. Bound their
+   * transient render state so a long-running bot cannot accumulate message ids
+   * forever; insertion order makes this a tiny FIFO eviction. */
+  function setBoundedCardState<T>(map: Map<string, T>, messageId: string, value: T): void {
+    if (!map.has(messageId) && map.size >= 64) {
+      const oldest = map.keys().next().value;
+      if (oldest !== undefined) map.delete(oldest);
+    }
+    map.set(messageId, value);
   }
 
   /** ☕ 咖啡一下 二级卡：本机离开转发那组控件（总开关 / 通知范围 / 转发后端 / 离开保活 /
@@ -2131,6 +2576,88 @@ export function createOrchestrator(
     return buildCoffeeSettingsCard(section);
   }
 
+  // ── 🏷️ Bridge 新会话的原生 resume 标题设置 ───────────────────────
+  function sessionTitleBackendOptions(): { id: string; label: string }[] {
+    return visibleCatalog()
+      .filter((entry) => entry.id === DEFAULT_BACKEND_ID || isBackendEntryInstalled(entry))
+      .map((entry) => ({ id: entry.id, label: entry.displayName }));
+  }
+
+  async function renderSessionTitleSettings(
+    selectedBackendId?: string,
+    notice?: string,
+  ): Promise<object> {
+    const options = sessionTitleBackendOptions();
+    const selected =
+      selectedBackendId && options.some((entry) => entry.id === selectedBackendId)
+        ? selectedBackendId
+        : options[0]?.id ?? DEFAULT_BACKEND_ID;
+    const models = await listModels(backendFor(selected)).catch((err) => {
+      log.fail('agent', err, { phase: 'session-title-models', backend: selected });
+      return [] as ModelInfo[];
+    });
+    return buildSessionTitleSettingsCard(cfg, options, selected, models, notice);
+  }
+
+  const sessionTitleRenderStates = new Map<string, { generation: number; selectedBackendId?: string }>();
+  async function renderSessionTitleSettingsFor(
+    messageId: string,
+    selectedBackendId?: string,
+    notice?: string,
+  ): Promise<object> {
+    const previous = sessionTitleRenderStates.get(messageId);
+    const state = { generation: (previous?.generation ?? 0) + 1, selectedBackendId };
+    setBoundedCardState(sessionTitleRenderStates, messageId, state);
+    for (;;) {
+      const latestState = sessionTitleRenderStates.get(messageId) ?? state;
+      const rendered = await renderSessionTitleSettings(latestState.selectedBackendId, notice);
+      const current = sessionTitleRenderStates.get(messageId);
+      if (!current || current === latestState) return rendered;
+    }
+  }
+
+  function applySessionTitlePref(
+    evt: CardActionEvent,
+    backendId: string,
+    config: SessionTitleBackendConfig,
+    notice: string,
+    freshAfterSubmit = false,
+  ): void {
+    if (!dmAdmin(evt.operator?.openId)) return;
+    const valid = sessionTitleBackendOptions().some((entry) => entry.id === backendId);
+    if (!valid) {
+      const renderInvalid = () => renderSessionTitleSettings(undefined, '⚠️ 这个 Agent 当前不可用，未保存。');
+      if (freshAfterSubmit) {
+        sendFreshSettingsResult(evt, renderInvalid, 'session-title-submit-validation');
+      } else {
+        void patch(evt, renderInvalid);
+      }
+      return;
+    }
+    const saved = writePreferences((prefs) => {
+      const current = prefs.sessionTitles ?? {};
+      prefs.sessionTitles = {
+        ...current,
+        byBackend: { ...(current.byBackend ?? {}), [backendId]: config },
+      };
+    }).then(
+      () => true,
+      (err) => {
+        log.fail('console', err, { phase: 'save-config' });
+        return false;
+      },
+    );
+    const renderSaved = async (): Promise<object> => {
+      const ok = await saved;
+      return renderSessionTitleSettings(backendId, ok ? notice : '⚠️ 保存失败，原配置未改变，请重试。');
+    };
+    if (freshAfterSubmit) {
+      sendFreshSettingsResult(evt, renderSaved, 'session-title-submit-result');
+    } else {
+      void patch(evt, renderSaved);
+    }
+  }
+
   // ── 📝 云文档评论 @bot 全局设置（DM「⚙️ 设置 → 📝 云文档评论」）───────────
   /** Installed backends offered for the comment flow (codex always; others when
    * downloaded) — same gate as the project backend picker. */
@@ -2140,26 +2667,91 @@ export function createOrchestrator(
       .map((e) => ({ id: e.id, label: e.displayName }));
   }
 
-  /** Render the comment-settings card for the CURRENT comments config: fetch the
-   * configured backend's live model list so the model/effort dropdowns match it. */
-  async function renderCommentSettings(notice?: string): Promise<object> {
-    const comments = getCommentsConfig(cfg);
-    const models = await listModels(backendFor(comments.backend)).catch(() => [] as ModelInfo[]);
-    return buildCommentSettingsCard(cfg, commentBackendOptions(), models, notice);
+  /** Render the comment-settings card. Agent buttons are transient edit state;
+   * the selected Agent/model/effort commit together only on form submit. */
+  async function renderCommentSettings(notice?: string, selectedBackendId?: string): Promise<object> {
+    const options = commentBackendOptions();
+    const configured = getCommentsConfig(cfg).backend ?? DEFAULT_BACKEND_ID;
+    const selected =
+      selectedBackendId && options.some((entry) => entry.id === selectedBackendId)
+        ? selectedBackendId
+        : options.some((entry) => entry.id === configured)
+          ? configured
+          : options[0]?.id ?? DEFAULT_BACKEND_ID;
+    for (;;) {
+      const comments = getCommentsConfig(cfg);
+      const models = await listModels(backendFor(selected)).catch(() => [] as ModelInfo[]);
+      const latest = getCommentsConfig(cfg);
+      if (
+        latest.backend !== comments.backend ||
+        latest.model !== comments.model ||
+        latest.effort !== comments.effort
+      ) {
+        continue;
+      }
+      const snapshot: AppConfig = {
+        ...cfg,
+        preferences: { ...(cfg.preferences ?? {}), comments: { ...comments } },
+      };
+      return buildCommentSettingsCard(snapshot, options, models, notice, selected);
+    }
   }
 
-  /** Mutate cfg.preferences.comments (admin-gated), persist, and re-render the
-   * comment-settings card in place. Mirrors {@link applyPref} but scoped to the
-   * comments block and refreshing the comment card (not the global one). */
-  function applyCommentsPref(evt: CardActionEvent, mut: (c: CommentsConfig) => void): void {
+  /** Per-card transient selection + generation. Two admins (or two old cards)
+   * can browse different Agents without sharing UI state; rapid clicks on one
+   * card converge to that card's newest selection after async model discovery. */
+  const commentSettingsRenderStates = new Map<string, { generation: number; selectedBackendId?: string }>();
+  async function renderCommentSettingsFor(
+    messageId: string,
+    selectedBackendId?: string,
+    notice?: string,
+  ): Promise<object> {
+    const previous = commentSettingsRenderStates.get(messageId);
+    const state = {
+      generation: (previous?.generation ?? 0) + 1,
+      selectedBackendId,
+    };
+    setBoundedCardState(commentSettingsRenderStates, messageId, state);
+    for (;;) {
+      const latestState = commentSettingsRenderStates.get(messageId) ?? state;
+      const rendered = await renderCommentSettings(notice, latestState.selectedBackendId);
+      const current = commentSettingsRenderStates.get(messageId);
+      if (!current || current === latestState) return rendered;
+    }
+  }
+
+  /** Mutate cfg.preferences.comments (admin-gated), persist, then render the
+   * comment card. Form submissions request a fresh card because CardKit locks
+   * the submitted entity; button-only callers may still update in place. */
+  function applyCommentsPref(
+    evt: CardActionEvent,
+    mut: (c: CommentsConfig) => void,
+    opts: { freshAfterSubmit?: boolean; notice?: string; selectedBackendId?: string } = {},
+  ): void {
     if (!dmAdmin(evt.operator?.openId)) return;
-    const prefs: AppPreferences = { ...(cfg.preferences ?? {}) };
-    const comments: CommentsConfig = { ...(prefs.comments ?? {}) };
-    mut(comments);
-    prefs.comments = comments;
-    cfg.preferences = prefs;
-    void saveConfig(cfg).catch((err) => log.fail('console', err, { phase: 'save-config' }));
-    void patch(evt, () => renderCommentSettings());
+    const saved = writePreferences((prefs) => {
+      const comments: CommentsConfig = { ...(prefs.comments ?? {}) };
+      mut(comments);
+      prefs.comments = comments;
+    }).then(
+      () => true,
+      (err) => {
+        log.fail('console', err, { phase: 'save-config' });
+        return false;
+      },
+    );
+    const renderSaved = async (): Promise<object> => {
+      const ok = await saved;
+      return renderCommentSettings(
+        ok ? opts.notice : '⚠️ 保存失败，原配置未改变，请重试。',
+        ok ? undefined : opts.selectedBackendId,
+      );
+    };
+    if (opts.freshAfterSubmit) {
+      sendFreshSettingsResult(evt, renderSaved, 'comment-settings-submit-result');
+    } else {
+      void patch(evt, renderSaved);
+    }
   }
 
   // Back-to-menu: the settings card is button-only (never locks) and the
@@ -2269,6 +2861,8 @@ export function createOrchestrator(
     };
   };
 
+  const voiceConsole = registerVoiceConsole(dispatcher, channel, cfg, voice);
+
   dispatcher
     .on(DM.menu, ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) freshMenu(evt);
@@ -2362,32 +2956,24 @@ export function createOrchestrator(
       patch(evt, () => renderProjectList(page));
     })
     .on(DM.settings, async ({ evt }) => {
-      if (dmAdmin(evt.operator?.openId)) await patch(evt, renderSettings);
+      if (dmAdmin(evt.operator?.openId)) {
+        voiceConsole.leave(evt.messageId);
+        await patch(evt, renderSettings);
+      }
     })
     // ☕ 咖啡一下 二级卡：进卡时读一次 hook 安装状态（~/.claude、~/.codex）再渲染。
     .on(DM.coffeeSettings, async ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) await patch(evt, () => renderCoffeeSettings(true));
     })
-    .on(CLI.toggleEnabled, async ({ evt, value }) => {
+    .on(CLI.toggleEnabled, ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const enabled = value.v === 'on';
       if (enabled && !canEnableCliBridge(cfg).ok) return;
-      try {
-        if (enabled) {
-          await cliBridge?.start?.();
-          applyPref(evt, (p) => {
-            p.cliBridge = { ...(p.cliBridge ?? {}), enabled: true };
-          }, { render: false });
-        } else {
-          applyPref(evt, (p) => {
-            p.cliBridge = { ...(p.cliBridge ?? {}), enabled: false };
-          }, { render: false });
-          await cliBridge?.shutdown?.();
-        }
-      } catch (err) {
-        log.fail('cli-bridge', err, { phase: enabled ? 'enable' : 'disable' });
-      }
-      void patch(evt, renderCoffeeSettings);
+      const transition = setCliBridgeEnabled(evt, enabled);
+      void patch(evt, async () => {
+        await transition;
+        return renderCoffeeSettings();
+      });
     })
     .on(CLI.repairHooks, async ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
@@ -2411,29 +2997,38 @@ export function createOrchestrator(
     .on(CLI.setNotifyScope, ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const scope = value.v === 'bound_projects' || value.v === 'none' ? value.v : 'all';
-      applyPref(evt, (p) => {
+      const saved = applyPref(evt, (p) => {
         p.cliBridge = { ...(p.cliBridge ?? {}), notifyScope: scope };
       }, { render: false });
-      void patch(evt, renderCoffeeSettings);
+      void patch(evt, async () => {
+        await saved;
+        return renderCoffeeSettings();
+      });
     })
     .on(CLI.toggleAgent, ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const agent = value.agent === 'codex' ? 'codex' : 'claude';
       const on = value.v === 'on';
-      applyPref(evt, (p) => {
+      const saved = applyPref(evt, (p) => {
         const cur = p.cliBridge ?? {};
         p.cliBridge = { ...cur, agents: { ...(cur.agents ?? {}), [agent]: on } };
       }, { render: false });
-      void patch(evt, renderCoffeeSettings);
+      void patch(evt, async () => {
+        await saved;
+        return renderCoffeeSettings();
+      });
     })
     .on(CLI.toggleKeepAwake, ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const on = value.v === 'on';
-      applyPref(evt, (p) => {
+      const saved = applyPref(evt, (p) => {
         const cur = p.cliBridge ?? {};
         p.cliBridge = { ...cur, keepAwake: { ...(cur.keepAwake ?? {}), enabled: on } };
       }, { render: false });
-      void patch(evt, renderCoffeeSettings);
+      void patch(evt, async () => {
+        await saved;
+        return renderCoffeeSettings();
+      });
     })
     .on(DM.doctor, async ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
@@ -2670,6 +3265,66 @@ export function createOrchestrator(
         n === 0 ? 0 : Math.min(Math.max(Math.floor(n), RUN_IDLE_TIMEOUT_MIN_SEC), RUN_IDLE_TIMEOUT_MAX_SEC);
       applyPref(evt, (p) => (p.runIdleTimeoutSeconds = sec));
     })
+    .on(DM.setCompletionReminder, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const mode = value.v;
+      if (mode !== 'manual' && mode !== 'long' && mode !== 'failures' && mode !== 'always') return;
+      // Shared writer persists first and only then mutates LIVE cfg, so a disk
+      // failure cannot create a setting that works until restart and vanishes.
+      // Queue the write before the 500ms card-interaction settle delay: a task
+      // finishing immediately after this click must already see the new policy.
+      const saved = performSetCompletionReminder({
+        cfg,
+        mode: mode as CompletionReminderMode,
+        writePreferences,
+      }).then(
+        (result) => {
+          if (!result.ok) log.warn('console', 'completion-reminder-rejected', { reason: result.reason });
+          else refreshCompletionReminderCards();
+        },
+        (err) => log.fail('console', err, { phase: 'save-config' }),
+      );
+      void patch(evt, async () => {
+        await saved;
+        return renderSettings();
+      });
+    })
+    .on(DM.completionReminderCustom, ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      void patch(evt, buildCompletionReminderCustomCard(cfg));
+    })
+    .on(DM.completionReminderCustomSubmit, ({ evt, formValue }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const raw = String(formValue?.minutes ?? '').trim();
+      const minutes = Number(raw);
+      if (
+        !Number.isInteger(minutes) ||
+        minutes < COMPLETION_REMINDER_LONG_TASK_MIN_MINUTES ||
+        minutes > COMPLETION_REMINDER_LONG_TASK_MAX_MINUTES
+      ) {
+        // A submitted form card becomes interaction-locked. Repaint it into a
+        // fresh form so an invalid value is actually retryable instead of
+        // leaving the user with a warning beside a dead input.
+        void patch(evt, buildCompletionReminderCustomCard(cfg));
+        return;
+      }
+      const saved = performSetCompletionReminder({
+        cfg,
+        mode: 'long',
+        longTaskMinutes: minutes,
+        writePreferences,
+      }).then(
+        (result) => {
+          if (!result.ok) log.warn('console', 'completion-reminder-rejected', { reason: result.reason });
+          else refreshCompletionReminderCards();
+        },
+        (err) => log.fail('console', err, { phase: 'save-config' }),
+      );
+      void patch(evt, async () => {
+        await saved;
+        return renderSettings();
+      });
+    })
     .on(DM.setPending, ({ evt, value }) => {
       if (value.v === 'steer' || value.v === 'queue') applyPref(evt, (p) => (p.pendingPolicy = value.v as PendingPolicy));
     })
@@ -2677,32 +3332,115 @@ export function createOrchestrator(
       const n = Number(value.v);
       if (Number.isFinite(n)) applyPref(evt, (p) => (p.maxConcurrentRuns = n));
     })
-    // 📝 云文档评论 @bot 全局设置：纯按钮即点即改即重渲（提示词走 comment-instructions.md 文件，不在卡里）。
+    // 🏷️ 每个 Agent 后端独立配置。模型列表只用于方便选择，不充当白名单；
+    // 表单也接受任意第三方模型 ID，运行时严格原样调用，失败即截断兜底。
+    .on(DM.sessionTitleSettings, ({ evt }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      void patch(evt, () => renderSessionTitleSettingsFor(evt.messageId));
+    })
+    .on(DM.sessionTitleSetBackend, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const backendId = typeof value.v === 'string' ? value.v : undefined;
+      void patch(evt, () => renderSessionTitleSettingsFor(evt.messageId, backendId));
+    })
+    .on(DM.sessionTitleDisable, ({ evt, value }) => {
+      const backendId = typeof value.b === 'string' ? value.b : '';
+      applySessionTitlePref(evt, backendId, { enabled: false }, '✅ 已改为截断首句；以后新建的会话不调用标题模型。');
+    })
+    .on(DM.sessionTitleSubmit, ({ evt, value, formValue }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const backendId = typeof value.b === 'string' ? value.b : '';
+      const parsed = parseSessionTitleFormValue(formValue);
+      if (!parsed.ok) {
+        sendFreshSettingsResult(
+          evt,
+          () => renderSessionTitleSettings(backendId, `⚠️ ${parsed.message}`),
+          'session-title-submit-validation',
+        );
+        return;
+      }
+      if (!getSessionTitleEfforts(backendId).includes(parsed.config.effort)) {
+        sendFreshSettingsResult(
+          evt,
+          () => renderSessionTitleSettings(backendId, '⚠️ 当前 Agent 不支持这个推理强度，未保存。'),
+          'session-title-submit-validation',
+        );
+        return;
+      }
+      applySessionTitlePref(
+        evt,
+        backendId,
+        parsed.config,
+        `✅ 已保存：AI 精炼 · ${parsed.config.model} · ${reasoningEffortLabel(parsed.config.effort)}。仅影响以后新建的会话。`,
+        true,
+      );
+    })
+    // 📝 云文档评论 @bot 全局设置：Agent 按钮仅切换预览，模型/强度随表单一次保存；
+    // 回复规则走 comment-instructions.md 文件，不塞进 config.json。
     .on(DM.commentSettings, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      void patch(evt, () => renderCommentSettings());
+      void patch(evt, () => renderCommentSettingsFor(evt.messageId));
     })
     .on(DM.commentSetBackend, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
       const v = typeof value.v === 'string' ? value.v : undefined;
-      // Backend is a button (cascade source): switching invalidates the stored
-      // model/effort (backend-specific) → clear them, then re-render so the form's
-      // dropdowns reflect the new backend's models.
-      applyCommentsPref(evt, (c) => {
-        c.backend = v && backendIds().includes(v) ? v : undefined;
-        c.model = undefined;
-        c.effort = undefined;
-      });
+      // Transient cascade source: fetch that Agent's models, but do not mutate
+      // persistent comments config until the form is submitted.
+      void patch(evt, () => renderCommentSettingsFor(evt.messageId, v));
     })
     // Model + effort form submit (one save for both). The dropdowns preselect the
     // current value, so a submit always carries a concrete model/effort to store.
-    .on(DM.commentSubmit, ({ evt, formValue }) => {
+    .on(DM.commentSubmit, ({ evt, value, formValue }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
+      const backendId = typeof value.b === 'string' ? value.b : getCommentsConfig(cfg).backend ?? DEFAULT_BACKEND_ID;
+      if (!commentBackendOptions().some((entry) => entry.id === backendId)) {
+        sendFreshSettingsResult(
+          evt,
+          () => renderCommentSettings('⚠️ 这个 Agent 当前不可用，未保存。'),
+          'comment-settings-submit-validation',
+        );
+        return;
+      }
       const modelId = selectValue(formValue, 'model');
-      const effort = asEffort(selectValue(formValue, 'effort'));
-      applyCommentsPref(evt, (c) => {
-        if (modelId) c.model = modelId; // single-model backend renders no select → leave as-is
-        if (effort) c.effort = effort; // no-effort backend renders no select → leave as-is
-      });
+      const rawRequestedEffort = selectValue(formValue, 'effort');
+      const requestedEffort = asEffort(rawRequestedEffort);
+      if (rawRequestedEffort && !requestedEffort) {
+        sendFreshSettingsResult(
+          evt,
+          () => renderCommentSettings('⚠️ 推理强度无效，未保存。请重新选择。', backendId),
+          'comment-settings-submit-validation',
+        );
+        return;
+      }
+      void (async () => {
+        const models = await listModels(backendFor(backendId)).catch(() => [] as ModelInfo[]);
+        const resolved = resolveCommentModelFormValue(models, modelId, requestedEffort);
+        if (!resolved.ok) {
+          sendFreshSettingsResult(
+            evt,
+            () => renderCommentSettings(`⚠️ ${resolved.message}`, backendId),
+            'comment-settings-submit-validation',
+          );
+          return;
+        }
+        const { model: selected, effort, adjusted } = resolved;
+        const summary = `${selected.displayName || selected.id}${effort ? ` · ${reasoningEffortLabel(effort)}` : ''}`;
+        applyCommentsPref(
+          evt,
+          (c) => {
+            c.backend = backendId;
+            c.model = selected.id;
+            c.effort = effort;
+          },
+          {
+            freshAfterSubmit: true,
+            selectedBackendId: backendId,
+            notice: adjusted
+              ? `✅ 已保存：${summary}。所选强度不适用于这个模型，已自动调整。`
+              : `✅ 已保存：${summary}。下一条新评论起生效。`,
+          },
+        );
+      })().catch((err) => log.fail('console', err, { phase: 'comment-settings-submit' }));
     })
     // ✍️ 编辑提示词：打开预填当前 master 模板（含 {变量}）的编辑子卡。
     .on(DM.commentEditPrompt, ({ evt }) => {
@@ -2723,21 +3461,40 @@ export function createOrchestrator(
       void (async () => {
         if (!content.trim()) {
           const cur = await loadCommentInstructions(paths.commentInstructionsFile);
-          await patch(evt, buildCommentPromptCard(cur, '⚠️ 提示词不能为空，未保存。', paths.commentInstructionsFile));
+          sendFreshSettingsResult(
+            evt,
+            () => buildCommentPromptCard(cur, '⚠️ 回复规则不能为空，未保存。', paths.commentInstructionsFile),
+            'comment-prompt-submit-validation',
+          );
           return;
         }
-        await saveCommentInstructions(paths.commentInstructionsFile, content).catch((err) =>
-          log.fail('console', err, { phase: 'save-comment-prompt' }),
-        );
+        try {
+          await saveCommentInstructions(paths.commentInstructionsFile, content);
+        } catch (err) {
+          log.fail('console', err, { phase: 'save-comment-prompt' });
+          sendFreshSettingsResult(
+            evt,
+            () => buildCommentPromptCard(content, '⚠️ 回复规则保存失败，原规则未改变，请重试。', paths.commentInstructionsFile),
+            'comment-prompt-submit-result',
+          );
+          return;
+        }
         const n = await syncAllCommentInstructions(paths.commentsRootDir, content, cfg.accounts.app.tenant).catch(
-          () => 0,
+          (err) => {
+            log.fail('console', err, { phase: 'sync-comment-prompt' });
+            return undefined;
+          },
         );
-        await patch(evt, () =>
-          buildCommentPromptCard(
+        sendFreshSettingsResult(
+          evt,
+          () => buildCommentPromptCard(
             content,
-            `✅ 提示词已保存，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
+            n === undefined
+              ? '⚠️ 回复规则已保存，但同步到已有文档失败，请重试。'
+              : `✅ 回复规则已保存，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
             paths.commentInstructionsFile,
           ),
+          'comment-prompt-submit-result',
         );
       })();
     })
@@ -2746,20 +3503,38 @@ export function createOrchestrator(
     .on(DM.commentResetPrompt, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       void (async () => {
-        await saveCommentInstructions(paths.commentInstructionsFile, DEFAULT_COMMENT_INSTRUCTIONS).catch((err) =>
-          log.fail('console', err, { phase: 'reset-comment-prompt' }),
-        );
+        try {
+          await saveCommentInstructions(paths.commentInstructionsFile, DEFAULT_COMMENT_INSTRUCTIONS);
+        } catch (err) {
+          log.fail('console', err, { phase: 'reset-comment-prompt' });
+          const current = await loadCommentInstructions(paths.commentInstructionsFile).catch(
+            () => DEFAULT_COMMENT_INSTRUCTIONS,
+          );
+          sendFreshSettingsResult(
+            evt,
+            () => buildCommentPromptCard(current, '⚠️ 重置失败，原回复规则未改变，请重试。', paths.commentInstructionsFile),
+            'comment-prompt-reset-result',
+          );
+          return;
+        }
         const n = await syncAllCommentInstructions(
           paths.commentsRootDir,
           DEFAULT_COMMENT_INSTRUCTIONS,
           cfg.accounts.app.tenant,
-        ).catch(() => 0);
-        await patch(evt, () =>
-          buildCommentPromptCard(
+        ).catch((err) => {
+          log.fail('console', err, { phase: 'sync-comment-prompt' });
+          return undefined;
+        });
+        sendFreshSettingsResult(
+          evt,
+          () => buildCommentPromptCard(
             DEFAULT_COMMENT_INSTRUCTIONS,
-            `↩️ 已重置为默认提示词，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
+            n === undefined
+              ? '⚠️ 已重置为默认回复规则，但同步到已有文档失败，请重试。'
+              : `↩️ 已重置为默认回复规则，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
             paths.commentInstructionsFile,
           ),
+          'comment-prompt-reset-result',
         );
       })();
     })
@@ -2857,11 +3632,12 @@ export function createOrchestrator(
       log.info('console', 'admin-add', { picked: id?.slice(-6) ?? null });
       void (async () => {
         if (id) {
-          const access: AppAccess = { ...(cfg.preferences?.access ?? {}) };
-          access.ownerOpenId ??= resolveOwner(cfg);
-          access.admins = Array.from(new Set([...(access.admins ?? []), id]));
-          cfg.preferences = { ...(cfg.preferences ?? {}), access };
-          await saveConfig(cfg).catch((e) => log.fail('console', e, { phase: 'save-config' }));
+          await writePreferences((preferences) => {
+            const access: AppAccess = { ...(preferences.access ?? {}) };
+            access.ownerOpenId ??= resolveOwner(cfg);
+            access.admins = Array.from(new Set([...(access.admins ?? []), id]));
+            preferences.access = access;
+          }).catch((e) => log.fail('console', e, { phase: 'save-config' }));
         }
         const ids = [resolveOwner(cfg), ...(cfg.preferences?.access?.admins ?? [])];
         const next = buildAdminsCard(cfg, await namesWithOperator(evt, ids));
@@ -2873,11 +3649,12 @@ export function createOrchestrator(
       const id = typeof value.u === 'string' ? value.u : '';
       patch(evt, async () => {
         if (id && id !== resolveOwner(cfg)) {
-          const access: AppAccess = { ...(cfg.preferences?.access ?? {}) };
-          access.ownerOpenId ??= resolveOwner(cfg);
-          access.admins = (access.admins ?? []).filter((x) => x !== id);
-          cfg.preferences = { ...(cfg.preferences ?? {}), access };
-          await saveConfig(cfg).catch((e) => log.fail('console', e, { phase: 'save-config' }));
+          await writePreferences((preferences) => {
+            const access: AppAccess = { ...(preferences.access ?? {}) };
+            access.ownerOpenId ??= resolveOwner(cfg);
+            access.admins = (access.admins ?? []).filter((x) => x !== id);
+            preferences.access = access;
+          }).catch((e) => log.fail('console', e, { phase: 'save-config' }));
         }
         const ids = [resolveOwner(cfg), ...(cfg.preferences?.access?.admins ?? [])];
         return buildAdminsCard(cfg, await namesWithOperator(evt, ids));
@@ -3189,7 +3966,12 @@ export function createOrchestrator(
   }
 
   // ── shared run loop ───────────────────────────────────────────────
+  async function sendCompletionReminder(input: CompletionReminderReplyInput): Promise<void> {
+    await sendCompletionReminderReply({ channel, cfg, dedupe: completionReminderSent }, input);
+  }
+
   interface LaunchOpts {
+    voice?: VoiceReply;
     chatId: string;
     replyTo: string;
     /** true on first reply that creates the topic; subsequent replies use replyTo only */
@@ -3202,10 +3984,18 @@ export function createOrchestrator(
     knownThreadId?: string;
     model?: string;
     effort?: ReasoningEffort;
+    /** The run's workspace. Resolves relative `![](…)` image refs in the reply
+     * and is persisted as the session's cwd — NOT the bridge process's cwd. */
     cwd?: string;
+    /** The turn's permission mode; a `full` project may reference images outside
+     * {@link cwd} (see ../card/outbound-images). */
+    mode?: PermissionMode;
     summary?: string;
     /** who triggered this run (for ⏹/⚙️ ownership gating) */
     requesterOpenId?: string;
+    /** wall-clock origin for completion reminders; normally the inbound
+     * message's createTime, so global/session queueing is included. */
+    requestedAt?: number;
     /** single-session group: reply by quoting (no reply_in_thread / topic). */
     flat?: boolean;
     /** when admin/guest tiers are split: 'admin'|'guest' to namespace the
@@ -3214,6 +4004,12 @@ export function createOrchestrator(
     /** the backend that created `thread` (persisted into the SessionRecord so a
      * restart resumes on the same runtime). Unset → default (codex). */
     backendId?: string;
+    /** Durable title ledger key for a Bridge-owned, newly-created native
+     * session. Absent for manual /resume, legacy sessions, and doc comments. */
+    titleJobKey?: string;
+    /** Structured, un-woven first message. Required so a rejected first turn
+     * can be retitled from a later queued message without touching AgentInput. */
+    titleSource: SessionTitleSource;
     /** prefetched SessionRecord for the FIRST turn (M-1 极限提前)：免掉编织完成
      * 与 turn/start 之间的 getSession 读盘。`null` = 确知没有记录（全新会话）；
      * undefined = 没预取，照旧读。后续排队轮永远重读（⚙️ 可能改了 model）。 */
@@ -3249,21 +4045,34 @@ export function createOrchestrator(
     if (sema.hasFree()) return { release: await sema.acquire() };
     const stream = new RunCardStream();
     let msgId: string | undefined;
+    const queueCard = (input: Parameters<typeof buildQueuedCard>[0]) =>
+      buildQueuedCard({
+        ...input,
+        voiceMessages: opts.voice ? [opts.voice] : undefined,
+        ...(!state.isGoal ? { completionReminder: completionReminderView(state) } : {}),
+      });
     const q = sema.enqueue((pos) => {
       // 前面有人拿到槽/取消 → 原地刷新位置。走合并泵（非阻塞、合并、限频）。
-      if (msgId) stream.streamCoalesced(channel, buildQueuedCard({ position: pos, cardKey: msgId }), null);
+      if (msgId) stream.streamCoalesced(channel, queueCard({ position: pos, cardKey: msgId }), null);
     });
     try {
-      msgId = await stream.create(channel, opts.chatId, buildQueuedCard({ position: q.position() }), {
+      msgId = await stream.create(channel, opts.chatId, queueCard({ position: q.position() }), {
         replyTo: opts.replyTo,
         replyInThread: opts.flat ? false : (opts.replyInThread ?? Boolean(opts.knownThreadId)),
       });
       // 自指按钮（m = 自己的 messageId）只能在拿到 messageId 后补上。建卡 RTT 里
       // 槽可能已到手（position()=0）——那就不补按钮，run 卡马上原地接管。
       const pos = q.position();
-      if (pos > 0) await stream.updateCard(channel, buildQueuedCard({ position: pos, cardKey: msgId }));
+      if (pos > 0) await stream.updateCard(channel, queueCard({ position: pos, cardKey: msgId }));
       runsByCard.set(msgId, state);
       runStreams.set(msgId, stream);
+      if (!state.isGoal) {
+        const key = msgId;
+        completionReminderRefreshers.set(key, () => {
+          const currentPos = q.position();
+          if (currentPos > 0) void stream.updateLiveCard(channel, queueCard({ position: currentPos, cardKey: key }));
+        });
+      }
     } catch (err) {
       // 占位卡失败不阻断排队：没有卡只是不可见/不可取消，run 照常等槽。
       log.fail('card', err, { phase: 'queued-card' });
@@ -3273,6 +4082,7 @@ export function createOrchestrator(
     // 让位给运行期 interrupt（launchRun 每轮重装）。
     state.interrupt = () => {
       if (!q.cancel()) return;
+      state.intakeCancelled = true;
       active.delete(activeKey);
       if (opts.knownThreadId) sessions.delete(opts.knownThreadId);
       // 还没跑过任何 turn：直接回收进程。持久化记录保留，重发消息经 resume 兜底。
@@ -3280,7 +4090,8 @@ export function createOrchestrator(
       if (msgId) {
         runsByCard.delete(msgId);
         runStreams.delete(msgId);
-        void stream.updateCard(channel, buildQueuedCard({ cancelled: true, dropped: state.queue.length }));
+        completionReminderRefreshers.delete(msgId);
+        void stream.updateCard(channel, queueCard({ cancelled: true, dropped: state.queue.length }));
       }
       reaction?.done();
       log.info('card', 'action', { actionId: 'run.stop', queuedCancel: true });
@@ -3298,6 +4109,9 @@ export function createOrchestrator(
   ): Promise<void> {
     let activeKey = opts.knownThreadId ?? `pending:${opts.replyTo}`;
     let topicThreadId = opts.knownThreadId;
+    // The turn's workspace: resolves relative image refs in the reply and is what
+    // the session record stores (see LaunchOpts.cwd).
+    const runCwd = opts.cwd ?? fallbackCwd;
     // Reuse the reservation handleTurn made for this session (so messages
     // queued during startup aren't lost); fall back to a fresh state otherwise.
     const state: ActiveState = active.get(activeKey) ?? { queue: [], requesterOpenId: opts.requesterOpenId };
@@ -3313,14 +4127,68 @@ export function createOrchestrator(
     let queuedCard = slot.queuedCard;
     reaction?.started(); // slot acquired → flip OneSecond → Typing
     let firstCardSent = false;
+    let titleStart: Promise<boolean> | undefined;
+    let titleApplyRequested = false;
+    let titleTurnAttempted = false;
+
+    const beginSessionTitle = (): void => {
+      if (!opts.titleJobKey || titleStart) return;
+      const key = opts.titleJobKey;
+      titleStart = (async () => {
+        try {
+          // Called only after the host emits turn_started. A start rejection
+          // leaves waiting_turn + its binding marker intact for the next message.
+          const activated = await sessionTitles.activate(key);
+          if (!activated) return false;
+          await sessionTitles.prepare(key);
+          return true;
+        } catch (err) {
+          log.fail('agent', err, { phase: 'session-title-start', key });
+          return false;
+        }
+      })();
+    };
+    const requestSessionTitleApply = (): void => {
+      if (!opts.titleJobKey || !titleStart || titleApplyRequested) return;
+      titleApplyRequested = true;
+      const key = opts.titleJobKey;
+      const bindingKey = topicThreadId;
+      void titleStart.then(async (activated) => {
+        if (!activated) {
+          titleStart = undefined;
+          titleApplyRequested = false;
+          return;
+        }
+        if (bindingKey) {
+          await clearSessionTitleJobKey(bindingKey, key).catch((err) =>
+            log.fail('agent', err, { phase: 'session-title-marker-clear', key }),
+          );
+        }
+        await sessionTitles.apply(key);
+      });
+    };
+    const retrySessionTitleAfterTurn = (): void => {
+      if (!opts.titleJobKey || !titleStart) return;
+      const key = opts.titleJobKey;
+      void (async () => {
+        if (!(await titleStart)) return;
+        // Claude's native session row may appear only after the first result. An
+        // idempotent post-turn attempt plus a short delayed retry covers that
+        // timing edge without holding the user's run/semaphore completion.
+        await sessionTitles.apply(key);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await sessionTitles.apply(key);
+      })();
+    };
 
     const persist = async (threadId: string): Promise<void> => {
       await upsertSession({
         threadId,
         chatId: opts.chatId,
-        cwd: opts.cwd ?? fallbackCwd,
+        cwd: runCwd,
         sessionId: opts.thread.sessionId,
         backend: opts.backendId ?? DEFAULT_BACKEND_ID,
+        titleJobKey: opts.titleJobKey,
         model: opts.model,
         effort: opts.effort,
         summary: opts.summary ?? opts.firstText.slice(0, 80),
@@ -3347,14 +4215,33 @@ export function createOrchestrator(
     // tracks the latest run card key so the finally can clear runsByCard even
     // if the stream producer throws mid-turn (avoids leaking a stale stop target)
     let curCardKey: string | undefined;
+    let disposeInterrupt: (() => void) | undefined;
     // intake durations ride the FIRST turn's stream.timing line only (M-1)
     let intake = opts.timing;
     let firstRec = opts.firstRec;
     try {
-      let turnInput: AgentInput = { text: opts.firstText, images: opts.images };
+      let currentTurn: QueuedTurn = {
+        input: { text: opts.firstText, images: opts.images },
+        voice: opts.voice,
+        titleSource: opts.titleSource,
+        requesterOpenId: opts.requesterOpenId,
+        requestedAt: opts.requestedAt ?? Date.now(),
+        summary: opts.summary,
+      };
       let replyTo = opts.replyTo;
       let replyInThread = opts.flat ? false : (opts.replyInThread ?? Boolean(opts.knownThreadId));
       for (;;) {
+        const turnInput = currentTurn.input;
+        state.requesterOpenId = currentTurn.requesterOpenId;
+        if (titleTurnAttempted && !titleStart && opts.titleJobKey) {
+          // A prior turn/start was rejected before turn_started. If a queued
+          // follow-up now becomes the first accepted turn, title that message,
+          // not the rejected one. AgentInput.text is deliberately forbidden
+          // here because it contains Bridge sender/quote/history/file context.
+          await sessionTitles.attachSource(opts.titleJobKey, currentTurn.titleSource).catch((err) =>
+            log.fail('agent', err, { phase: 'session-title-refresh', key: opts.titleJobKey }),
+          );
+        }
         // per-turn model/effort: prefer latest persisted (⚙️ may have changed it).
         // First turn uses the intake-prefetched record (null = known absent) so
         // runStreamed — i.e. turn/start — fires with zero awaits after weaving.
@@ -3365,6 +4252,7 @@ export function createOrchestrator(
         const turnEffort = rec?.effort ?? opts.effort;
         const modelDisp = getModelDisplay(cfg);
         const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
+        titleTurnAttempted = true;
         const turnStartAt = Date.now(); // turn/start 已在 runStreamed() 内发出（与下面的建卡并行）
         state.run = run;
         const render = new RunRender();
@@ -3372,8 +4260,10 @@ export function createOrchestrator(
         let cardMsgId: string | undefined;
         const rc: RunCardState = {
           rs: render.snapshot(),
-          requesterOpenId: opts.requesterOpenId,
+          voiceMessages: currentTurn.voice ? [currentTurn.voice] : [],
+          requesterOpenId: currentTurn.requesterOpenId,
           showTools: render.showTools,
+          completionReminder: completionReminderView(state),
           // 模型显示档位：footnote 本轮 model·推理强度；always 档终态卡也保留。
           ...(modelDisp !== 'off' && turnModel
             ? { model: turnModel, effort: turnEffort, modelOnTerminal: modelDisp === 'always' }
@@ -3406,6 +4296,24 @@ export function createOrchestrator(
         // CardKit streaming entity: body streams with the native typewriter,
         // ⏹/⚙️ ride whole-card updates — both on one card_id (see RunCardStream).
         const stream = queuedCard?.stream ?? new RunCardStream();
+        state.voiceReply = {
+          run,
+          add: (voice) => {
+            const messages = (rc.voiceMessages ??= []);
+            if (messages.some((v) => v.messageId === voice.messageId)) return;
+            messages.push(voice);
+            if (!cardMsgId) return; // The post-create frame picks it up below.
+            if (rc.rs.terminal === 'running') stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID);
+            else void stream.updateCard(channel, buildRunCard(rc))
+              .catch((err) => log.fail('card', err, { phase: 'voice-steer-reply' }));
+          },
+        };
+        attachRunImages({
+          stream,
+          rc,
+          channel,
+          upload: (sources) => uploadOutboundImages(channel, sources, runCwd, opts.mode ?? DEFAULT_PERMISSION_MODE),
+        });
         const tCreate = Date.now();
         try {
           if (queuedCard) {
@@ -3435,6 +4343,15 @@ export function createOrchestrator(
         rc.cardKey = cardMsgId;
         runsByCard.set(cardMsgId, state);
         runStreams.set(cardMsgId, stream);
+        completionReminderRefreshers.set(cardMsgId, () => {
+          rc.completionReminder = completionReminderView(state);
+          void stream.updateLiveCard(channel, buildRunCard(rc));
+        });
+        // The entity is created before its carrier messageId exists, so the
+        // initial JSON cannot self-route controls. Establish the first
+        // self-addressed ⏹/🔔 row immediately instead of waiting for an agent
+        // event (a long silent tool startup still needs both controls).
+        stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID);
         await adoptThreadId(cardMsgId);
         // first card is live = topic created. The 群@bot 建话题 path flips its
         // reaction to DONE here (creating the topic is the acked action), unlike
@@ -3466,7 +4383,8 @@ export function createOrchestrator(
           abort: (tid) => void opts.thread.abort(tid).catch(() => undefined),
           forceStop: resolveStop,
         });
-        state.interrupt = stopper.interrupt;
+        disposeInterrupt = stopper.dispose;
+        state.interrupt = () => { state.intakeCancelled = true; stopper.interrupt(); };
         const idleMs = currentIdleMs();
         const guarded = withIdleTimeout(
           run.events,
@@ -3489,6 +4407,12 @@ export function createOrchestrator(
           const tEv = Date.now();
           if (!firstEvAt) firstEvAt = tEv;
           const et = (ev as { type?: string }).type;
+          if (et === 'turn_started') {
+            // Host accepted the first turn. Title generation now overlaps the
+            // remainder of that turn; the binding was persisted before this loop.
+            beginSessionTitle();
+            requestSessionTitleApply();
+          }
           if (et === 'text_delta') {
             if (!firstTextAt) firstTextAt = tEv;
             const d = (ev as { delta?: string }).delta;
@@ -3510,22 +4434,36 @@ export function createOrchestrator(
           }
           render.apply(ev);
           rc.rs = render.snapshot();
+          // The global mode is live-editable. Re-evaluate on every structural /
+          // answer frame so switching away from manual removes the button from
+          // an already-running card instead of leaving a stale affordance.
+          rc.completionReminder = completionReminderView(state);
           // Non-blocking: never stall event consumption on a round-trip. The pump
           // coalesces and routes the latest snapshot — answer text → element
           // typewriter (cardElement.content), structure → whole-card update.
           stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID);
         }
+        state.run = undefined; // completion-card I/O must queue, never steer into a finished turn
         const doneAt = Date.now(); // codex stopped emitting / loop ended
         stopper.dispose(); // 事件流已收尾：撤掉 ⏹ 的 5s 强停兜底定时器
-        await stream.drain(); // flush the last coalesced frame before terminal
+        disposeInterrupt = undefined;
+        await stream.drain().catch(err => log.fail('card', err, { phase: 'terminal-drain' })); // terminal I/O must not kill a completed turn
         state.interrupt = undefined; // turn done; nothing left to interrupt
         const interrupted = stopper.interrupted();
         // 杀进程恢复锤只留给「真出事」：watchdog 超时，或 ⏹ 后没等到干净收尾
         // （forced）。优雅 ⏹（done 及时到达）不算 killed —— 线程与进程留用。
         const killed = timedOut || (interrupted && stopper.forced());
-        if (interrupted) render.interrupt();
-        else if (timedOut) render.timeout(Math.round(idleMs / 1000));
-        else render.finalize();
+        // A child crash closes the notification iterator cleanly, so no error
+        // event is guaranteed. Detect liveness BEFORE finalizing: only a still-
+        // running render becomes error; an explicit backend done/error terminal
+        // remains authoritative.
+        const procDead = !killed && !opts.thread.isAlive();
+        settleOrdinaryTurnRender(render, {
+          interrupted,
+          timedOut,
+          idleTimeoutSeconds: Math.round(idleMs / 1000),
+          procDead,
+        });
         rc.rs = render.snapshot();
         if (interrupted) log.info('agent', 'interrupt', { graceful: !stopper.forced(), threadId: topicThreadId ?? null });
 
@@ -3541,7 +4479,6 @@ export function createOrchestrator(
         // 进程级死亡（app-server 中途崩溃 → error 卡 / 轮间死 → 空卡，killed=false）
         // 同走回收：立即清出缓存，下一条消息直接经 resolveThread 的 resume 兜底
         // 自愈（快路径的 isAlive 守卫是兜底的兜底）。
-        const procDead = !killed && !opts.thread.isAlive();
         if (killed || procDead) {
           void opts.thread.close().catch(() => undefined);
           if (topicThreadId) sessions.delete(topicThreadId);
@@ -3556,64 +4493,90 @@ export function createOrchestrator(
         }
 
         const finalMsgId = cardMsgId;
-        await adoptThreadId(finalMsgId);
-        rc.cardKey = finalMsgId;
+        try {
+          await adoptThreadId(finalMsgId);
+          rc.cardKey = finalMsgId;
 
-        // Outbound images + 卡片围栏 — only at terminal (uploads are slow; while
-        // streaming, ![](path) refs and ```feishu-card fences show as text). Scan
-        // the final answer once: upload every image ref (cached; covers both the
-        // run-card's inline images and any clean-card images), then post each
-        // ```feishu-card fence as a standalone clean card. Best-effort: a failed
-        // upload leaves the original markdown in place, a failed card is logged.
-        const answerText = finalMessageText(rc.rs);
-        const { fences } = extractCardFences(answerText);
-        const imgSources = imageSources(answerText);
-        if (imgSources.length > 0) {
-          rc.images = await uploadOutboundImages(channel, imgSources, opts.cwd ?? fallbackCwd);
-        }
+          // Outbound images + 卡片围栏. The answer's images mostly uploaded already
+          // (the background uploader started on the ref's first appearance, so the
+          // live card showed them mid-stream). settleImages finishes the job under
+          // ONE hard deadline — it waits out in-flight uploads and uploads the
+          // final answer's own refs concurrently, and what hasn't landed by then
+          // simply renders as text (an `image.create` with no timeout used to leave
+          // the card stuck on 「正在输出」with a live ⏹; issue #14 "一显示就卡").
+          // The ```feishu-card fences are hoisted into standalone clean cards here.
+          // Best-effort throughout: an unresolved ref renders as text, a failed
+          // card is logged.
+          const answerText = finalMessageText(rc.rs);
+          rc.localFiles = await outboundFiles.prepare(answerText, {
+            messageId: finalMsgId, chatId: opts.chatId, cwd: runCwd,
+            mode: opts.mode ?? DEFAULT_PERMISSION_MODE, requesterOpenId: currentTurn.requesterOpenId,
+            replyInThread: !opts.flat, cardId: stream.getCardId(),
+          }, (elementId, element) => stream.updateElement(channel, elementId, element));
+          const { fences } = extractCardFences(answerText);
+          rc.images = await stream.settleImages(answerText);
 
-        // terminal whole-card update: final render with streaming off (clears the
-        // typewriter cursor) and no ⏹ button.
-        await stream.updateCard(channel, buildRunCard(rc));
-        // One-line per-turn timeline; all ms are relative to the turn's stream start.
-        {
-          const terminalAt = Date.now();
-          const st = stream.stats();
-          log.info('stream', 'timing', {
-            tResolve: intake?.tResolve ?? -1, // 入站段耗时（仅首轮有值；M-1 并行化观测）
-            tWeave: intake?.tWeave ?? -1,
-            tCardCreate,
-            tTurnStart: turnStartAt - tStart, // 负数 = turn/start 抢在流循环前多少 ms（QW-1 并行收益）
-            firstEv: firstEvAt ? firstEvAt - tStart : -1,
-            firstText: firstTextAt ? firstTextAt - tStart : -1,
-            lastEv: lastEvAt - tStart,
-            done: doneAt - tStart,
-            terminal: terminalAt - tStart,
-            doneToTerminal: terminalAt - doneAt,
-            events: evCount,
-            textChars,
-            pushes: st.pushCount,
-            cardPushes: st.cardPushes,
-            elPushes: st.elPushes,
-            rttAvg: st.pushCount ? Math.round(st.totalRttMs / st.pushCount) : 0,
-            rttMax: st.maxRttMs,
-          });
-          intake = undefined; // 排队续轮没有入站段，别把首轮数值带下去
-        }
-        runsByCard.delete(cardMsgId);
-        promoteCard(finalMsgId, rc);
-
-        for (const fence of fences) {
-          try {
-            await sendManagedCard(channel, opts.chatId, buildCleanCard(fence, rc.images), finalMsgId, !opts.flat);
-          } catch (err) {
-            log.fail('card', err, { phase: 'clean-card' });
+          // terminal whole-card update: final render with streaming off (clears the
+          // typewriter cursor) and no ⏹ button. Remove the callback before freezing
+          // live repaints; already-accepted repaint writes are serialized ahead of
+          // finalizeCard, while callbacks arriving from now on cannot overwrite it.
+          const manuallyRequested = Boolean(state.completionReminderRequested);
+          completionReminderRefreshers.delete(cardMsgId);
+          const terminalCardUpdated = await stream.finalizeCard(channel, buildRunCard(rc));
+          // One-line per-turn timeline; all ms are relative to the turn's stream start.
+          {
+            const terminalAt = Date.now();
+            const st = stream.stats();
+            log.info('stream', 'timing', {
+              tResolve: intake?.tResolve ?? -1, // 入站段耗时（仅首轮有值；M-1 并行化观测）
+              tWeave: intake?.tWeave ?? -1,
+              tCardCreate,
+              tTurnStart: turnStartAt - tStart, // 负数 = turn/start 抢在流循环前多少 ms（QW-1 并行收益）
+              firstEv: firstEvAt ? firstEvAt - tStart : -1,
+              firstText: firstTextAt ? firstTextAt - tStart : -1,
+              lastEv: lastEvAt - tStart,
+              done: doneAt - tStart,
+              terminal: terminalAt - tStart,
+              doneToTerminal: terminalAt - doneAt,
+              events: evCount,
+              textChars,
+              pushes: st.pushCount,
+              cardPushes: st.cardPushes,
+              elPushes: st.elPushes,
+              rttAvg: st.pushCount ? Math.round(st.totalRttMs / st.pushCount) : 0,
+              rttMax: st.maxRttMs,
+            });
+            intake = undefined; // 排队续轮没有入站段，别把首轮数值带下去
           }
+          runsByCard.delete(cardMsgId);
+          promoteCard(finalMsgId, rc);
+
+          for (const fence of fences) {
+            try {
+              await sendManagedCard(channel, opts.chatId, buildCleanCard(fence, rc.images), finalMsgId, !opts.flat);
+            } catch (err) {
+              log.fail('card', err, { phase: 'clean-card' });
+            }
+          }
+          if (topicThreadId) {
+            touchSession(topicThreadId); // 轮次收尾打点（M-3 reaper 的空闲时钟）
+            await patchSession(topicThreadId, { updatedAt: Date.now() });
+          }
+          await sendCompletionReminder({
+            cardMsgId: finalMsgId,
+            requesterOpenId: currentTurn.requesterOpenId,
+            outcome: rc.rs.terminal === 'running' ? 'done' : rc.rs.terminal,
+            requestedAt: currentTurn.requestedAt,
+            manuallyRequested,
+            summary: currentTurn.summary,
+            cardUpdated: terminalCardUpdated,
+            replyInThread: !opts.flat,
+          });
+        } catch (err) {
+          log.fail('card', err, { phase: 'terminal-delivery' });
+          void channel.send(opts.chatId, { markdown: '⚠️ 本轮已结束，但结果同步失败，请检查会话记录。' }, { replyTo: finalMsgId, replyInThread: !opts.flat }).catch(() => undefined);
         }
-        if (topicThreadId) {
-          touchSession(topicThreadId); // 轮次收尾打点（M-3 reaper 的空闲时钟）
-          await patchSession(topicThreadId, { updatedAt: Date.now() });
-        }
+        retrySessionTitleAfterTurn();
         replyTo = finalMsgId;
         replyInThread = !opts.flat; // stay in the topic for queued turns (single: stay flat)
         log.info('card', 'final', { terminal: render.terminal() });
@@ -3623,6 +4586,7 @@ export function createOrchestrator(
         // swallowing them. 优雅 ⏹ 虽然线程留用，但用户按了停就是要停：排队消息
         // 同样丢弃（语义与杀进程路径一致，只是进程不回收）。
         if (killed || procDead || interrupted) {
+          state.intakeCancelled = true;
           if (state.queue.length > 0) {
             void channel
               .send(
@@ -3636,16 +4600,36 @@ export function createOrchestrator(
           break;
         }
         if (state.queue.length === 0) break;
-        turnInput = state.queue.shift()!;
+        currentTurn = state.queue.shift()!;
+        // Per-turn ownership + one-shot override must not leak from the previous
+        // requester. The queued item's timestamp preserves all waiting time for
+        // the `long` policy and notification copy.
+        activateQueuedTurn(state, currentTurn);
       }
     } catch (err) {
+      // Detach before any await: new messages must not join a failed consumer.
+      if (active.get(activeKey) === state) active.delete(activeKey);
+      const dropped = state.queue.splice(0).length;
+      disposeInterrupt?.();
+      state.run = undefined;
+      state.interrupt = undefined;
+      // A stream/card failure can leave an agent turn running. Retire that
+      // client before the next message resumes the persisted session.
+      if (topicThreadId && sessions.get(topicThreadId) === opts.thread) sessions.delete(topicThreadId);
+      await opts.thread.close().catch(() => undefined);
       log.fail('intake', err);
       await channel
-        .send(opts.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
-        .catch(() => undefined);
+        .send(opts.chatId, { markdown: runFailureMessage(err, dropped) }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
+        .catch((sendError) => log.fail('intake', sendError, { phase: 'run-failure-feedback', dropped }));
     } finally {
-      active.delete(activeKey);
-      if (curCardKey) runsByCard.delete(curCardKey);
+      // A replacement run may have reserved the key while failure feedback
+      // was in flight. Never delete another run's reservation.
+      if (active.get(activeKey) === state) active.delete(activeKey);
+      state.voiceReply = undefined;
+      if (curCardKey) {
+        runsByCard.delete(curCardKey);
+        completionReminderRefreshers.delete(curCardKey);
+      }
       // F8: adopt 始终没成功的线程对任何后续消息都不可达（pending: 键随本
       // finally 即灭，会话从未 persist，M-3 reaper 只扫 sessions 也看不见它）
       // ——保活只会把常驻 agent 进程（~172MB/个）泄漏到停机。与 goal 路径
@@ -3676,6 +4660,8 @@ export function createOrchestrator(
     const objective = opts.firstText;
     let activeKey = opts.knownThreadId ?? `pending:${opts.replyTo}`;
     let topicThreadId = opts.knownThreadId;
+    // The goal's workspace — see LaunchOpts.cwd / launchRun's runCwd.
+    const runCwd = opts.cwd ?? fallbackCwd;
     const state: ActiveState = active.get(activeKey) ?? { queue: [], requesterOpenId: opts.requesterOpenId };
     state.thread = opts.thread;
     state.isGoal = true; // messages during the goal get a prompt, never queue (handleTurn)
@@ -3696,13 +4682,61 @@ export function createOrchestrator(
       void slot.queuedCard.stream.updateCard(channel, buildQueuedCard({ started: true }));
     }
 
+    let titleStart: Promise<boolean> | undefined;
+    let titleApplyRequested = false;
+    const beginGoalSessionTitle = (): void => {
+      if (!opts.titleJobKey || titleStart) return;
+      const key = opts.titleJobKey;
+      titleStart = (async () => {
+        try {
+          const activated = await sessionTitles.activate(key);
+          if (!activated) return false;
+          await sessionTitles.prepare(key);
+          return true;
+        } catch (err) {
+          log.fail('agent', err, { phase: 'session-title-start', key });
+          return false;
+        }
+      })();
+    };
+    const requestGoalSessionTitleApply = (): void => {
+      if (!opts.titleJobKey || !titleStart || titleApplyRequested) return;
+      titleApplyRequested = true;
+      const key = opts.titleJobKey;
+      const bindingKey = topicThreadId;
+      void titleStart.then(async (activated) => {
+        if (!activated) {
+          titleStart = undefined;
+          titleApplyRequested = false;
+          return;
+        }
+        if (bindingKey) {
+          await clearSessionTitleJobKey(bindingKey, key).catch((err) =>
+            log.fail('agent', err, { phase: 'session-title-marker-clear', key }),
+          );
+        }
+        await sessionTitles.apply(key);
+      });
+    };
+    const retryGoalSessionTitleAfterRun = (): void => {
+      if (!opts.titleJobKey || !titleStart) return;
+      const key = opts.titleJobKey;
+      void (async () => {
+        if (!(await titleStart)) return;
+        await sessionTitles.apply(key);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        await sessionTitles.apply(key);
+      })();
+    };
+
     const persist = async (threadId: string): Promise<void> => {
       await upsertSession({
         threadId,
         chatId: opts.chatId,
-        cwd: opts.cwd ?? fallbackCwd,
+        cwd: runCwd,
         sessionId: opts.thread.sessionId,
         backend: opts.backendId ?? DEFAULT_BACKEND_ID,
+        titleJobKey: opts.titleJobKey,
         model: opts.model,
         effort: opts.effort,
         summary: opts.summary ?? objective.slice(0, 80),
@@ -3760,6 +4794,13 @@ export function createOrchestrator(
       await ctx.stream.drain();
       ctx.render.finalize();
       ctx.rc.rs = ctx.render.snapshot();
+      const answerText = finalMessageText(ctx.rc.rs);
+      ctx.rc.localFiles = await outboundFiles.prepare(answerText, {
+        messageId: ctx.cardMsgId, chatId: opts.chatId, cwd: runCwd,
+        mode: opts.mode ?? DEFAULT_PERMISSION_MODE, requesterOpenId: opts.requesterOpenId,
+        replyInThread: !opts.flat, cardId: ctx.stream.getCardId(),
+      }, (elementId, element) => ctx.stream!.updateElement(channel, elementId, element));
+      ctx.rc.images = await ctx.stream.settleImages(answerText);
       await ctx.stream.updateCard(channel, buildRunCard(ctx.rc));
       runsByCard.delete(ctx.cardMsgId);
       promoteCard(ctx.cardMsgId, ctx.rc);
@@ -3786,6 +4827,12 @@ export function createOrchestrator(
     const ensureCard = async (ctx: GoalTurnCtx): Promise<void> => {
       if (ctx.stream) return;
       const stream = new RunCardStream();
+      attachRunImages({
+        stream,
+        rc: ctx.rc,
+        channel,
+        upload: (sources) => uploadOutboundImages(channel, sources, runCwd, opts.mode ?? DEFAULT_PERMISSION_MODE),
+      });
       const cardMsgId = await stream.create(channel, opts.chatId, buildRunCard(ctx.rc), { replyTo, replyInThread });
       ctx.rc.cardKey = cardMsgId;
       ctx.stream = stream;
@@ -3793,6 +4840,7 @@ export function createOrchestrator(
       runsByCard.set(cardMsgId, state);
       runStreams.set(cardMsgId, stream);
       await adoptThreadId(cardMsgId, ctx.rc);
+      requestGoalSessionTitleApply();
       // chain the next turn's card (and the terminal card) under this one
       replyTo = cardMsgId;
       replyInThread = !opts.flat;
@@ -3876,6 +4924,10 @@ export function createOrchestrator(
           continue;
         }
         if (ev.type === 'turn_started') {
+          // Unlike runGoal() construction, this proves the host accepted and
+          // started the goal's first turn. Generate in parallel from here.
+          beginGoalSessionTitle();
+          if (topicThreadId) requestGoalSessionTitleApply();
           await finalizeCard(cur); // close the previous turn's card (if it produced one)
           cur = startTurn(); // render-only; the card is sent lazily on first content
           continue;
@@ -3920,6 +4972,10 @@ export function createOrchestrator(
       if (interrupted && cur) cur.render.interrupt();
       await finalizeCard(cur);
       cur = null;
+      // Covers a goal that produced no content card (and therefore never called
+      // ensureCard) plus Claude's post-result native-session timing.
+      requestGoalSessionTitleApply();
+      retryGoalSessionTitleAfterRun();
 
       // Always clear the goal when the run ends: a non-complete goal would
       // reactivate on the next resume, and a LEFTOVER goal (even complete) gets
@@ -4462,6 +5518,7 @@ export function createOrchestrator(
 
   async function shutdown(): Promise<void> {
     clearInterval(reaper);
+    await sessionTitles.shutdown();
     // adopt 失败的孤儿线程已在 launchRun/launchGoalRun 的 finally 就地 close，
     // 这里只需回收 LIVE 会话缓存。
     const live = [...new Set(sessions.values())];
@@ -4472,6 +5529,10 @@ export function createOrchestrator(
     log.info('bridge', 'shutdown', { closed: live.length });
   }
 
+  // Recover only ledger rows created by this feature. v1/v2 sessions migrate
+  // with an empty ledger, so startup never backfills legacy/manual sessions.
+  sessionTitles.startRecovery();
+
   // 启动预热：daemon 首个新话题原本恒吃一次 model/list 冷 spawn（独立 app-server
   // ~150–300ms），启动是空闲期，提前付掉。成功时只填 backend 内部缓存，后续
   // listModels() 零成本；失败时 backend 返回 STATIC_MODELS 兜底但不写缓存——
@@ -4481,7 +5542,11 @@ export function createOrchestrator(
   // 管理面写执行器（Web 控制台 / supervisor IPC 入口）：与上面 DM 回调共用
   // admin/ops.ts 的 perform*，注入同一个 backendFor + evictLiveSessionsForChat
   // —— 双端写行为同源（同校验、同落盘、同驱逐）。
-  const adminExecute = createAdminWriteExecutor({ backendFor, evictLiveSessionsForChat });
+  const executeAdminWrite = createAdminWriteExecutor({ cfg, backendFor, evictLiveSessionsForChat, writePreferences, voiceAction: voice.action });
+  const adminExecute = async (op: AdminWriteOp): Promise<void> => {
+    await executeAdminWrite(op);
+    if (op.kind === 'setCompletionReminder') refreshCompletionReminderCards();
+  };
 
   return { onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, shutdown };
 }

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/config/store', () => ({
   saveConfig: vi.fn(async () => undefined),
@@ -16,6 +16,7 @@ vi.mock('../src/core/logger', () => ({
 import { createOrchestrator, type CliBridgeRuntimeHooks } from '../src/bot/handle-message';
 import { CLI } from '../src/cli-bridge/cards';
 import type { AppConfig } from '../src/config/schema';
+import { saveConfig } from '../src/config/store';
 
 function cfg(enabled: boolean): AppConfig {
   return {
@@ -68,6 +69,10 @@ function cliBridge(overrides: Partial<CliBridgeRuntimeHooks> = {}): CliBridgeRun
 }
 
 describe('cli bridge runtime settings', () => {
+  beforeEach(() => {
+    vi.mocked(saveConfig).mockReset().mockResolvedValue(undefined);
+  });
+
   it('starts the runtime service when Local agents is enabled from settings', async () => {
     const appCfg = cfg(false);
     const bridge = cliBridge();
@@ -115,5 +120,45 @@ describe('cli bridge runtime settings', () => {
     } as never);
 
     expect(appCfg.preferences?.cliBridge?.enabled).toBe(false);
+  });
+
+  it('rolls the runtime service back when persisting enabled=true fails', async () => {
+    vi.mocked(saveConfig).mockRejectedValueOnce(new Error('disk full'));
+    const appCfg = cfg(false);
+    const bridge = cliBridge();
+    const orchestrator = createOrchestrator(channel(), appCfg, '/repo', bridge);
+
+    await orchestrator.dispatcher.handle({
+      chatId: 'ou_owner',
+      messageId: 'settings-card',
+      operator: { openId: 'ou_owner' },
+      action: { tag: 'button', value: { a: CLI.toggleEnabled, v: 'on' } },
+    } as never);
+
+    await vi.waitFor(() => expect(bridge.shutdown).toHaveBeenCalledTimes(1));
+    expect(bridge.start).toHaveBeenCalledTimes(1);
+    expect(appCfg.preferences?.cliBridge?.enabled).toBe(false);
+  });
+
+  it('serializes rapid on/off transitions so runtime follows the final persisted flag', async () => {
+    const appCfg = cfg(false);
+    const bridge = cliBridge();
+    const orchestrator = createOrchestrator(channel(), appCfg, '/repo', bridge);
+    const event = (value: 'on' | 'off') => ({
+      chatId: 'ou_owner',
+      messageId: 'settings-card',
+      operator: { openId: 'ou_owner' },
+      action: { tag: 'button', value: { a: CLI.toggleEnabled, v: value } },
+    });
+
+    await Promise.all([
+      orchestrator.dispatcher.handle(event('on') as never),
+      orchestrator.dispatcher.handle(event('off') as never),
+    ]);
+
+    await vi.waitFor(() => expect(bridge.shutdown).toHaveBeenCalledTimes(1));
+    expect(appCfg.preferences?.cliBridge?.enabled).toBe(false);
+    expect(bridge.start).toHaveBeenCalledTimes(1);
+    expect(bridge.shutdown).toHaveBeenCalledTimes(1);
   });
 });

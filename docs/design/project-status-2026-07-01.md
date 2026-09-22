@@ -31,7 +31,7 @@
 | `agent/codex-appserver/` | Codex 后端（默认、能力最全）：驱动 `codex app-server` 子进程（JSON-RPC/stdio），线程生命周期、流式/自主目标 turn、三档 OS 沙箱、模型发现、常驻进程池、ChatGPT 账号用量数据层。 |
 | `agent/claude-agent/` | Claude Agent SDK 后端：进程内 `query()` 常驻会话、三档 OS 沙箱、settingSources 加载 CLAUDE.md/skills、合成 /goal、原生 /compact、双向 /resume（读 `~/.claude/projects`）。 |
 | `bot/handle-message.ts`（4255 行核心） | 中央编排器：所有活跃运行态 + 把每个入站飞书信号接到 agent；斜杠命令、卡片回调、运行/目标循环、会话解析/驱逐/回收、DM 管理控制台。 |
-| `bot/{bridge,supervisor,watchdog,session-store,register-bot}` | 进程/运行时骨架：长连接启动、多机器人「一 bot 一进程」监督器、per-turn idle watchdog + 优雅中断 + FIFO 并发信号量、会话持久化、非交互建 bot。 |
+| `bot/{bridge,supervisor,watchdog,session-store,register-bot}` | 进程/运行时骨架：长连接启动、多机器人「一 bot 一进程」监督器、per-turn idle watchdog + 优雅中断 + FIFO 并发信号量、会话持久化、扫码凭据校验与落盘。 |
 | `bot/{comments,context-weave,dm-console,media,onboarding,wizard,card-content}` | bot「边缘」：云文档评论流、入站上下文编织（引用/话题上文/图片/文件/降级卡）、DM 控制台入口、多模态下载、扫码 onboarding、卡片正文恢复。 |
 | `card/` | 表现与卡片传输层：schema 2.0 卡片构造器、CardKit 流式打字机、AgentEvent→RunState reducer、卡片回调路由、出站图片/feishu-card fence 渲染。 |
 | `cli-bridge/` | ☕ 咖啡一下反向桥：本机 Claude/Codex 的 hook（审批/提问/Stop）经 IPC 转发到飞书私聊；presence 离开检测、keep-awake、续聊、hook 安装/修复。 |
@@ -115,7 +115,7 @@
 - ✅ **自环防护**：桥自己起的会话（`FEISHU_CODEX_BRIDGE=1`）不自转发。
 
 ### J. Web 控制台（127.0.0.1）
-- ✅ **本地控制台**：仅绑 127.0.0.1 + token（Bearer/cookie/?token=）+ Host/Origin 防 DNS rebinding；扫码/手填加机器人、项目设置读写、诊断、后端装卸、daemon 生命周期、日志实时 tail(SSE)。
+- ✅ **本地控制台**：仅绑 127.0.0.1 + token（Bearer/cookie/?token=）+ Host/Origin 防 DNS rebinding；扫码加机器人（扫码人自动成为 owner/admin）、项目设置读写、诊断、后端装卸、daemon 生命周期、日志实时 tail(SSE)。
 - ✅ **Web=DM 卡片写操作同源**（`admin/ops.ts`，零漂移）；无 daemon 时退化只读预览（写→501，仅允许启 daemon/更新）。
 - ✅ **稳定 URL**：canonical 端口 51847 + 稳定 token + discovery 文件跨重启存活。
 

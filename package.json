@@ -1,6 +1,6 @@
 {
   "name": "@modelzen/feishu-codex-bridge",
-  "version": "0.6.8",
+  "version": "0.6.12",
   "description": "Bridge Feishu/Lark messenger with local Codex via app-server (project=group, thread=session)",
   "type": "module",
   "bin": {
@@ -23,6 +23,7 @@
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:native-service": "node scripts/test-native-service.mjs",
     "start": "node bin/feishu-codex-bridge.mjs run",
     "prepare": "npm run build",
     "release": "bash scripts/release.sh"
@@ -31,6 +32,7 @@
     "@larksuiteoapi/node-sdk": "^1.65.0",
     "commander": "^12.1.0",
     "cross-spawn": "^7.0.6",
+    "ogg-opus-decoder": "^1.7.5",
     "qrcode-terminal": "^0.12.0"
   },
   "devDependencies": {

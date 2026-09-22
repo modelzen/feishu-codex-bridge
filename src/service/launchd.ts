@@ -8,6 +8,7 @@ import {
   ensureLogFiles,
   serviceStderrPath,
   serviceStdoutPath,
+  type ServiceDefinitionOptions,
   type ServiceStatus,
 } from './common';
 
@@ -37,17 +38,17 @@ function escapeXml(value: string): string {
     .replace(/"/g, '&quot;');
 }
 
-export function buildPlist(): string {
+export function buildPlist(options: ServiceDefinitionOptions & { label?: string } = {}): string {
   const nodePath = process.execPath;
-  const cliBinPath = resolveCliBinPath();
-  const pathEnv = process.env.PATH ?? '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin';
+  const cliBinPath = options.cliBinPath ?? resolveCliBinPath();
+  const pathEnv = options.envPath ?? process.env.PATH ?? '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin';
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${LAUNCHD_LABEL}</string>
+  <string>${escapeXml(options.label ?? LAUNCHD_LABEL)}</string>
   <key>ProgramArguments</key>
   <array>
     <string>${escapeXml(nodePath)}</string>
@@ -59,9 +60,9 @@ export function buildPlist(): string {
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>${escapeXml(serviceStdoutPath())}</string>
+  <string>${escapeXml(options.stdoutPath ?? serviceStdoutPath())}</string>
   <key>StandardErrorPath</key>
-  <string>${escapeXml(serviceStderrPath())}</string>
+  <string>${escapeXml(options.stderrPath ?? serviceStderrPath())}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>

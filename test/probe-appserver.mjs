@@ -141,7 +141,7 @@ async function interruptProbe() {
   // ── 第 1 轮：起 turn，~1s 后 interrupt ───────────────────────────────
   const input = [{ type: 'text', text: 'reply with exactly: pong', text_elements: [] }];
   const turnDone = waitNotification((m) => m.method === 'turn/completed', 'turn/completed #1', 120_000);
-  const turn1 = request('turn/start', { threadId, input }); // 整轮在飞，不能 await
+  const turn1 = request('turn/start', { threadId, input }); // ACK 返回 turn ID；本探针另等通知以测量事件时序
   turn1.catch((err) => console.error(`${ts()} turn/start #1 rejected: ${err.message}`));
   const started = await waitNotification((m) => m.method === 'turn/started', 'turn/started #1');
   const turnId = started.params.turn.id;

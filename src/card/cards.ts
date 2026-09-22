@@ -134,6 +134,159 @@ export function note(content: string): CardElement {
   return { tag: 'div', text: { tag: 'lark_md', content, text_size: 'notation', text_color: 'grey' } };
 }
 
+/** One column of a {@link columns} row: an arbitrary element list. */
+export interface ColumnSpec {
+  elements: CardElement[];
+  /** only honoured with `flexMode: 'none'`: `auto` (default) | `weighted` (+weight) */
+  width?: string;
+  weight?: number;
+  verticalAlign?: 'top' | 'center' | 'bottom';
+}
+
+/**
+ * A generic `column_set` row. Card 2.0 has no `action` container, so anything
+ * that needs to sit side by side (a thumbnail strip, a control + caption)
+ * builds on this. A column may hold any component except `form`/`table`;
+ * `flexMode: 'flow'` wraps instead of squashing on narrow screens — the right
+ * choice for a thumbnail strip on mobile.
+ */
+export function columns(
+  items: ColumnSpec[],
+  opts: {
+    flexMode?: 'none' | 'stretch' | 'flow' | 'bisect' | 'trisect';
+    spacing?: string;
+    align?: 'left' | 'center' | 'right';
+    elementId?: string;
+  } = {},
+): CardElement {
+  return {
+    tag: 'column_set',
+    ...(opts.elementId ? { element_id: opts.elementId } : {}),
+    flex_mode: opts.flexMode ?? 'none',
+    horizontal_spacing: opts.spacing ?? 'small',
+    ...(opts.align ? { horizontal_align: opts.align } : {}),
+    columns: items.map((c) => ({
+      tag: 'column',
+      width: c.width ?? 'auto',
+      ...(c.weight ? { weight: c.weight } : {}),
+      ...(c.verticalAlign ? { vertical_align: c.verticalAlign } : {}),
+      elements: c.elements,
+    })),
+  };
+}
+
+/**
+ * A collapsed image "pill": the title is the markdown image's alt text (what the
+ * model already wrote in `![alt](src)`), and tapping it expands the image IN
+ * PLACE. `header.width: auto_when_fold` is what makes the collapsed state a small
+ * label instead of a full-width bar; the image keeps `preview` so a second tap
+ * opens it full-screen.
+ *
+ * This is the bridge's default presentation for a resolved outbound image: a
+ * plain `img` element commits the card to a full-width picture (a 1480×3943
+ * contact sheet dominates the reply), while a pill costs one line until the
+ * reader asks for it — and unlike a link it needs no upload elsewhere, no
+ * sharing scope and no callback.
+ */
+export function imagePill(opts: {
+  /** pre-uploaded image key */
+  imgKey: string;
+  /** pill title — the markdown alt (caller falls back to the file name) */
+  title: string;
+  /** hover text on the expanded image (defaults to the title) */
+  alt?: string;
+  /** start expanded */
+  expanded?: boolean;
+  elementId?: string;
+  /** `link` (default): no border, no chevron, blue title — the header reads as a
+   * hyperlink that reveals the image on tap. `pill`: the bordered, grey variant. */
+  style?: 'pill' | 'link';
+  /** blue tint for {@link style} `'link'` — a feishu colour name (`blue`,
+   * `wathet`, `indigo`, …). */
+  color?: string;
+  /** link style only: keep a small chevron so the row still hints it expands. */
+  chevron?: 'none' | 'right';
+}): CardElement {
+  const link = opts.style !== 'pill'; // link look is the default presentation
+  return collapsiblePanelEl({
+    title: link ? `<font color='${opts.color ?? 'blue'}'>${opts.title}</font>` : opts.title,
+    expanded: opts.expanded ?? false,
+    border: link ? 'none' : 'grey',
+    headerWidth: 'auto_when_fold',
+    padding: '0px',
+    spacing: '6px',
+    ...(link
+      ? opts.chevron === 'right'
+        ? { headerIcon: { token: 'down-small-ccm_outlined', color: opts.color ?? 'blue', size: '14px 14px' }, iconPosition: 'right' as const }
+        : { headerIcon: false as const }
+      : {}),
+    ...(opts.elementId ? { elementId: opts.elementId } : {}),
+    elements: [image(opts.imgKey, opts.alt ?? opts.title)],
+  });
+}
+
+/** Cell renderers a `table` column supports (Card 2.0). */
+export type TableColumnType = 'text' | 'lark_md' | 'number' | 'options' | 'persons' | 'date' | 'markdown';
+
+export interface TableColumn {
+  /** key this column reads from each row object */
+  name: string;
+  /** header label */
+  displayName: string;
+  /** how cell values render; default `text`. `lark_md` carries links. */
+  type?: TableColumnType;
+  /** `auto` | `[80,600]px` | `%` */
+  width?: string;
+  horizontalAlign?: 'left' | 'center' | 'right';
+  verticalAlign?: 'top' | 'center' | 'bottom';
+}
+
+/**
+ * A `table` component (Card 2.0). Card markdown (the `markdown` element) does
+ * NOT render GFM pipe tables, so a report that tables its data has to become
+ * this component — see {@link ../card/report-render}.
+ *
+ * Feishu's rules, enforced here so a caller can't emit a card that 400s:
+ * table is body-level only (it can't be nested in a panel), ≤50 columns, ≤5
+ * tables per card, and `page_size` ∈ [1,10] (rows beyond it paginate).
+ */
+export function table(
+  columns: TableColumn[],
+  rows: Array<Record<string, unknown>>,
+  opts: {
+    /** Rows per page, [1,10]. Defaults to all rows (capped at 10) so short
+     * tables don't get a pointless pager. */
+    pageSize?: number;
+    /** `low` (default) | `middle` | `high` | `auto` | `[32,124]px` */
+    rowHeight?: string;
+    /** Keep the first column visible while scrolling a wide table. */
+    freezeFirstColumn?: boolean;
+    /** Header background: `grey` (default) | `none`. */
+    headerBackground?: 'grey' | 'none';
+    margin?: string;
+  } = {},
+): CardElement {
+  const cols = columns.slice(0, 50).map((c) => ({
+    name: c.name,
+    display_name: c.displayName,
+    data_type: c.type ?? 'text',
+    ...(c.width ? { width: c.width } : {}),
+    ...(c.horizontalAlign ? { horizontal_align: c.horizontalAlign } : {}),
+    ...(c.verticalAlign ? { vertical_align: c.verticalAlign } : {}),
+  }));
+  const pageSize = Math.min(Math.max(opts.pageSize ?? rows.length, 1), 10);
+  return {
+    tag: 'table',
+    columns: cols,
+    rows,
+    page_size: pageSize,
+    row_height: opts.rowHeight ?? 'low',
+    ...(opts.freezeFirstColumn ? { freeze_first_column: true } : {}),
+    header_style: { background_style: opts.headerBackground ?? 'grey', bold: true, lines: 1 },
+    ...(opts.margin ? { margin: opts.margin } : {}),
+  };
+}
+
 /** Named text colors the bridge uses on notation lines (feishu 2.0 palette). */
 export type NoteColor = 'grey' | 'green' | 'yellow' | 'orange' | 'red' | 'blue';
 
@@ -193,22 +346,51 @@ export function collapsiblePanel(opts: {
 export function collapsiblePanelEl(opts: {
   title: string;
   expanded: boolean;
-  border: PanelBorder;
+  /** Border colour, or `'none'` for a chrome-less panel (a header that reads as
+   * a plain/blue text line until it is tapped). */
+  border: PanelBorder | 'none';
   elements: CardElement[];
+  /** Header width. `fill` (default) spans the card; `auto_when_fold` shrinks the
+   * COLLAPSED header to its text — a small pill (「🖼️ 4 张图片 ⌄」) instead of a
+   * full-width bar, which is what makes a collapsed image group cheap. */
+  headerWidth?: 'fill' | 'auto' | 'auto_when_fold';
+  /** Panel padding [0,99]px. */
+  padding?: string;
+  /** Gap between the panel's children [0,99]px (default 8px). */
+  spacing?: string;
+  /** Header icon. Defaults to the collapse chevron; pass `false` to drop it
+   * (nothing then signals "expandable" except the tap itself — used when the
+   * title should read as a link). */
+  headerIcon?: { token: string; color?: string; size?: string } | false;
+  /** Where the chevron sits; ignored when {@link headerIcon} is false. */
+  iconPosition?: 'left' | 'right' | 'follow_text';
+  elementId?: string;
 }): CardElement {
+  const icon = opts.headerIcon === false ? null : (opts.headerIcon ?? { token: 'down-small-ccm_outlined' });
   return {
     tag: 'collapsible_panel',
+    ...(opts.elementId ? { element_id: opts.elementId } : {}),
     expanded: opts.expanded,
     header: {
       title: { tag: 'markdown', content: opts.title },
+      ...(opts.headerWidth ? { width: opts.headerWidth } : {}),
       vertical_align: 'center',
-      icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', size: '16px 16px' },
-      icon_position: 'follow_text',
-      icon_expanded_angle: -180,
+      ...(icon
+        ? {
+            icon: {
+              tag: 'standard_icon',
+              token: icon.token,
+              ...(icon.color ? { color: icon.color } : {}),
+              size: icon.size ?? '16px 16px',
+            },
+            icon_position: opts.iconPosition ?? 'follow_text',
+            icon_expanded_angle: -180,
+          }
+        : {}),
     },
-    border: { color: opts.border, corner_radius: '5px' },
-    vertical_spacing: '8px',
-    padding: '8px 8px 8px 8px',
+    ...(opts.border === 'none' ? {} : { border: { color: opts.border, corner_radius: '5px' } }),
+    vertical_spacing: opts.spacing ?? '8px',
+    padding: opts.padding ?? '8px 8px 8px 8px',
     elements: opts.elements,
   };
 }

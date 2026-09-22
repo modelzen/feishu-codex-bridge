@@ -1,7 +1,8 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
-import type { CardObject } from './cards';
+import type { CardObject, CardElement } from './cards';
 import { isCardIdNotReady } from './managed';
+import type { StreamingImages } from './outbound-images';
 
 /**
  * Min gap between throttled stream pushes. Finer = smoother chunked growth
@@ -92,6 +93,10 @@ function isRateLimited(err: unknown): boolean {
  * streams and carries clickable controls (⏹).
  */
 export class RunCardStream {
+  /** Optional per-turn background image uploader (see {@link setImageWorker}).
+   * Deliberately not part of the push path: event consumption asks it to scan,
+   * never waits on it. */
+  private imageWorker: { uploads: StreamingImages; text: () => string } | null = null;
   private cardId = '';
   private _messageId = '';
   private seq = 0;
@@ -117,6 +122,16 @@ export class RunCardStream {
   private lastAnswerText = '';
   // Per-chat pacer shared with the chat's other streams (set in create()).
   private pacer: ChatPacer | null = null;
+  // Forced whole-card writes (button/settings repaint, queue → run flip,
+  // terminal frame) must never race one another. In particular, an async
+  // completion-reminder repaint that started just before turn completion must
+  // land BEFORE the terminal frame, not finish late and put the card back into
+  // its running layout. This tail is deliberately separate from the coalesced
+  // pump: event consumption remains non-blocking, and the caller drains that
+  // pump before finalizing.
+  private forcedUpdateTail: Promise<void> = Promise.resolve();
+  /** Once terminal finalization starts, reminder/settings repaint is stale. */
+  private liveUpdatesFrozen = false;
 
   get messageId(): string {
     return this._messageId;
@@ -134,12 +149,41 @@ export class RunCardStream {
   }
 
   /**
+   * Attach the turn's background image uploader. `text` returns the answer as it
+   * stands (see {@link ../card/run-card}.runningAnswerText) — it's scanned for
+   * new `![](…)` refs on every frame, and a resolved `image_key` repaints the
+   * live card, which is how an image appears mid-turn instead of only at the end.
+   */
+  setImageWorker(uploads: StreamingImages, text: () => string): void {
+    this.imageWorker = { uploads, text };
+  }
+
+  /**
+   * Resolve this turn's images for the terminal frame. Bounded by
+   * {@link StreamingImages.finalize}'s own deadline, because the terminal frame
+   * is sequenced behind it — an upload that never settles must not leave the card
+   * on 「正在输出」forever.
+   *
+   * Returns an empty map when no uploader was attached ({@link setImageWorker}).
+   * Production always attaches one right after creating the stream (see
+   * {@link ./run-card}.attachRunImages), so that only covers a stream driven
+   * directly (a test, or a caller that only ever renders text).
+   */
+  async settleImages(finalAnswer: string): Promise<ReadonlyMap<string, string>> {
+    if (!this.imageWorker) return new Map();
+    return this.imageWorker.uploads.finalize(finalAnswer);
+  }
+
+  /**
    * Record the latest card and ensure the pump is running. Returns immediately;
    * calls that arrive while a push is in flight collapse into a single push of
    * the most recent card once that round-trip completes. Use this from the
    * event-consume loop instead of awaiting {@link streamCard} per event.
    */
   streamCoalesced(channel: LarkChannel, fullCard: CardObject, answerEid: string | null): void {
+    // Kick the image uploader off the same snapshot the frame was built from, so
+    // a ref starts uploading the moment the model finishes writing it.
+    this.imageWorker?.uploads.refresh(this.imageWorker.text());
     this.pending = { card: fullCard, answerEid };
     this.pumpChannel = channel;
     if (!this.pumpPromise) this.pumpPromise = this.pump();
@@ -203,11 +247,14 @@ export class RunCardStream {
    * pump only advances its baselines on delivered frames). */
   private async streamElement(channel: LarkChannel, elementId: string, content: string): Promise<boolean> {
     if (!this.cardId) return false;
-    const push = (): Promise<unknown> =>
-      channel.rawClient.cardkit.v1.cardElement.content({
-        path: { card_id: this.cardId, element_id: elementId },
-        data: { content, sequence: ++this.seq, uuid: `e_${this.cardId}_${this.seq}` },
-      });
+    const push = async (): Promise<void> => {
+      assertCardkitSuccess(
+        await channel.rawClient.cardkit.v1.cardElement.content({
+          path: { card_id: this.cardId, element_id: elementId },
+          data: { content, sequence: ++this.seq, uuid: `e_${this.cardId}_${this.seq}` },
+        }),
+      );
+    };
     await this.pacer?.wait();
     const t0 = Date.now();
     try {
@@ -217,14 +264,16 @@ export class RunCardStream {
         const code = cardkitErrCode(err);
         if (code === ERR_STREAMING_OFF) {
           log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, reopenStreaming: true });
-          await channel.rawClient.cardkit.v1.card.settings({
-            path: { card_id: this.cardId },
-            data: {
-              settings: JSON.stringify({ config: { streaming_mode: true } }),
-              sequence: ++this.seq,
-              uuid: `o_${this.cardId}_${this.seq}`,
-            },
-          });
+          assertCardkitSuccess(
+            await channel.rawClient.cardkit.v1.card.settings({
+              path: { card_id: this.cardId },
+              data: {
+                settings: JSON.stringify({ config: { streaming_mode: true } }),
+                sequence: ++this.seq,
+                uuid: `o_${this.cardId}_${this.seq}`,
+              },
+            }),
+          );
           await push();
         } else if (code === ERR_SEQ_OUT_OF_ORDER) {
           log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, retry: true });
@@ -322,10 +371,12 @@ export class RunCardStream {
     await this.pacer?.wait();
     const t0 = Date.now();
     try {
-      await channel.rawClient.cardkit.v1.card.update({
-        path: { card_id: this.cardId },
-        data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `s_${this.cardId}_${this.seq}` },
-      });
+      assertCardkitSuccess(
+        await channel.rawClient.cardkit.v1.card.update({
+          path: { card_id: this.cardId },
+          data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `s_${this.cardId}_${this.seq}` },
+        }),
+      );
       this.lastContent = data;
       const rtt = Date.now() - t0;
       this.pushCount++;
@@ -341,8 +392,10 @@ export class RunCardStream {
     }
   }
 
-  /** Forced whole-card replace for structural/terminal updates. A terminal
-   * card built with streaming off clears the typewriter cursor.
+  /** Forced whole-card replace for structural updates. Calls are serialized in
+   * invocation order so concurrent callback repaints cannot complete out of
+   * order. A terminal card built with streaming off clears the typewriter
+   * cursor.
    *
    * The terminal frame MUST land — losing it leaves the card "streaming"
    * forever (cursor + dead ⏹) while the run is over and `runsByCard` already
@@ -350,28 +403,114 @@ export class RunCardStream {
    * with exponential backoff (1s/2s/4s, {@link TERMINAL_RL_RETRIES} retries);
    * anything else — typically 200810 "card in ongoing interaction" when the
    * update fires inside a ⏹ click's 3s window — waits out the window and
-   * retries once. */
-  async updateCard(channel: LarkChannel, fullCard: CardObject): Promise<void> {
-    if (!this.cardId) return;
+   * retries once. Returns whether the requested frame is observably on the
+   * entity, so terminal callers can emit a truthful fallback notification. */
+  updateCard(channel: LarkChannel, fullCard: CardObject): Promise<boolean> {
+    return this.enqueueForcedUpdate(channel, fullCard);
+  }
+
+  getCardId(): string { return this.cardId; }
+
+  /** File rows share the whole-card queue and sequence, including demotion. */
+  private readonly elementOverrides = new Map<string, CardElement>();
+
+  updateElement(channel: LarkChannel, elementId: string, element: CardElement): Promise<boolean> {
+    this.elementOverrides.set(elementId, element);
+    const data = JSON.stringify(element);
+    const task = this.forcedUpdateTail.then(async () => {
+      if (!this.cardId) return false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await this.pacer?.wait();
+        try {
+          assertCardkitSuccess(await channel.rawClient.cardkit.v1.cardElement.update({
+            path: { card_id: this.cardId, element_id: elementId },
+            data: { element: data, sequence: ++this.seq, uuid: `f_${this.cardId}_${this.seq}` },
+          }));
+          return true;
+        } catch (err) {
+          log.fail('card', err, { phase: 'file-row-update', retry: attempt === 0 });
+          if (attempt === 0) await new Promise((r) => setTimeout(r, 3200));
+        }
+      }
+      return false;
+    });
+    this.forcedUpdateTail = task.then(() => undefined, () => undefined);
+    return task;
+  }
+
+  /**
+   * Repaint a still-live card (currently used by the completion-reminder
+   * control). Once {@link finalizeCard} has synchronously frozen live repaints,
+   * late callbacks become a no-op. Repaints accepted before the freeze share
+   * the forced-update tail and therefore finish before the terminal frame.
+   */
+  updateLiveCard(channel: LarkChannel, fullCard: CardObject): Promise<boolean> {
+    if (this.liveUpdatesFrozen) return Promise.resolve(false);
+    return this.enqueueForcedUpdate(channel, fullCard);
+  }
+
+  /**
+   * Freeze live repaints synchronously, then enqueue the terminal whole-card
+   * frame after every already-accepted forced update. Future intentional
+   * non-live updates (for example demoting an old terminal card's settings
+   * control) may still use {@link updateCard}.
+   */
+  finalizeCard(channel: LarkChannel, fullCard: CardObject): Promise<boolean> {
+    this.liveUpdatesFrozen = true;
+    return this.enqueueForcedUpdate(channel, fullCard);
+  }
+
+  private enqueueForcedUpdate(channel: LarkChannel, fullCard: CardObject): Promise<boolean> {
+    if (!this.cardId) return Promise.resolve(false);
+    // Capture the exact frame at invocation time; callers often mutate their
+    // RunCardState again while this queued network write is waiting its turn.
     const data = JSON.stringify(fullCard);
+    const task = this.forcedUpdateTail.then(() => {
+      // Overlay at dispatch time: an already-queued demotion must not restore
+      // a stale "get" button after delivery completed.
+      const frame = JSON.parse(data) as CardBody;
+      const overlay = (el: CardElement): CardElement => {
+        const updated = this.elementOverrides.get(String(el.element_id));
+        if (updated) return updated;
+        if (Array.isArray(el.elements)) el.elements = (el.elements as CardElement[]).map(overlay);
+        if (Array.isArray(el.columns)) el.columns = (el.columns as CardElement[]).map(overlay);
+        return el;
+      };
+      if (frame.body?.elements) frame.body.elements = frame.body.elements.map(overlay);
+      return this.pushForcedUpdate(channel, JSON.stringify(frame));
+    });
+    // A surprising transport failure must not poison the serialization tail and
+    // prevent the terminal frame. pushForcedUpdate normally absorbs failures,
+    // but keep the tail resilient to any future exception too.
+    this.forcedUpdateTail = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    return task;
+  }
+
+  private async pushForcedUpdate(channel: LarkChannel, data: string): Promise<boolean> {
+    if (!this.cardId) return false;
     const push = async (): Promise<void> => {
-      await channel.rawClient.cardkit.v1.card.update({
-        path: { card_id: this.cardId },
-        data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `u_${this.cardId}_${this.seq}` },
-      });
+      assertCardkitSuccess(
+        await channel.rawClient.cardkit.v1.card.update({
+          path: { card_id: this.cardId },
+          data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `u_${this.cardId}_${this.seq}` },
+        }),
+      );
       this.lastContent = data;
     };
     for (let i = 0; ; i++) {
       await this.pacer?.wait();
       try {
         await push();
-        return;
+        return true;
       } catch (err) {
         const rl = isRateLimited(err);
         if (rl) this.pacer?.penalize();
         if (i >= (rl ? TERMINAL_RL_RETRIES : 1)) {
           log.fail('card', err, { phase: 'run-update-retry', cardId: this.cardId, seq: this.seq });
-          return;
+          return false;
         }
         log.fail('card', err, { phase: 'run-update', cardId: this.cardId, seq: this.seq, retry: true, rateLimited: rl });
         await new Promise((r) => setTimeout(r, rl ? RL_BACKOFF_BASE_MS * 2 ** i : 3200));
@@ -411,4 +550,19 @@ function structureSig(card: CardObject, eid: string | null): string {
   if (!eid || !Array.isArray(els)) return JSON.stringify(card);
   const blanked = els.map((el) => (el && el.element_id === eid ? { ...el, content: '' } : el));
   return JSON.stringify({ ...(card as object), body: { ...body, elements: blanked } });
+}
+
+/**
+ * The SDK resolves HTTP 200 business failures (`{code: 230099, msg: …}`) instead
+ * of rejecting, so without this check a rejected card write counts as delivered:
+ * `lastContent` advances and the frame is never retried. That silently drops the
+ * TERMINAL frame in particular — the run is over but the card keeps its running
+ * layout with a live ⏹ cursor (issue #14 "一显示就卡"). Throwing here routes the
+ * failure into the existing retry/self-heal paths.
+ */
+function assertCardkitSuccess(response: unknown): void {
+  const result = response as { code?: number; msg?: string } | null;
+  if (typeof result?.code === 'number' && result.code !== 0) {
+    throw Object.assign(new Error(result.msg ?? `cardkit error ${result.code}`), { code: result.code });
+  }
 }

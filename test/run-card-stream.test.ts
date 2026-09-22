@@ -98,6 +98,27 @@ describe('RunCardStream.streamElement — streaming_mode recovery', () => {
 describe('RunCardStream.updateCard — 终局帧保障（M-4）', () => {
   afterEach(() => vi.useRealTimers());
 
+  it('serializes file-row updates with demotion and overlays the latest file state onto stale frames', async () => {
+    const ch = fakeChannel();
+    const elementUpdates: any[] = [];
+    ch.rawClient.cardkit.v1.cardElement.update = async (request: any) => { elementUpdates.push(request); return {}; };
+    const s = new RunCardStream();
+    const initial = card([{ tag: 'column_set', columns: [{ tag: 'column', elements: [
+      { tag: 'markdown', element_id: 'local_file_0', content: '获取并查看' },
+    ] }] }]);
+    await s.create(ch, 'oc_file_rows', initial, {});
+    expect(s.getCardId()).toBe('c_1');
+    const row = { tag: 'markdown', element_id: 'local_file_0', content: '查看文件' };
+    await Promise.all([
+      s.updateCard(ch, initial), // stale demotion was already queued
+      s.updateElement(ch, 'local_file_0', row),
+      s.updateCard(ch, initial),
+    ]);
+    expect(ch.updates.every((u: any) => u.data.includes('查看文件') && !u.data.includes('获取并查看'))).toBe(true);
+    expect(elementUpdates[0].data.sequence).toBeGreaterThan(ch.updates[0].sequence);
+    expect(ch.updates[1].sequence).toBeGreaterThan(elementUpdates[0].data.sequence);
+  });
+
   it('retries a rate-limited terminal update with exponential backoff until it lands', async () => {
     vi.useFakeTimers();
     // 两种限频形态都识别：HTTP 429（axios status）与业务码 99991400。
@@ -106,10 +127,11 @@ describe('RunCardStream.updateCard — 终局帧保障（M-4）', () => {
     await s.create(ch, 'oc_m4_rl', frame('hi'), {});
     const done = s.updateCard(ch, frame('terminal'));
     await vi.runAllTimersAsync();
-    await done;
+    const delivered = await done;
 
     expect(ch.updates).toHaveLength(1);
     expect(ch.updates[0].data).toContain('terminal');
+    expect(delivered).toBe(true);
   });
 
   it('keeps the single 200810-window retry for non-rate-limit errors, then gives up without throwing', async () => {
@@ -119,9 +141,51 @@ describe('RunCardStream.updateCard — 终局帧保障（M-4）', () => {
     await s.create(ch, 'oc_m4_810', frame('hi'), {});
     const done = s.updateCard(ch, frame('terminal'));
     await vi.runAllTimersAsync();
-    await done; // 初次 + 1 次重试均失败 → 放弃（吞错，不抛）
+    const delivered = await done; // 初次 + 1 次重试均失败 → 放弃（吞错，不抛）
 
     expect(ch.updates).toHaveLength(0);
+    expect(delivered).toBe(false);
+  });
+
+  it('serializes an accepted live repaint before terminal and freezes every late repaint', async () => {
+    const ch = fakeChannel();
+    const rawUpdate = ch.rawClient.cardkit.v1.card.update;
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    let calls = 0;
+    ch.rawClient.cardkit.v1.card.update = async (p: Parameters<typeof rawUpdate>[0]) => {
+      calls++;
+      if (calls === 1) {
+        markFirstStarted();
+        await firstGate;
+      }
+      return rawUpdate(p);
+    };
+
+    const s = new RunCardStream();
+    await s.create(ch, 'oc_terminal_freeze', frame('initial'), {});
+    const repaint = s.updateLiveCard(ch, frame('live repaint'));
+    await firstStarted;
+
+    // finalizeCard freezes synchronously. The accepted repaint must finish
+    // first; a callback that arrives after the freeze is ignored immediately.
+    const terminal = s.finalizeCard(ch, frame('terminal'));
+    await expect(s.updateLiveCard(ch, frame('late repaint'))).resolves.toBe(false);
+    releaseFirst();
+    await expect(repaint).resolves.toBe(true);
+    await expect(terminal).resolves.toBe(true);
+
+    expect(ch.updates).toHaveLength(2);
+    expect(ch.updates[0].data).toContain('live repaint');
+    expect(ch.updates[1].data).toContain('terminal');
+    expect(ch.updates[1].data).not.toContain('late repaint');
+    expect(ch.updates[1].sequence).toBeGreaterThan(ch.updates[0].sequence);
   });
 });
 
@@ -192,4 +256,21 @@ describe('per-chat 推送共享限速（M-4）', () => {
     expect(ch.updates).toHaveLength(2);
     expect(ch.updates[1].at - ch.updates[0].at).toBe(0); // 各自的桶，互不排队
   });
+});
+
+it('streams only answer growth while preserving the native voice panel', async () => {
+  const { voiceReplyElements } = await import('../src/card/voice-reply');
+  const voice = { messageId: 'voice', text: '较长语音原文。'.repeat(100), transcribed: true };
+  const voiceFrame = (answer: string) => card([...voiceReplyElements([voice]), mdStream(answer, 'answer')], { streaming: true });
+  const ch = fakeChannel();
+  const stream = new RunCardStream();
+  await stream.create(ch, 'voice-stream-chat', voiceFrame('开始'), {});
+  stream.streamCoalesced(ch, voiceFrame('开始'), 'answer');
+  await stream.drain();
+  const before = ch.updates.length;
+  stream.streamCoalesced(ch, voiceFrame('开始，下面是很长的回答。'.repeat(100)), 'answer');
+  await stream.drain();
+  expect(ch.updates).toHaveLength(before);
+  expect(ch.contents).toHaveLength(1);
+  expect(ch.contents[0].content).not.toContain('语音');
 });

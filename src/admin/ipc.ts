@@ -19,7 +19,7 @@ import { AdminWriteError, type AdminWriteOp } from './ops';
 export const ADMIN_IPC_REQ = 'fcb.admin.req' as const;
 export const ADMIN_IPC_RES = 'fcb.admin.res' as const;
 
-/** 转发给子进程的操作：四个写 op + 实时连接状态查询（替代锁文件探测）。 */
+/** 转发给子进程的结构化写 op + 实时连接状态查询（替代锁文件探测）。 */
 export type AdminIpcOp = AdminWriteOp | { kind: 'status' };
 
 export interface AdminIpcRequest {

@@ -1,3 +1,4 @@
+import { UnsentRequestError } from '../types';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mergeProcessEnv, spawnProcess } from '../../platform/spawn';
 import { log } from '../../core/logger';
@@ -25,17 +26,31 @@ class AsyncQueue<T> {
     this.items.length = 0;
   }
 
-  async *[Symbol.asyncIterator](): AsyncGenerator<T> {
-    while (true) {
-      if (this.items.length) {
-        yield this.items.shift()!;
-        continue;
-      }
-      if (this.closed) return;
-      const next = await new Promise<IteratorResult<T>>((resolve) => this.waiters.push(resolve));
-      if (next.done) return;
-      yield next.value;
-    }
+  [Symbol.asyncIterator](): AsyncIterableIterator<T> {
+    let ended = false;
+    const owned = new Set<(v: IteratorResult<T>) => void>();
+    return {
+      [Symbol.asyncIterator]() { return this; },
+      next: () => {
+        if (ended) return Promise.resolve({ value: undefined as never, done: true });
+        if (this.items.length) return Promise.resolve({ value: this.items.shift()!, done: false });
+        if (this.closed) return Promise.resolve({ value: undefined as never, done: true });
+        return new Promise<IteratorResult<T>>(resolve => {
+          const waiter = (v: IteratorResult<T>) => { owned.delete(waiter); resolve(v); };
+          owned.add(waiter);
+          this.waiters.push(waiter);
+        });
+      },
+      return: async () => {
+        ended = true;
+        for (const waiter of owned) {
+          const index = this.waiters.indexOf(waiter);
+          if (index >= 0) this.waiters.splice(index, 1);
+          waiter({ value: undefined as never, done: true });
+        }
+        return { value: undefined as never, done: true };
+      },
+    };
   }
 }
 
@@ -87,7 +102,7 @@ export class AppServerClient {
    * isAlive) use this to evict the thread so resolveThread's resume fallback
    * can take over instead of reusing a corpse. */
   get exited(): boolean {
-    return this.hasExited;
+    return this.hasExited || this.closed;
   }
 
   /** spawn + initialize handshake. Throws if spawn/handshake fails. */
@@ -118,6 +133,12 @@ export class AppServerClient {
       this.notifications.close();
     });
     child.on('error', (err) => this.failAllPending(err));
+    // Writable streams emit their own error in addition to write callbacks.
+    child.stdin.on('error', (err) => {
+      this.failAllPending(err);
+      this.notifications.close();
+      void this.close();
+    });
 
     await this.request('initialize', {
       clientInfo: { name: this.opts.clientName ?? 'feishu-codex-bridge', version: '0.0.1' },
@@ -130,15 +151,23 @@ export class AppServerClient {
     this.notify('initialized');
   }
 
-  request<T = unknown>(method: string, params?: unknown): Promise<T> {
-    if (this.closed || !this.child) return Promise.reject(new Error('app-server client closed'));
+  request<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
+    if (this.closed || !this.child) return Promise.reject(new UnsentRequestError('app-server client closed'));
     const id = ++this.nextId;
     const payload = `${JSON.stringify({ jsonrpc: '2.0', id, method, params: params ?? {} })}\n`;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+      const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`RPC ${method} response timed out; delivery unknown`));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: value => { clearTimeout(timer); resolve(value as T); },
+        reject: error => { clearTimeout(timer); reject(error); },
+      });
       this.child!.stdin.write(payload, (err) => {
         if (err) {
           this.pending.delete(id);
+          clearTimeout(timer);
           reject(err);
         }
       });

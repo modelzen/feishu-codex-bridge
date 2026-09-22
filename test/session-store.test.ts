@@ -2,7 +2,20 @@ import { rmSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getSession, listSessions, patchSession, upsertSession, type SessionRecord } from '../src/bot/session-store';
+import {
+  clearSessionTitleJobKey,
+  createSessionTitleJob,
+  getSession,
+  getSessionTitleJob,
+  listSessions,
+  listSessionTitleJobs,
+  patchSession,
+  sessionTitleJobKey,
+  updateSessionTitleJob,
+  upsertSession,
+  type SessionRecord,
+  type SessionTitleJob,
+} from '../src/bot/session-store';
 import { paths } from '../src/config/paths';
 
 // 把 sessions.json 指到临时目录，绝不碰真实 ~/.feishu-codex-bridge。
@@ -32,6 +45,22 @@ function rec(threadId: string, sessionId: string): SessionRecord {
     summary: `s-${threadId}`,
     createdAt: Date.now(),
     updatedAt: Date.now(),
+  };
+}
+
+function titleJob(sessionId = 'cx-title'): SessionTitleJob {
+  const now = Date.now();
+  return {
+    key: sessionTitleJobKey('codex-appserver', sessionId),
+    backend: 'codex-appserver',
+    sessionId,
+    cwd: '/tmp/proj',
+    phase: 'pending',
+    source: '帮我看下这个报错',
+    policy: { strategy: 'model', model: 'gpt-5.5', effort: 'low' },
+    attempts: 0,
+    createdAt: now,
+    updatedAt: now,
   };
 }
 
@@ -89,9 +118,10 @@ describe('session-store', () => {
     // 写回（patch 任意字段）后落盘的是新字段名 + 回填的 backend + 新文件版本
     await patchSession('old-topic', { model: 'gpt-5.5' });
     const onDisk = JSON.parse(await readFile(paths.sessionsFile, 'utf8'));
-    expect(onDisk.version).toBe(2);
+    expect(onDisk.version).toBe(3);
     expect(onDisk.sessions[0].sessionId).toBe('cx-legacy');
     expect(onDisk.sessions[0].backend).toBe('codex-appserver');
+    expect(onDisk.titleJobs).toEqual([]);
   });
 
   it('keeps an explicit stored backend as-is (no backfill clobber)', async () => {
@@ -109,5 +139,127 @@ describe('session-store', () => {
     expect(got?.effort).toBeUndefined();
     await patchSession('nope', { model: 'x' }); // must not throw or create a record
     expect(await listSessions()).toHaveLength(1);
+  });
+
+  it('reads a v2 store with an empty title ledger and never backfills old sessions', async () => {
+    await mkdir(dirname(paths.sessionsFile), { recursive: true });
+    await writeFile(
+      paths.sessionsFile,
+      JSON.stringify({
+        version: 2,
+        sessions: [rec('old-v2-topic', 'old-v2-session')],
+        // A hand-edited/partial-upgrade v2 file still must not smuggle in work.
+        titleJobs: [titleJob('must-not-run')],
+      }),
+      'utf8',
+    );
+
+    expect(await listSessionTitleJobs()).toEqual([]);
+    expect((await getSession('old-v2-topic'))?.sessionId).toBe('old-v2-session');
+
+    // Any later write upgrades the envelope but does not invent work for an old
+    // backend session the bridge cannot safely prove it owns.
+    await patchSession('old-v2-topic', { summary: 'updated' });
+    const onDisk = JSON.parse(await readFile(paths.sessionsFile, 'utf8'));
+    expect(onDisk.version).toBe(3);
+    expect(onDisk.titleJobs).toEqual([]);
+  });
+
+  it('create is idempotent and ordinary session writes preserve title jobs', async () => {
+    const job = titleJob();
+    expect(await createSessionTitleJob(job)).toBe(true);
+    expect(await createSessionTitleJob({ ...job, source: '不应覆盖' })).toBe(false);
+
+    await upsertSession(rec('t-title', 'cx-title'));
+    await patchSession('t-title', { model: 'gpt-5.5' });
+
+    expect((await getSessionTitleJob(job.key))?.source).toBe('帮我看下这个报错');
+    const onDisk = JSON.parse(await readFile(paths.sessionsFile, 'utf8'));
+    expect(onDisk.sessions).toHaveLength(1);
+    expect(onDisk.titleJobs).toHaveLength(1);
+  });
+
+  it('allows exactly one concurrent pending -> generating claim', async () => {
+    const job = titleJob('cx-race');
+    await createSessionTitleJob(job);
+
+    const claims = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        updateSessionTitleJob(
+          job.key,
+          (current) => current.phase === 'pending',
+          (current) => ({
+            ...current,
+            phase: 'generating' as const,
+            claimId: `claim-${i}`,
+            leaseUntil: Date.now() + 60_000,
+            attempts: current.attempts + 1,
+          }),
+        ),
+      ),
+    );
+
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    const stored = await getSessionTitleJob(job.key);
+    expect(stored?.phase).toBe('generating');
+    expect(stored?.attempts).toBe(1);
+    expect(stored?.claimId).toMatch(/^claim-\d+$/);
+  });
+
+  it('conditional mutate is a no-op for a stale claim id', async () => {
+    const job = { ...titleJob('cx-stale'), phase: 'generating' as const, claimId: 'winner' };
+    await createSessionTitleJob(job);
+    const result = await updateSessionTitleJob(
+      job.key,
+      (current) => current.claimId === 'loser',
+      (current) => ({ ...current, phase: 'prepared', candidate: '报错排查' }),
+    );
+    expect(result).toBe(false);
+    expect((await getSessionTitleJob(job.key))?.phase).toBe('generating');
+  });
+
+  it('full replacement can clear source/candidate/policy atomically', async () => {
+    const job: SessionTitleJob = {
+      ...titleJob('cx-clear-fields'),
+      phase: 'applying',
+      candidate: '登录报错排查',
+      claimId: 'claim-1',
+      leaseUntil: Date.now() + 1000,
+    };
+    await createSessionTitleJob(job);
+    const updated = await updateSessionTitleJob(
+      job.key,
+      (current) => current.phase === 'applying' && current.claimId === 'claim-1',
+      (current) => ({
+        key: current.key,
+        backend: current.backend,
+        sessionId: current.sessionId,
+        cwd: current.cwd,
+        phase: 'done',
+        finalTitle: current.candidate,
+        attempts: current.attempts,
+        outcome: 'written',
+        createdAt: current.createdAt,
+        updatedAt: current.updatedAt,
+      }),
+    );
+    expect(updated).toBe(true);
+    const stored = await getSessionTitleJob(job.key);
+    expect(stored).not.toHaveProperty('source');
+    expect(stored).not.toHaveProperty('candidate');
+    expect(stored).not.toHaveProperty('policy');
+    expect(stored).not.toHaveProperty('claimId');
+    expect(stored?.phase).toBe('done');
+  });
+
+  it('clears a consumed binding marker only when the key still matches', async () => {
+    const marker = sessionTitleJobKey('codex-appserver', 'cx-marker');
+    await upsertSession({ ...rec('t-marker', 'cx-marker'), titleJobKey: marker });
+
+    await clearSessionTitleJobKey('t-marker', 'codex-appserver:stale');
+    expect((await getSession('t-marker'))?.titleJobKey).toBe(marker);
+
+    await clearSessionTitleJobKey('t-marker', marker);
+    expect(await getSession('t-marker')).not.toHaveProperty('titleJobKey');
   });
 });

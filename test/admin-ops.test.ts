@@ -4,15 +4,18 @@ import { paths } from '../src/config/paths';
 import { addProject, getProjectByName, removeProject } from '../src/project/registry';
 import {
   AdminWriteError,
+  createAppPreferencesWriter,
   createAdminWriteExecutor,
   performBackendSwitch,
   performSetAutoCompact,
+  performSetCompletionReminder,
   performSetNoMention,
   performSetPermissionMode,
   probeBackends as opsProbeBackends,
   runAdminWriteOp,
   validateBackendSwitch as opsValidateBackendSwitch,
 } from '../src/admin/ops';
+import type { AppConfig } from '../src/config/schema';
 import {
   BACKEND_PROBE_TIMEOUT_MS as hmTimeout,
   probeBackends as hmProbeBackends,
@@ -129,6 +132,130 @@ describe('performSetNoMention / performSetAutoCompact', () => {
     expect(r1.ok).toBe(false);
     expect(r2.ok).toBe(false);
     expect(evict).not.toHaveBeenCalled();
+  });
+});
+
+describe('performSetCompletionReminder', () => {
+  function config(): AppConfig {
+    return {
+      accounts: { app: { id: 'cli_test', secret: 'secret', tenant: 'feishu' } },
+      preferences: { completionReminder: { mode: 'failures', longTaskMinutes: 3 } },
+    };
+  }
+
+  it('先落盘再热更新同一个 LIVE cfg 对象', async () => {
+    const cfg = config();
+    const persist = vi.fn(async (next: AppConfig) => {
+      // persist 尚未完成时，运行态仍是旧策略；避免落盘失败却临时生效。
+      expect(cfg.preferences?.completionReminder).toEqual({ mode: 'failures', longTaskMinutes: 3 });
+      expect(next.preferences?.completionReminder).toEqual({ mode: 'long', longTaskMinutes: 9 });
+    });
+    const r = await performSetCompletionReminder({
+      cfg,
+      mode: 'long',
+      longTaskMinutes: 9,
+      persistConfig: persist,
+    });
+    expect(r).toEqual({ ok: true, completionReminder: { mode: 'long', longTaskMinutes: 9 } });
+    expect(cfg.preferences?.completionReminder).toEqual({ mode: 'long', longTaskMinutes: 9 });
+    expect(persist).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { mode: 'smart' as never, longTaskMinutes: 3 },
+    { mode: 'long' as const, longTaskMinutes: 0 },
+    { mode: 'long' as const, longTaskMinutes: 1441 },
+    { mode: 'long' as const, longTaskMinutes: 1.5 },
+  ])('非法策略/阈值 %# → 拒绝且不落盘、不改 LIVE cfg', async (input) => {
+    const cfg = config();
+    const persist = vi.fn(async () => undefined);
+    const r = await performSetCompletionReminder({ ...input, cfg, persistConfig: persist });
+    expect(r.ok).toBe(false);
+    expect(persist).not.toHaveBeenCalled();
+    expect(cfg.preferences?.completionReminder).toEqual({ mode: 'failures', longTaskMinutes: 3 });
+  });
+
+  it('落盘失败 → reject 且 LIVE cfg 保持旧策略', async () => {
+    const cfg = config();
+    await expect(
+      performSetCompletionReminder({
+        cfg,
+        mode: 'always',
+        longTaskMinutes: 3,
+        persistConfig: async () => {
+          throw new Error('disk full');
+        },
+      }),
+    ).rejects.toThrow('disk full');
+    expect(cfg.preferences?.completionReminder).toEqual({ mode: 'failures', longTaskMinutes: 3 });
+  });
+
+  it('串行合并 Web 完成提醒与同时发生的其它 DM 偏好写，不丢字段', async () => {
+    const cfg = config();
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const snapshots: AppConfig[] = [];
+    const persist = vi.fn(async (next: AppConfig) => {
+      snapshots.push(next);
+      if (snapshots.length === 1) await firstBlocked;
+    });
+    const writePreferences = createAppPreferencesWriter({ cfg, persistConfig: persist });
+
+    const webWrite = performSetCompletionReminder({
+      cfg,
+      mode: 'long',
+      longTaskMinutes: 9,
+      writePreferences,
+    });
+    await vi.waitFor(() => expect(persist).toHaveBeenCalledTimes(1));
+    const dmWrite = writePreferences((preferences) => {
+      preferences.showToolCalls = true;
+    });
+
+    // The first disk write is still pending, so LIVE remains the last committed snapshot.
+    expect(cfg.preferences).toEqual({ completionReminder: { mode: 'failures', longTaskMinutes: 3 } });
+    releaseFirst();
+    await Promise.all([webWrite, dmWrite]);
+
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots[0]?.preferences).toEqual({ completionReminder: { mode: 'long', longTaskMinutes: 9 } });
+    expect(snapshots[1]?.preferences).toEqual({
+      completionReminder: { mode: 'long', longTaskMinutes: 9 },
+      showToolCalls: true,
+    });
+    expect(cfg.preferences).toEqual(snapshots[1]?.preferences);
+  });
+
+  it('仅切 mode 会在队列内合并最新阈值，不会用入队前的旧阈值覆盖它', async () => {
+    const cfg = config();
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const snapshots: AppConfig[] = [];
+    const writePreferences = createAppPreferencesWriter({
+      cfg,
+      persistConfig: async (next) => {
+        snapshots.push(next);
+        if (snapshots.length === 1) await firstBlocked;
+      },
+    });
+
+    const thresholdWrite = performSetCompletionReminder({
+      cfg,
+      mode: 'long',
+      longTaskMinutes: 12,
+      writePreferences,
+    });
+    await vi.waitFor(() => expect(snapshots).toHaveLength(1));
+    const modeOnlyWrite = performSetCompletionReminder({ cfg, mode: 'always', writePreferences });
+
+    releaseFirst();
+    await Promise.all([thresholdWrite, modeOnlyWrite]);
+    expect(snapshots[1]?.preferences?.completionReminder).toEqual({ mode: 'always', longTaskMinutes: 12 });
+    expect(cfg.preferences?.completionReminder).toEqual({ mode: 'always', longTaskMinutes: 12 });
   });
 });
 
@@ -278,5 +405,22 @@ describe('createAdminWriteExecutor / runAdminWriteOp（Web · IPC 入口）', ()
     const err = await exec({ kind: 'switchBackend', project: 'demo', backend: 'gpt-9' }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(AdminWriteError);
     expect((err as AdminWriteError).code).toBe('ADMIN_WRITE_REJECTED');
+  });
+
+  it('setCompletionReminder op 通过执行器热更新 cfg；缺 LIVE cfg 时 fail closed', async () => {
+    const cfg: AppConfig = {
+      accounts: { app: { id: 'cli_test', secret: 'secret', tenant: 'feishu' } },
+    };
+    const persist = vi.fn(async () => undefined);
+    const exec = createAdminWriteExecutor({ ...deps, cfg, persistConfig: persist });
+    await expect(
+      exec({ kind: 'setCompletionReminder', mode: 'manual', longTaskMinutes: 3 }),
+    ).resolves.toBeUndefined();
+    expect(cfg.preferences?.completionReminder).toEqual({ mode: 'manual', longTaskMinutes: 3 });
+
+    const missingCfg = createAdminWriteExecutor(deps);
+    await expect(
+      missingCfg({ kind: 'setCompletionReminder', mode: 'failures', longTaskMinutes: 3 }),
+    ).rejects.toBeInstanceOf(AdminWriteError);
   });
 });

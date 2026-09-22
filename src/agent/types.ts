@@ -1,3 +1,6 @@
+/** Request rejected locally before any transport write: safe to resubmit. */
+export class UnsentRequestError extends Error {}
+
 /**
  * Backend-agnostic agent interface. The codex app-server implementation lives
  * in ./codex-appserver; this layer lets the bot orchestrator stay decoupled
@@ -24,6 +27,12 @@ export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
  * (restricted token); on Linux/WSL it can't, so those tiers fail-closed there.
  */
 export type PermissionMode = 'qa' | 'write' | 'full';
+
+/** What a turn runs as when no project policy resolved a mode: the middle tier —
+ * confined to the project folder, never the historical whole-machine `full`.
+ * Consumers that receive an OPTIONAL mode (a caller may not have a project yet)
+ * read this ONE constant instead of each carrying its own `?? 'write'`. */
+export const DEFAULT_PERMISSION_MODE: PermissionMode = 'write';
 
 export interface AgentInput {
   text?: string;
@@ -216,6 +225,7 @@ export interface AgentThread {
    * reactivate when the thread is later resumed. Best-effort. */
   clearGoal(): Promise<void>;
   /** inject input into the in-flight turn (引导) */
+  readonly supportsSteer?: boolean;
   steer(input: AgentInput, expectedTurnId: string): Promise<void>;
   /** interrupt the in-flight turn (watchdog 中止) */
   abort(turnId: string): Promise<void>;
@@ -249,6 +259,17 @@ export interface StartThreadOptions {
 export interface ResumeThreadOptions extends StartThreadOptions {
   /** the session to resume (a prior {@link AgentThread.sessionId}) */
   sessionId: string;
+}
+
+/** Isolated one-shot title generation. The caller supplies the complete prompt
+ * (including title rules and the already-cleaned first user message); backends
+ * must use the selected model/effort verbatim and must not silently substitute
+ * a cheaper/default model. */
+export interface GenerateSessionTitleOptions {
+  cwd: string;
+  prompt: string;
+  model: string;
+  effort: ReasoningEffort;
 }
 
 // ── 账号用量（归一化）──────────────────────────────────────────────────
@@ -406,6 +427,17 @@ export interface AgentBackend {
    * live. Keeps the last `maxTurns` turns; never throws (returns empty on fail).
    */
   readHistory(cwd: string, sessionId: string, maxTurns?: number): Promise<ThreadHistory>;
+  /** Read the backend-native user title only (not preview/auto summary). Undefined
+   * means this session has no title yet. Kept optional for future backends that
+   * cannot participate in native resume-title synchronization. */
+  readSessionTitle?(cwd: string, sessionId: string): Promise<string | undefined>;
+  /** Persist a title through the backend's native session store so its own CLI
+   * resume picker sees it (codex: thread/name/set; Claude: customTitle). */
+  setSessionTitle?(cwd: string, sessionId: string, title: string): Promise<void>;
+  /** Run an isolated, non-persistent one-shot generation with the exact selected
+   * model and effort. Empty model output is represented as undefined; runtime
+   * errors intentionally propagate so the coordinator can apply its fallback. */
+  generateSessionTitle?(opts: GenerateSessionTitleOptions): Promise<string | undefined>;
   startThread(opts: StartThreadOptions): Promise<AgentThread>;
   resumeThread(opts: ResumeThreadOptions): Promise<AgentThread>;
 }

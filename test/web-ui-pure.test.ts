@@ -30,6 +30,20 @@ describe('ui.ts UI_PURE_JS 内联进 UI_HTML（同一份字符串，零漂移）
   it('UI_HTML 内联了 UI_PURE_JS 全文', () => {
     expect(UI_HTML).toContain(UI_PURE_JS);
   });
+
+  it('每 bot 完成提醒设置展示四档、长任务阈值与保存接口', () => {
+    for (const label of ['仅手动', '长任务', '失败或超时', '每次结束']) {
+      expect(UI_HTML).toContain(label);
+    }
+    expect(UI_HTML).toContain('/completion-reminder');
+    expect(UI_HTML).toContain('1–1440');
+    expect(UI_HTML).toContain('运行卡不显示提醒按钮');
+  });
+
+  it('添加机器人只保留扫码，不暴露手填表单或 POST /api/bots', () => {
+    expect(UI_HTML).not.toContain('已有飞书应用？手动填 App ID/Secret');
+    expect(UI_HTML).not.toContain("fetch('/api/bots', {");
+  });
 });
 
 describe('parseRoute —— hash 路由（overview / bot）', () => {
@@ -150,6 +164,10 @@ describe('扫码 SSE 事件处理 —— status / error 文案映射', () => {
   it('error：access_denied → 取消/拒绝文案', () => {
     expect(pure.scanErrorText('access_denied')).toContain('取消');
   });
+  it('error：identity_missing → 明确未保存并要求重新扫码', () => {
+    expect(pure.scanErrorText('identity_missing')).toContain('没有保存');
+    expect(pure.scanErrorText('identity_missing')).toContain('重新扫码');
+  });
   it('error：未知 code → 透传 message，无 message 兜底', () => {
     expect(pure.scanErrorText('persist_failed', '写盘失败')).toBe('写盘失败');
     expect(pure.scanErrorText('unknown')).toContain('请重试');
@@ -230,4 +248,11 @@ describe('qrSvg —— 给定 url 出有效 SVG', () => {
   it('opts.size 自定义像素', () => {
     expect(pure.qrSvg('x', { size: 180 })).toContain('width="180"');
   });
+});
+
+
+it('parses every embedded browser script, including voice settings', () => {
+  for (const match of UI_HTML.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)) {
+    expect(() => new Function(match[1]!)).not.toThrow();
+  }
 });

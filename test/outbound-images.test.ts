@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { imageSources, uploadOutboundImages } from '../src/card/outbound-images';
+import { uploadOutboundImages } from '../src/card/outbound-images';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]); // tiny but non-empty
 
@@ -36,29 +36,13 @@ function fakeChannel() {
   return { channel: channel as any, state };
 }
 
-describe('imageSources', () => {
-  it('extracts srcs in order, deduped, unwrapping <> and dropping titles', () => {
-    const text = '![a](one.png) text ![b](<two with space.png>) ![c](three.png "t") ![dup](one.png)';
-    expect(imageSources(text)).toEqual(['one.png', 'two with space.png', 'three.png']);
-  });
-
-  it('finds image refs inside a ```feishu-card fence too (one scan covers both)', () => {
-    const text = '答复\n\n```feishu-card\n# T\n![x](inside.png)\n```';
-    expect(imageSources(text)).toEqual(['inside.png']);
-  });
-
-  it('returns [] when there are no images', () => {
-    expect(imageSources('no images here, just `code`')).toEqual([]);
-  });
-});
-
 describe('uploadOutboundImages', () => {
   it('uploads a local file inside cwd and maps src → image_key', async () => {
     const cwd = await tmpDir();
     await writeFile(join(cwd, 'a.png'), PNG);
     const { channel, state } = fakeChannel();
 
-    const map = await uploadOutboundImages(channel, ['a.png'], cwd);
+    const map = await uploadOutboundImages(channel, ['a.png'], cwd, 'write');
     expect(map.get('a.png')).toMatch(/^img_key_/);
     expect(state.calls).toBe(1);
   });
@@ -68,9 +52,9 @@ describe('uploadOutboundImages', () => {
     await writeFile(join(cwd, 'b.png'), PNG);
     const { channel, state } = fakeChannel();
 
-    await uploadOutboundImages(channel, ['b.png'], cwd);
+    await uploadOutboundImages(channel, ['b.png'], cwd, 'write');
     const callsAfterFirst = state.calls;
-    await uploadOutboundImages(channel, ['b.png'], cwd);
+    await uploadOutboundImages(channel, ['b.png'], cwd, 'write');
     expect(state.calls).toBe(callsAfterFirst); // cache hit, no second upload
   });
 
@@ -80,7 +64,7 @@ describe('uploadOutboundImages', () => {
     await writeFile(join(outside, 'secret.png'), PNG);
     const { channel, state } = fakeChannel();
 
-    const map = await uploadOutboundImages(channel, [join(outside, 'secret.png'), '../escape.png'], cwd);
+    const map = await uploadOutboundImages(channel, [join(outside, 'secret.png'), '../escape.png'], cwd, 'write');
     expect(map.size).toBe(0);
     expect(state.calls).toBe(0);
   });
@@ -90,7 +74,7 @@ describe('uploadOutboundImages', () => {
     await writeFile(join(cwd, 'note.txt'), PNG);
     const { channel, state } = fakeChannel();
 
-    const map = await uploadOutboundImages(channel, ['note.txt'], cwd);
+    const map = await uploadOutboundImages(channel, ['note.txt'], cwd, 'write');
     expect(map.size).toBe(0);
     expect(state.calls).toBe(0);
   });
@@ -100,7 +84,7 @@ describe('uploadOutboundImages', () => {
     await writeFile(join(cwd, 'real.png'), PNG);
     const { channel } = fakeChannel();
 
-    const map = await uploadOutboundImages(channel, ['gone.png', 'real.png'], cwd);
+    const map = await uploadOutboundImages(channel, ['gone.png', 'real.png'], cwd, 'write');
     expect(map.has('gone.png')).toBe(false);
     expect(map.get('real.png')).toMatch(/^img_key_/);
   });
