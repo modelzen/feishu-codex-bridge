@@ -83,6 +83,9 @@ export function sandboxParams(
   return {
     config: {
       default_permissions: 'feishu',
+      // Stop AGENTS.md discovery at cwd: parent Git roots may be outside the
+      // readable workspace and otherwise make restricted thread startup fail.
+      project_root_markers: ['.'],
       permissions: {
         feishu: {
           filesystem: {

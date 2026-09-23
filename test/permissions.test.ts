@@ -65,6 +65,15 @@ describe('sandboxParams', () => {
   // qa/write read-confinement is enforceable on macOS (Seatbelt) and native
   // Windows (restricted token) — assert the profile shape on both.
   for (const plat of ['darwin', 'win32'] as const) {
+    it(`${plat}: restricted modes stop AGENTS.md discovery at the permitted cwd`, () => {
+      withPlatform(plat, () => {
+        for (const mode of ['qa', 'write'] as const) {
+          const params = sandboxParams(mode, false);
+          expect(params).toHaveProperty('config.project_root_markers', ['.']);
+          expect(withAutoCompact(params, false)).toHaveProperty('config.project_root_markers', ['.']);
+        }
+      });
+    });
     it(`${plat}: qa → read-only confined to workspace, network off`, () => {
       withPlatform(plat, () => {
         const p = sandboxParams('qa', false) as any;
