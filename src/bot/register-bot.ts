@@ -108,8 +108,12 @@ export async function registerBotFromCredentials(
     await saveConfig(cfg, files.configFile);
 
     const reg = await loadBots();
-    const name = uniqueName(reg, input.desiredName ?? v.botName ?? appId);
-    await addBot({ name, appId, tenant, botName: v.botName, createdAt: Date.now() });
+    const previous = reg.bots.find(bot => bot.appId === appId);
+    const name = uniqueName(
+      { ...reg, bots: reg.bots.filter(bot => bot.appId !== appId) },
+      input.desiredName ?? previous?.name ?? v.botName ?? appId,
+    );
+    await addBot({ ...previous, name, appId, tenant, botName: v.botName, createdAt: previous?.createdAt ?? Date.now() });
 
     log.info('register-bot', 'bot-registered', { name, appId, bot: v.botName ?? null });
     return { ok: true, name, appId, tenant, botName: v.botName, missingScopes: v.missingScopes };

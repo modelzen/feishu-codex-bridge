@@ -43,7 +43,7 @@ vi.mock('../src/config/paths', async () => {
 
 import { registerBotFromCredentials } from '../src/bot/register-bot';
 import { getSecret } from '../src/config/keystore';
-import { loadBots } from '../src/config/bots';
+import { loadBots, saveBots } from '../src/config/bots';
 import { botPaths, paths } from '../src/config/paths';
 import { secretKeyForApp } from '../src/config/schema';
 
@@ -139,13 +139,17 @@ describe('registerBotFromCredentials · 注册落盘', () => {
       { appId: 'cli_dup1234567', appSecret: 'secret-1', tenant: 'feishu', ownerOpenId: 'ou_dup' },
       okValidate,
     );
+    const before = await loadBots();
+    const original = before.bots.find(b => b.appId === 'cli_dup1234567')!;
+    original.active = true;
+    await saveBots(before);
     await registerBotFromCredentials(
       { appId: 'cli_dup1234567', appSecret: 'secret-2', tenant: 'feishu', ownerOpenId: 'ou_dup' },
       okValidate,
     );
     expect(await getSecret(secretKeyForApp('cli_dup1234567'))).toBe('secret-2');
     const reg = await loadBots();
-    expect(reg.bots.filter((b) => b.appId === 'cli_dup1234567')).toHaveLength(1);
+    expect(reg.bots.filter((b) => b.appId === 'cli_dup1234567')).toEqual([original]);
   });
 
   it('lark 租户透传给探活与注册', async () => {
