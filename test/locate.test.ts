@@ -43,19 +43,19 @@ afterAll(() => {
 });
 
 describe('resolveCodexBin 缓存', () => {
-  it('命中后不重探；force 重探；缓存路径消失则自动失效', () => {
+  it('显式覆盖立即生效；路径消失时不得回退到其它 Codex', () => {
     const a = join(dir, 'codex-a');
     const b = join(dir, 'codex-b');
     writeFileSync(a, '');
     writeFileSync(b, '');
 
     expect(withCodexBinEnv(a, () => resolveCodexBin({ force: true }))).toBe(a);
-    // 环境换了但缓存仍有效（路径还存在）→ 不重探
-    expect(withCodexBinEnv(b, () => resolveCodexBin())).toBe(a);
+    expect(withCodexBinEnv(b, () => resolveCodexBin())).toBe(b);
     // force 绕过缓存 → 看到新 CODEX_BIN
     expect(withCodexBinEnv(b, () => resolveCodexBin({ force: true }))).toBe(b);
     // 缓存的 bin 被删 → existsSync 复验失败，自动重探
     rmSync(b);
+    expect(withCodexBinEnv(b, () => resolveCodexBin())).toBeNull();
     expect(withCodexBinEnv(a, () => resolveCodexBin())).toBe(a);
   });
 });

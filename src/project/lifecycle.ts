@@ -31,6 +31,12 @@ export function assertBackendUsable(backend: string | undefined, mode: Permissio
   throw new Error(`所选后端「${backend}」当前不可用（未下载或不支持该权限档），请回卡片重新选择`);
 }
 
+export function bindModeFor(backend?: string): PermissionMode | undefined {
+  const modes = backend ? catalogById(backend)?.supportedModes : undefined;
+  if (modes && !modes.includes('qa')) return modes.includes('full') ? 'full' : modes[0];
+  return undefined;
+}
+
 export interface CreateProjectInput {
   name: string;
   /** DM sender open_id — invited to the new group + set as a member. */
@@ -56,7 +62,7 @@ export interface JoinGroupInput {
   /** the pre-existing group the bot was added to. */
   chatId: string;
   /** open_id of the admin who added the bot + submitted the bind. */
-  addedBy: string;
+  addedBy?: string;
   /** when set, bind this existing folder; otherwise create a blank project. */
   existingPath?: string;
   /** optional config.json override for the parent directory of blank projects. */

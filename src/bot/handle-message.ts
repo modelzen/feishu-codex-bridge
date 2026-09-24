@@ -192,7 +192,8 @@ import {
   updateProject,
   type Project,
 } from '../project/registry';
-import { createProject, joinExistingGroup } from '../project/lifecycle';
+import { bindModeFor, createProject, joinExistingGroup } from '../project/lifecycle';
+export { bindModeFor } from '../project/lifecycle';
 import { refreshBranch } from '../project/announcement';
 import { leaveChat, transferOwnership } from '../project/group-ops';
 import {
@@ -389,17 +390,6 @@ function backendOptionsFor(mode: PermissionMode): SelectOption[] {
   return opts.length > 1 ? opts : [];
 }
 
-/**
- * 绑定『已有群』时该项目落哪个权限档。joined 群默认只读 qa（外部群安全考量）——但
- * claude 系后端仅支持 full，若用户在绑定卡里显式选了它，就以它支持的档（full）绑定，
- * 否则 joinExistingGroup 的 assertBackendUsable 会当场拒绝「不支持该档」。codex / 未选
- * → undefined → 沿用 joinExistingGroup 的 qa 默认（外部群仍只读，安全不变）。
- */
-export function bindModeFor(backend?: string): PermissionMode | undefined {
-  const modes = backend ? catalogById(backend)?.supportedModes : undefined;
-  if (modes && !modes.includes('qa')) return modes.includes('full') ? 'full' : modes[0];
-  return undefined;
-}
 /** 把卡片提交的 backend 收成安全值：必须是注册表里的 id，否则丢弃（落回默认 codex），防伪造。 */
 export function safeBackendId(formValue: Record<string, unknown> | undefined): string | undefined {
   const v = selectValue(formValue, 'backend');

@@ -1,8 +1,9 @@
 import { UnsentRequestError } from '../types';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
-import { mergeProcessEnv, spawnProcess } from '../../platform/spawn';
+import { mergeProcessEnv } from '../../platform/spawn';
 import { log } from '../../core/logger';
 import type { ServerNotification } from './protocol';
+import { OwnedCodexProcess } from './owned-process';
 
 /** Simple async queue: push() from the reader, async-iterate from consumers. */
 class AsyncQueue<T> {
@@ -74,6 +75,8 @@ export interface AppServerClientOptions {
   cwd: string;
   env?: Record<string, string>;
   clientName?: string;
+  quietOutput?: boolean;
+  initializeTimeoutMs?: number;
 }
 
 /**
@@ -84,6 +87,7 @@ export interface AppServerClientOptions {
  */
 export class AppServerClient {
   private child: ChildProcessWithoutNullStreams | null = null;
+  private owned: OwnedCodexProcess | undefined;
   private buf = '';
   private nextId = 0;
   private readonly pending = new Map<number, Pending>();
@@ -110,18 +114,20 @@ export class AppServerClient {
     // Launch via cross-spawn (platform/spawn) so a Windows `.cmd` codex shim
     // runs instead of throwing EINVAL (CVE-2024-27980). With stdio all-piped the
     // streams are non-null, so the cast to *WithoutNullStreams is sound.
-    const child = spawnProcess(this.opts.bin, ['app-server', '--listen', 'stdio://'], {
+    const owned = new OwnedCodexProcess(this.opts.bin, ['app-server', '--listen', 'stdio://'], {
       cwd: this.opts.cwd,
       env: mergeProcessEnv(process.env, { ...this.opts.env, FEISHU_CODEX_BRIDGE: '1' }),
       stdio: ['pipe', 'pipe', 'pipe'],
-    }) as ChildProcessWithoutNullStreams;
+    });
+    const child = owned.child as ChildProcessWithoutNullStreams;
+    this.owned = owned;
     this.child = child;
     log.info('agent', 'spawn', { pid: child.pid ?? null, cwd: this.opts.cwd });
 
     child.stdout.on('data', (d: Buffer) => this.onStdout(d));
     child.stderr.on('data', (d: Buffer) => {
       const line = d.toString('utf8').trim();
-      if (line) log.warn('agent', 'stderr', { line: line.slice(0, 200) });
+      if (line && !this.opts.quietOutput) log.warn('agent', 'stderr', { line: line.slice(0, 200) });
     });
     child.on('exit', (code, signal) => {
       log.info('agent', 'exit', { pid: child.pid ?? null, code, signal });
@@ -137,7 +143,7 @@ export class AppServerClient {
     child.stdin.on('error', (err) => {
       this.failAllPending(err);
       this.notifications.close();
-      void this.close();
+      void this.close().catch(error => log.fail('agent', error));
     });
 
     await this.request('initialize', {
@@ -147,7 +153,7 @@ export class AppServerClient {
       // without it, thread/goal/set is rejected. The `goals` feature itself is
       // stable+on by default there, so no experimentalFeature/enablement/set needed.
       capabilities: { experimentalApi: true, requestAttestation: false },
-    });
+    }, this.opts.initializeTimeoutMs);
     this.notify('initialized');
   }
 
@@ -192,48 +198,18 @@ export class AppServerClient {
     this.notifications.clear();
   }
 
-  async close(graceMs = 4000): Promise<void> {
-    if (this.closed) return;
+  private closing: Promise<void> | undefined;
+
+  close(graceMs = 4000): Promise<void> {
+    this.closing ??= this.closeChild(graceMs);
+    return this.closing;
+  }
+
+  private async closeChild(graceMs: number): Promise<void> {
     this.closed = true;
-    const child = this.child;
-    if (!child || child.exitCode !== null) return;
-
-    if (process.platform === 'win32' && child.pid) {
-      // Windows has no POSIX signals, and child.kill() can't reap codex's
-      // grandchildren (MCP / tool subprocesses) — they'd orphan. `taskkill /T`
-      // terminates the whole process tree; wait for exit with graceMs fallback.
-      await new Promise<void>((resolve) => {
-        let settled = false;
-        const done = (): void => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(t);
-          resolve();
-        };
-        const t = setTimeout(done, graceMs);
-        child.once('exit', done);
-        spawnProcess('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' }).on(
-          'error',
-          () => {
-            child.kill();
-            done();
-          },
-        );
-      });
-      return;
-    }
-
-    child.kill('SIGTERM');
-    await new Promise<void>((resolve) => {
-      const t = setTimeout(() => {
-        if (child.exitCode === null) child.kill('SIGKILL');
-        resolve();
-      }, graceMs);
-      child.once('exit', () => {
-        clearTimeout(t);
-        resolve();
-      });
-    });
+    this.failAllPending(new Error('app-server client closed'));
+    this.notifications.close();
+    await this.owned?.close(graceMs);
   }
 
   private onStdout(d: Buffer): void {
@@ -252,7 +228,7 @@ export class AppServerClient {
     try {
       msg = JSON.parse(line);
     } catch {
-      log.warn('agent', 'nonjson', { line: line.slice(0, 120) });
+      if (!this.opts.quietOutput) log.warn('agent', 'nonjson', { line: line.slice(0, 120) });
       return;
     }
 

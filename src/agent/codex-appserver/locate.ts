@@ -1,3 +1,4 @@
+import { managedCodexBin } from './managed-install';
 import { existsSync } from 'node:fs';
 import { extname, join } from 'node:path';
 import { paths } from '../../config/paths';
@@ -15,9 +16,10 @@ const versionCache = new Map<string, string>();
 /**
  * Resolve the codex CLI binary, in priority order:
  *   1. $CODEX_BIN (explicit override)
- *   2. PATH (`codex`, via `where`/`which`)
- *   3. bridge private install (~/.feishu-codex-bridge/codex-cli/node_modules/.bin/codex)
- *   4. macOS Codex.app bundled binary
+ *   2. Managed private install
+ *   3. PATH (`codex`, via `where`/`which`)
+ *   4. legacy bridge private install (~/.feishu-codex-bridge/codex-cli/node_modules/.bin/codex)
+ *   5. macOS Codex.app bundled binary
  * Returns null if none found.
  *
  * On Windows an npm-installed bin is a `codex.cmd`/`codex.exe` shim, never a
@@ -25,6 +27,9 @@ const versionCache = new Map<string, string>();
  */
 export function resolveCodexBin(opts?: { force?: boolean }): string | null {
   // 命中后仍 existsSync 复验（零 spawn）：codex 被卸载/移动时自动失效重探。
+  if (process.env.CODEX_BIN) return existsSync(process.env.CODEX_BIN) ? process.env.CODEX_BIN : null;
+  const managed = managedCodexBin();
+  if (managed) return managed;
   if (!opts?.force && binCache && existsSync(binCache)) return binCache;
   binCache = locateBin();
   return binCache;

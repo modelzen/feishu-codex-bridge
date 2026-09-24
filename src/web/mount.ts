@@ -63,8 +63,8 @@ export async function mountWebConsole(service: AdminService): Promise<MountedWeb
     port,
     close: async (): Promise<void> => {
       process.removeListener('exit', exitCleanup);
+      await web.close();
       clearWebConsole();
-      await web.close().catch(() => undefined);
     },
   };
 }

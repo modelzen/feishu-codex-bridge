@@ -172,6 +172,7 @@ async function runSingle(botName: string | undefined, control: ShutdownControl, 
         if (op.kind === 'status') {
           return { connection: handle.channel.getConnectionStatus?.()?.state ?? 'unknown' };
         }
+        if (op.kind === 'joinedGroups' || op.kind === 'bindGroup') return handle.adminGroups(op);
         await handle.adminExecute(op);
         return { done: true };
       },
@@ -186,6 +187,10 @@ async function runSingle(botName: string | undefined, control: ShutdownControl, 
     const startedAt = Date.now();
     webConsole = await mountWebConsole(
       createAdminService({
+        executeGroups: async (botId, op) => {
+          if (botId !== ownAppId) throw new AdminWriteError('机器人不在本进程的活跃集里');
+          return handle.adminGroups(op);
+        },
         executeWrite: async (botId, op) => {
           if (botId !== ownAppId) {
             throw new AdminWriteError(

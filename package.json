@@ -33,6 +33,7 @@
     "start": "node bin/feishu-codex-bridge.mjs run",
     "prepare": "npm run build",
     "release": "bash scripts/release.sh",
+    "test:desktop-capabilities": "node scripts/test-desktop-capabilities.mjs",
     "test:host-lifecycle": "node scripts/test-host-lifecycle.mjs && node scripts/test-supervisor-shutdown.mjs"
   },
   "dependencies": {

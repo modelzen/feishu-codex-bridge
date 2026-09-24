@@ -140,7 +140,8 @@ export async function listProjectsIn(file: string): Promise<Project[]> {
   try {
     const text = await readFile(file, 'utf8');
     const parsed = JSON.parse(text) as Partial<StoreFile>;
-    return Array.isArray(parsed.projects) ? parsed.projects : [];
+    if (!parsed || !Array.isArray(parsed.projects) || parsed.projects.some(p => !p || typeof p !== 'object' || typeof p.name !== 'string' || typeof p.cwd !== 'string')) throw new Error('项目注册表格式无效');
+    return parsed.projects;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw err;

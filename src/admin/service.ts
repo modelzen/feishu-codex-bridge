@@ -1,3 +1,5 @@
+import { CodexSetupService, type CodexSetup, type CodexJob, type CodexJobType } from '../agent/codex-appserver/setup';
+import { parseJoinedGroups, type AdminGroupOp, type BindGroupInput, type JoinedGroups } from './groups';
 import { voiceView } from '../voice/view';
 import type { VoiceAction, VoiceView } from '../voice/types';
 import { readFile, rm } from 'node:fs/promises';
@@ -94,6 +96,13 @@ import type { AdminWriteOp } from './ops';
  * 切目录会把在跑 bot 的 paths 指到别的 bot（第一棒遗留的坑，本棒修掉）。
  */
 export interface AdminService {
+  codexSetup?(): Promise<CodexSetup>;
+  startCodexJob?(type: CodexJobType): { id: string };
+  codexJob?(id: string): CodexJob | undefined;
+  cancelCodexJob?(id: string): Promise<CodexJob | undefined>;
+  close?(): Promise<void>;
+  joinedGroups?(botId: string, cursor?: string): Promise<JoinedGroups>;
+  bindGroup?(botId: string, input: BindGroupInput): Promise<AdminProject>;
   getVoice(botId: string): Promise<VoiceView>;
   setVoice(botId: string, action: VoiceAction): Promise<void>;
   /** 全部已注册 bot + 进程在跑状态（daemon 内 = 真实 WS 状态；预览 = 锁文件探测）。 */
@@ -414,6 +423,8 @@ export interface AdminBackendCatalogEntry {
 
 /** daemon/预览两种进程形态的差异全部收进这几个注入点；读路径完全同源。 */
 export interface AdminServiceDeps {
+  codexTools?: CodexSetupService;
+  executeGroups?: (botId: string, op: AdminGroupOp) => Promise<unknown>;
   /** 写执行器：botId + op → 完成或抛 AdminWriteError（校验拒绝）。
    * 缺省 = 只读预览，写方法抛 {@link NotWiredYetError}（HTTP 501）。 */
   executeWrite?: (botId: string, op: AdminWriteOp) => Promise<void>;
@@ -462,6 +473,7 @@ export interface AdminServiceDeps {
  * 不自己解析 JSON；不碰全局 currentBotDir）；写路径与实时状态由 deps 注入。
  */
 export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
+  const codexTools = deps.codexTools ?? new CodexSetupService();
   async function projectsWithCounts(botId: string): Promise<AdminProject[]> {
     const files = botPaths(botId);
     const projects = await listProjectsIn(files.projectsFile);
@@ -529,6 +541,25 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
   }
 
   return {
+    codexSetup: () => codexTools.setup(),
+    startCodexJob(type) {
+      if (deps.readonlyPreview || deps.daemonStartedAt === undefined) throw new NotWiredYetError('Codex 设置');
+      return codexTools.start(type);
+    },
+    codexJob: id => codexTools.get(id),
+    cancelCodexJob: id => codexTools.cancel(id),
+    close: () => codexTools.close(),
+    async joinedGroups(botId, cursor) {
+      if (!deps.executeGroups) throw new NotWiredYetError('群列表');
+      return parseJoinedGroups(await deps.executeGroups(botId, { kind: 'joinedGroups', cursor }));
+    },
+    async bindGroup(botId, input) {
+      if (!deps.executeGroups) throw new NotWiredYetError('绑定群聊');
+      await deps.executeGroups(botId, { kind: 'bindGroup', input });
+      const project = (await projectsWithCounts(botId)).find(p => p.chatId === input.chatId);
+      if (!project) throw new Error('群绑定结果读取失败');
+      return project;
+    },
     async getVoice(botId: string): Promise<VoiceView> {
       const cfg = await loadConfig(botPaths(botId).configFile);
       if (!isComplete(cfg)) throw new Error('机器人配置不完整');

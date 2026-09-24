@@ -1,3 +1,4 @@
+import { GroupUpstreamError, InvalidGroupInput, type AdminGroupOp } from './groups';
 import { AdminWriteError, type AdminWriteOp } from './ops';
 
 /**
@@ -20,7 +21,7 @@ export const ADMIN_IPC_REQ = 'fcb.admin.req' as const;
 export const ADMIN_IPC_RES = 'fcb.admin.res' as const;
 
 /** 转发给子进程的结构化写 op + 实时连接状态查询（替代锁文件探测）。 */
-export type AdminIpcOp = AdminWriteOp | { kind: 'status' };
+export type AdminIpcOp = AdminWriteOp | AdminGroupOp | { kind: 'status' };
 
 export interface AdminIpcRequest {
   fcb: typeof ADMIN_IPC_REQ;
@@ -96,7 +97,7 @@ export function createAdminIpcCaller(send: (msg: AdminIpcRequest) => void): Admi
       }
       const reason = msg.error ?? '子进程执行失败';
       // 校验拒绝跨进程还原成 AdminWriteError —— HTTP 层与进程内路径同样映射 409。
-      entry.reject(msg.code === 'ADMIN_WRITE_REJECTED' ? new AdminWriteError(reason) : new Error(reason));
+      entry.reject(msg.code === 'ADMIN_WRITE_REJECTED' ? new AdminWriteError(reason) : msg.code === 'GROUP_UPSTREAM' ? new GroupUpstreamError(reason) : msg.code === 'INVALID_GROUP_INPUT' ? new InvalidGroupInput(reason) : new Error(reason));
     },
 
     rejectAll(reason): void {
