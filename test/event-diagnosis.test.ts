@@ -56,6 +56,35 @@ describe('diagnoseEventSubscription — 三态 + unchecked 降级', () => {
     expect(d.events).toEqual(ALL_EVENTS);
   });
 
+  it('reads stable event types when events contains localized display names', async () => {
+    const d = await diagnoseEventSubscription('cli_x', 's', 'feishu', fetchStub({
+      versions: { code: 0, data: { items: [{
+        version: '1.0.7', status: 1,
+        events: ['接收消息', '机器人自定义菜单事件'],
+        event_infos: [
+          { event_type: 'im.message.receive_v1', event_name: '接收消息' },
+          { event_type: 'application.bot.menu_v6', event_name: '机器人自定义菜单事件' },
+        ],
+      }] } },
+    }));
+    expect(d.state).toBe('ok');
+    expect(d.events).toEqual(['im.message.receive_v1', 'application.bot.menu_v6']);
+    expect(d.missingRequired).toEqual([]);
+    expect(d.missingOptional).not.toContain('application.bot.menu_v6');
+  });
+
+  it('uses event_infos as authoritative even when events claims a required ID', async () => {
+    const d = await diagnoseEventSubscription('cli_x', 's', 'feishu', fetchStub({
+      versions: { code: 0, data: { items: [{
+        version: '1.0.7', status: 1, events: ['im.message.receive_v1'],
+        event_infos: [{ event_type: 'application.bot.menu_v6' }, {}],
+      }] } },
+    }));
+    expect(d.state).toBe('missing');
+    expect(d.events).toEqual(['application.bot.menu_v6']);
+    expect(d.missingRequired).toEqual(['im.message.receive_v1']);
+  });
+
   it('missing：已发布但缺 im.message.receive_v1', async () => {
     const d = await diagnoseEventSubscription('cli_x', 's', 'feishu', fetchStub({
       versions: {

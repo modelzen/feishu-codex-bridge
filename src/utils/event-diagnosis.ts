@@ -5,7 +5,8 @@ import type { TenantBrand } from '../config/schema';
  *
  * 飞书对「添加事件 / 回调 / 发布版本」没有任何**写入类** OpenAPI，但提供了只读的
  * 「获取应用版本列表」（`GET /application/v6/applications/:app_id/app_versions`），
- * 响应里每个版本都带 `events`（已订阅事件列表）与 `status`（1=审核通过/已上架）。
+ * 响应里每个版本的 `event_infos[].event_type` 是事件 ID，`events` 是本地化名称，
+ * `status` 为 1 表示审核通过/已上架。
  * 凭它可把「@机器人没反应」从"等用户发现"变成启动/doctor/诊断卡上的精确三态：
  *
  *   - `unpublished` —— 从未发布过版本（事件订阅尚未生效）；
@@ -15,7 +16,7 @@ import type { TenantBrand } from '../config/schema';
  * 第四态 `unchecked` 是优雅降级：缺 `application:application.app_version:readonly`
  * scope、网络不通、接口报错都归这里——只告知、绝不阻塞启动（项目既有策略）。
  *
- * 注意：`events` 只含「事件配置」标签页的事件；「回调配置」（card.action.trigger
+ * 注意：事件列表只含「事件配置」标签页的事件；「回调配置」（card.action.trigger
  * 卡片回传交互）不在其中，**无法检测**——相关提示仍须保留人工指引。
  */
 
@@ -64,7 +65,12 @@ interface TokenResp {
 interface VersionListResp {
   code?: number;
   msg?: string;
-  data?: { items?: { version?: string; status?: number; events?: string[] }[] };
+  data?: { items?: {
+    version?: string;
+    status?: number;
+    events?: string[];
+    event_infos?: { event_type?: string }[];
+  }[] };
 }
 
 /**
@@ -124,7 +130,12 @@ export async function diagnoseEventSubscription(
   const live = (body.data?.items ?? []).find((v) => v.status === 1);
   if (!live) return { state: 'unpublished' };
 
-  const events = live.events ?? [];
+  // The API localizes `events` (e.g. "接收消息" for lang=zh_cn).
+  // Compare stable event IDs from event_infos, never display names. Retain
+  // compatibility with responses that expose IDs directly in events.
+  const events = live.event_infos !== undefined
+    ? [...new Set(live.event_infos.map((event) => event.event_type).filter((type): type is string => typeof type === 'string' && type.length > 0))]
+    : live.events ?? [];
   const has = new Set(events);
   const missingRequired = REQUIRED_EVENTS.filter((e) => !has.has(e));
   const missingOptional = OPTIONAL_EVENTS.filter((e) => !has.has(e));
