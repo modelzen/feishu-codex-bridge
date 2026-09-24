@@ -1,3 +1,4 @@
+import { handleSettingsRoute } from './settings-routes';
 import { GroupUpstreamError, InvalidGroupInput, parseBindGroupInput } from '../admin/groups';
 import { CodexSetupConflict } from '../agent/codex-appserver/setup';
 import { validateVoiceAction } from '../voice/service';
@@ -160,6 +161,8 @@ export function createWebServer(opts: WebServerOptions): WebServer {
     if (setCookie) res.setHeader('Set-Cookie', setCookie);
 
     if (closing) { sendJson(res, 503, { error: 'closing', message: 'Host 正在退出' }); return; }
+
+    if (await handleSettingsRoute(req, res, url, opts.service.settings)) return;
 
     // ── 路由 ──────────────────────────────────────────────────────────────
     if (req.method === 'GET' && pathName === '/') {
@@ -581,6 +584,14 @@ export function createWebServer(opts: WebServerOptions): WebServer {
         return;
       }
       try {
+        if ((action === 'no-mention' || action === 'auto-compact') && typeof body.on !== 'boolean') {
+          sendJson(res, 400, { error: 'bad_body', message: 'on 必须是布尔值' });
+          return;
+        }
+        if (action === 'permission' && body.network !== undefined && typeof body.network !== 'boolean') {
+          sendJson(res, 400, { error: 'bad_body', message: 'network 必须是布尔值' });
+          return;
+        }
         if (action === 'backend') {
           await opts.service.switchBackend(botId, project, String(body.backend ?? ''));
         } else if (action === 'permission') {

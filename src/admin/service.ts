@@ -1,3 +1,6 @@
+import { createSettingsService } from './settings-service';
+import type { HostSettings } from './settings-types';
+import type { AdminSettingsReadOp } from './ipc';
 import { CodexSetupService, type CodexSetup, type CodexJob, type CodexJobType } from '../agent/codex-appserver/setup';
 import { parseJoinedGroups, type AdminGroupOp, type BindGroupInput, type JoinedGroups } from './groups';
 import { voiceView } from '../voice/view';
@@ -96,6 +99,7 @@ import type { AdminWriteOp } from './ops';
  * 切目录会把在跑 bot 的 paths 指到别的 bot（第一棒遗留的坑，本棒修掉）。
  */
 export interface AdminService {
+  settings?: HostSettings;
   codexSetup?(): Promise<CodexSetup>;
   startCodexJob?(type: CodexJobType): { id: string };
   codexJob?(id: string): CodexJob | undefined;
@@ -423,11 +427,10 @@ export interface AdminBackendCatalogEntry {
 
 /** daemon/预览两种进程形态的差异全部收进这几个注入点；读路径完全同源。 */
 export interface AdminServiceDeps {
+  executeSettingsRead?: (botId: string, op: AdminSettingsReadOp) => Promise<unknown>;
   codexTools?: CodexSetupService;
   executeGroups?: (botId: string, op: AdminGroupOp) => Promise<unknown>;
-  /** 写执行器：botId + op → 完成或抛 AdminWriteError（校验拒绝）。
-   * 缺省 = 只读预览，写方法抛 {@link NotWiredYetError}（HTTP 501）。 */
-  executeWrite?: (botId: string, op: AdminWriteOp) => Promise<void>;
+  executeWrite?: (botId: string, op: AdminWriteOp) => Promise<unknown>;
   /** 实时运行状态（daemon 进程内：本进程 channel / 子进程 IPC）。返回 undefined
    * 或缺省 → 回退锁文件探测（该 bot 不归本 daemon 管，如未激活的 bot）。 */
   liveStatus?: (botId: string) => Promise<BotLiveStatus | undefined>;
@@ -537,10 +540,11 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
 
   function executeWrite(botId: string, action: string, op: AdminWriteOp): Promise<void> {
     if (!deps.executeWrite) throw new NotWiredYetError(action);
-    return deps.executeWrite(botId, op);
+    return deps.executeWrite(botId, op).then(() => undefined);
   }
 
   return {
+    settings: createSettingsService(deps),
     codexSetup: () => codexTools.setup(),
     startCodexJob(type) {
       if (deps.readonlyPreview || deps.daemonStartedAt === undefined) throw new NotWiredYetError('Codex 设置');
@@ -938,21 +942,13 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       const reg = await loadBots();
       const target = reg.bots.find((b) => b.appId === appId);
       if (!target) return { ok: false, reason: `机器人「${appId}」不存在。` };
-      // 保护①：唯一 bot 不许删（删完控制台空了、无从恢复，得引导重新 init）。
-      if (reg.bots.length <= 1) {
-        return { ok: false, reason: '这是当前唯一的机器人，不能删除——删完控制台就空了。先用 `bot init` 添加另一个再删。' };
-      }
-      // 保护②：带运行中会话（bridge 在跑 + 有话题记录）的 bot 不许删——会打断正在跑的
-      // codex 会话、留下孤儿 app-server。先 `bot use` 退活跃集 + 重启让进程退出再删。
       const run = await runState(appId);
       if (run.running) {
-        const sessions = await listSessionsIn(botPaths(appId).sessionsFile).catch(() => []);
-        if (sessions.length > 0) {
-          return {
-            ok: false,
-            reason: `机器人「${target.name}」正在运行且有 ${sessions.length} 个活跃会话，不能删除（会打断进行中的对话）。先在「多机器人」里关掉它并重启 daemon，等进程退出后再删。`,
-          };
-        }
+        return { ok: false, reason: `机器人「${target.name}」仍在运行。请先关闭启用状态并重启 Host，确认已停止后再删除。` };
+      }
+      const enabled = reg.bots.some(bot => bot.active !== undefined) ? target.active === true : reg.current === appId;
+      if (enabled) {
+        return { ok: false, reason: '请先关闭此机器人的启用状态并确认已经停止，再删除。' };
       }
       // 注册表 + keystore 密钥 + 状态目录（projects/sessions/config），与 `bot rm` 同语义。
       await removeBot(appId);

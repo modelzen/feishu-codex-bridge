@@ -164,7 +164,8 @@ function withLock<T>(fn: () => Promise<T>): Promise<T> {
 async function write(projects: Project[]): Promise<void> {
   await mkdir(dirname(paths.projectsFile), { recursive: true });
   const tmp = `${paths.projectsFile}.tmp-${process.pid}-${randomUUID()}`;
-  const body: StoreFile = { version: FILE_VERSION, projects };
+  const previous = await readFile(paths.projectsFile, 'utf8').then(text => JSON.parse(text)).catch(error => { if (error.code === 'ENOENT') return {}; throw error; });
+  const body: StoreFile = { ...previous, version: FILE_VERSION, projects };
   await writeFile(tmp, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
   await rename(tmp, paths.projectsFile);
 }
@@ -228,5 +229,16 @@ export async function removeProject(name: string): Promise<Project | undefined> 
     const [removed] = projects.splice(idx, 1);
     await write(projects);
     return removed;
+  });
+}
+
+export async function mutateProject(name: string, mutate: (project: Project) => void | Promise<void>): Promise<Project> {
+  return withLock(async () => {
+    const projects = await read();
+    const project = projects.find(item => item.name === name);
+    if (!project) throw new Error('项目不存在');
+    await mutate(project);
+    await write(projects);
+    return project;
   });
 }

@@ -33,6 +33,7 @@ const LOCAL_RETURN = 'local_return';
  *  the two shapes drift); structural so bridge.ts can pass the full service without
  *  a circular import. */
 export interface CliBridgeRuntimeHooks {
+  isRunning?: () => boolean;
   onMessage: (msg: { parentId?: string; rootId?: string; text?: string; messageId?: string }) => boolean;
   register: (dispatcher: CardDispatcher) => void;
   start?: () => Promise<void>;
@@ -472,6 +473,7 @@ export function createCliBridgeService(opts: {
   }
 
   return {
+    isRunning: () => ipc !== undefined,
     start: async () => {
       if (ipc) return;
       ipc = await startCliBridgeIpcServer({ socketPath: opts.socketPath, handleMessage });

@@ -1,3 +1,6 @@
+import { createSettingsOwner, settingsRevision } from '../admin/settings';
+import type { HostSettings } from '../admin/settings-types';
+import type { AdminWriteResult } from '../admin/ops';
 import { registerVoiceConsole } from './voice-console';
 import { createVoiceService } from '../voice/service';
 import { ingestVoice, createIntakeQueue, type IngestedContext } from '../voice/inbound';
@@ -149,7 +152,7 @@ import {
   type DoctorInfo,
 } from '../card/dm-cards';
 import { cliBridgeSettingsSection, CLI } from '../cli-bridge/cards';
-import { inspectCliBridgeHooks, installCliBridgeHooks, resolveBridgeHookCommand } from '../cli-bridge/hooks';
+import { inspectCliBridgeHooks } from '../cli-bridge/hooks';
 import type { CliBridgeRuntimeHooks } from '../cli-bridge/service';
 export type { CliBridgeRuntimeHooks };
 import {
@@ -242,10 +245,8 @@ import {
   renderCommentInstructions,
   REPLY_MAX_CHARS,
   resolveComment,
-  saveCommentInstructions,
   stripMarkdown,
   SUPPORTED_FILE_TYPES,
-  syncAllCommentInstructions,
   syncCommentInstructions,
 } from './comments';
 import { createGracefulInterrupt, Semaphore, withIdleTimeout } from './watchdog';
@@ -519,10 +520,8 @@ export interface Orchestrator {
   /** application.bot.menu_v6（raw-tap）：bot 单聊菜单点击 → DM 管理台菜单卡。 */
   onBotMenu: (evt: { openId?: string; eventKey?: string; eventId?: string }) => Promise<void>;
   dispatcher: CardDispatcher;
-  /** 进程内管理写面（Web 控制台 / supervisor IPC 共用）：四个写操作走与 DM
-   * 卡片回调完全同一套共享函数（admin/ops.ts），含同样的校验与活跃会话驱逐；
-   * 校验拒绝抛 AdminWriteError（HTTP 409 / IPC code 还原）。 */
-  adminExecute: (op: AdminWriteOp) => Promise<void>;
+  adminExecute: (op: AdminWriteOp) => Promise<AdminWriteResult>;
+  settings: HostSettings;
   /** Close every live codex session (SIGKILLs the app-server children) so a
    *  graceful exit leaves no orphan processes. */
   shutdown: () => Promise<void>;
@@ -2493,39 +2492,15 @@ export function createOrchestrator(
     return saved;
   }
 
-  // CLI service state and its persisted enabled flag are one transition. Keep
-  // rapid on/off clicks ordered; if persistence fails after the side effect,
-  // compensate back to the last committed config so runtime and disk agree.
-  let cliEnabledTransition: Promise<unknown> = Promise.resolve();
+  let cardCliTransitions: Promise<unknown> = Promise.resolve();
   function setCliBridgeEnabled(evt: CardActionEvent, enabled: boolean): Promise<void> {
-    const run = cliEnabledTransition.then(async () => {
-      if (getCliBridgePreferences(cfg).enabled === enabled) return;
-      try {
-        if (enabled) await cliBridge?.start?.();
-        else await cliBridge?.shutdown?.();
-
-        const saved = await applyPref(
-          evt,
-          (p) => {
-            p.cliBridge = { ...(p.cliBridge ?? {}), enabled };
-          },
-          { render: false },
-        );
-        if (!saved) {
-          // Best-effort rollback of the runtime side effect. The persisted and
-          // LIVE config deliberately stayed unchanged on write failure.
-          if (enabled) await cliBridge?.shutdown?.();
-          else await cliBridge?.start?.();
-        }
-      } catch (err) {
-        log.fail('cli-bridge', err, { phase: enabled ? 'enable' : 'disable' });
-      }
-    });
-    cliEnabledTransition = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+    if (!dmAdmin(evt.operator?.openId)) return Promise.resolve();
+    const next = cardCliTransitions.then(async () => {
+      const result = await settings.act({ kind: 'setCliBridgeEnabled', botId: cfg.accounts.app.id, enabled, revision: settingsRevision([cfg.accounts.app.id, cfg.preferences?.cliBridge?.enabled]) });
+      if (result.kind !== 'saved') log.info('cli-bridge', 'settings-transition-failed', { result: result.kind });
+    }).catch(() => { log.info('cli-bridge', 'settings-transition-failed'); });
+    cardCliTransitions = next;
+    return next;
   }
 
   // 「☕ 咖啡一下」那组控件现在独立成二级卡（buildCoffeeSettingsCard），主设置卡只放入口。
@@ -2563,7 +2538,7 @@ export function createOrchestrator(
 
   /** ☕ 咖啡一下 二级卡：本机离开转发那组控件（总开关 / 通知范围 / 转发后端 / 离开保活 /
    *  hooks）独立渲染。进卡 / 修复 hooks 时刷新一次 hook 安装状态，其它轴的改动复用缓存。 */
-  async function renderCoffeeSettings(refreshHooks = false): Promise<object> {
+  async function renderCoffeeSettings(refreshHooks = false, notice?: string): Promise<object> {
     if (refreshHooks || !cliHookStatuses) cliHookStatuses = await inspectCliBridgeHooks();
     const cliPrefs = getCliBridgePreferences(cfg);
     const section = cliBridgeSettingsSection({
@@ -2574,6 +2549,7 @@ export function createOrchestrator(
       agents: cliPrefs.agents,
       keepAwake: cliPrefs.keepAwake.enabled,
     });
+    if (notice) section.splice(1, 0, { tag: 'markdown', content: notice });
     return buildCoffeeSettingsCard(section);
   }
 
@@ -2639,7 +2615,7 @@ export function createOrchestrator(
       const current = prefs.sessionTitles ?? {};
       prefs.sessionTitles = {
         ...current,
-        byBackend: { ...(current.byBackend ?? {}), [backendId]: config },
+        byBackend: { ...(current.byBackend ?? {}), [backendId]: { ...current.byBackend?.[backendId], ...config } },
       };
     }).then(
       () => true,
@@ -2656,6 +2632,18 @@ export function createOrchestrator(
       sendFreshSettingsResult(evt, renderSaved, 'session-title-submit-result');
     } else {
       void patch(evt, renderSaved);
+    }
+  }
+
+  async function saveCommentRulesFromCard(evt: CardActionEvent, content: { kind: 'custom'; text: string } | { kind: 'default' }): Promise<void> {
+    try {
+      const view = await settings.read({ kind: 'agent', botId: cfg.accounts.app.id });
+      if (!('commentInstructions' in view)) return;
+      const result = await settings.act({ kind: 'commentInstructions', botId: cfg.accounts.app.id, revision: view.commentInstructions.revision, content });
+      const notice = result.kind === 'saved' ? result.warnings.join('；') || '✅ 回复规则已保存并同步，下一条评论生效。' : '⚠️ 保存失败或规则已被修改，请刷新后重试。';
+      sendFreshSettingsResult(evt, () => buildCommentPromptCard(content.kind === 'custom' ? content.text : DEFAULT_COMMENT_INSTRUCTIONS, notice, paths.commentInstructionsFile), 'comment-prompt-result');
+    } catch {
+      sendFreshSettingsResult(evt, () => buildCommentPromptCard(content.kind === 'custom' ? content.text : DEFAULT_COMMENT_INSTRUCTIONS, '⚠️ 回复规则不能为空或过长，未保存。', paths.commentInstructionsFile), 'comment-prompt-validation');
     }
   }
 
@@ -2966,32 +2954,20 @@ export function createOrchestrator(
     .on(DM.coffeeSettings, async ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) await patch(evt, () => renderCoffeeSettings(true));
     })
-    .on(CLI.toggleEnabled, ({ evt, value }) => {
+    .on(CLI.toggleEnabled, async ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const enabled = value.v === 'on';
       if (enabled && !canEnableCliBridge(cfg).ok) return;
-      const transition = setCliBridgeEnabled(evt, enabled);
-      void patch(evt, async () => {
-        await transition;
-        return renderCoffeeSettings();
-      });
+      await setCliBridgeEnabled(evt, enabled);
+      void patch(evt, () => renderCoffeeSettings());
     })
     .on(CLI.repairHooks, async ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      // installCliBridgeHooks does raw fs writes (~/.claude, ~/.codex) that can
-      // throw (EACCES/ENOSPC); keep it inside the awaited handler so the
-      // dispatcher's try/catch covers it — there is no global rejection net
-      // (see cli-bridge/ipc.ts). Still refresh the card on failure.
-      try {
-        await installCliBridgeHooks({
-          agents: { claude: true, codex: true },
-          command: resolveBridgeHookCommand(cfg.accounts.app.id),
-        });
-      } catch (err) {
-        log.fail('cli-bridge', err, { phase: 'repair-hooks' });
-      }
-      // Just wrote the hook files — force a fresh inspect so the status reflects it.
-      await patch(evt, () => renderCoffeeSettings(true));
+      const result = await settings.act({ kind: 'repairCliHooks', botId: cfg.accounts.app.id });
+      const notice = result.kind === 'saved'
+        ? result.warnings.join('；') || 'Hooks 已修复。'
+        : 'Hooks 修复未完成，请检查本机配置后重试。';
+      patch(evt, () => renderCoffeeSettings(true, notice));
     })
     // 这三个轴属于咖啡子卡：applyPref 落盘但不渲染（{render:false}），改由我们 patch 回
     // 咖啡子卡（renderSettings 现在只渲主卡入口，会把用户踢出子卡）。
@@ -3459,85 +3435,11 @@ export function createOrchestrator(
     .on(DM.commentPromptSubmit, ({ evt, formValue }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const content = typeof formValue?.prompt === 'string' ? formValue.prompt : '';
-      void (async () => {
-        if (!content.trim()) {
-          const cur = await loadCommentInstructions(paths.commentInstructionsFile);
-          sendFreshSettingsResult(
-            evt,
-            () => buildCommentPromptCard(cur, '⚠️ 回复规则不能为空，未保存。', paths.commentInstructionsFile),
-            'comment-prompt-submit-validation',
-          );
-          return;
-        }
-        try {
-          await saveCommentInstructions(paths.commentInstructionsFile, content);
-        } catch (err) {
-          log.fail('console', err, { phase: 'save-comment-prompt' });
-          sendFreshSettingsResult(
-            evt,
-            () => buildCommentPromptCard(content, '⚠️ 回复规则保存失败，原规则未改变，请重试。', paths.commentInstructionsFile),
-            'comment-prompt-submit-result',
-          );
-          return;
-        }
-        const n = await syncAllCommentInstructions(paths.commentsRootDir, content, cfg.accounts.app.tenant).catch(
-          (err) => {
-            log.fail('console', err, { phase: 'sync-comment-prompt' });
-            return undefined;
-          },
-        );
-        sendFreshSettingsResult(
-          evt,
-          () => buildCommentPromptCard(
-            content,
-            n === undefined
-              ? '⚠️ 回复规则已保存，但同步到已有文档失败，请重试。'
-              : `✅ 回复规则已保存，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
-            paths.commentInstructionsFile,
-          ),
-          'comment-prompt-submit-result',
-        );
-      })();
+      void saveCommentRulesFromCard(evt, { kind: 'custom', text: content });
     })
-    // 重置为默认：忽略输入框内容，把内置默认模板写回 master + 同步进所有评论工作目录（含历史），
-    // 重渲编辑卡并预填默认（与「保存」一样即时生效、即时同步）。
     .on(DM.commentResetPrompt, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      void (async () => {
-        try {
-          await saveCommentInstructions(paths.commentInstructionsFile, DEFAULT_COMMENT_INSTRUCTIONS);
-        } catch (err) {
-          log.fail('console', err, { phase: 'reset-comment-prompt' });
-          const current = await loadCommentInstructions(paths.commentInstructionsFile).catch(
-            () => DEFAULT_COMMENT_INSTRUCTIONS,
-          );
-          sendFreshSettingsResult(
-            evt,
-            () => buildCommentPromptCard(current, '⚠️ 重置失败，原回复规则未改变，请重试。', paths.commentInstructionsFile),
-            'comment-prompt-reset-result',
-          );
-          return;
-        }
-        const n = await syncAllCommentInstructions(
-          paths.commentsRootDir,
-          DEFAULT_COMMENT_INSTRUCTIONS,
-          cfg.accounts.app.tenant,
-        ).catch((err) => {
-          log.fail('console', err, { phase: 'sync-comment-prompt' });
-          return undefined;
-        });
-        sendFreshSettingsResult(
-          evt,
-          () => buildCommentPromptCard(
-            DEFAULT_COMMENT_INSTRUCTIONS,
-            n === undefined
-              ? '⚠️ 已重置为默认回复规则，但同步到已有文档失败，请重试。'
-              : `↩️ 已重置为默认回复规则，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
-            paths.commentInstructionsFile,
-          ),
-          'comment-prompt-reset-result',
-        );
-      })();
+      void saveCommentRulesFromCard(evt, { kind: 'default' });
     })
     // In-group settings: toggle 免@ for the project bound to evt.chatId. Admin-gated.
     // 写路径走管理面共享层（admin/ops.ts）——与 DM 卡片 / Web 控制台同一套落盘逻辑。
@@ -5278,43 +5180,28 @@ export function createOrchestrator(
     return run;
   }
 
-  /** Reuse the in-memory thread for a comment session, else resume the persisted
-   * one, else start a fresh thread in `cwd` (the per-doc comment dir, holding the
-   * synced AGENTS.md / CLAUDE.md). Fresh threads pick their backend + model/effort
-   * from the global comments config; resumed ones keep what they were created with.
-   * `instructions` is the prompt content just synced to the cwd: a live thread read
-   * those files only at start/resume, so if they changed since (user edited the
-   * master prompt) we recycle the live thread to force a re-read. */
   async function resolveDocThread(
     sessionKey: string,
     cwd: string,
     instructions: string,
     question: string,
   ): Promise<AgentThread> {
+    const comments = getCommentsConfig(cfg);
+    const be = backendFor(comments.backend);
+    const { model, effort } = pickDefault(await listModels(be), { model: comments.model, effort: comments.effort });
+    const rec = await getSession(sessionKey);
+    const selectionChanged = rec && (rec.backend !== be.id || rec.model !== model || rec.effort !== effort);
     const live = sessions.get(sessionKey);
     if (live) {
-      const alive = live.isAlive();
-      // Instructions unchanged + alive → reuse the warm thread (the common case).
-      if (alive && commentInstrUsed.get(sessionKey) === instructions) return live;
-      // Edited prompt (alive but stale) → close the in-memory thread we're discarding
-      // so the resume below re-reads the freshly-synced AGENTS.md/CLAUDE.md. Dead
-      // thread → just evict (与 resolveThread 同款守卫；app-server 死后死线程留在缓存，
-      // 每次 @ 评论都立即失败)，落进下面的 resume-or-fresh 兜底自愈。
-      if (alive && commentInstrUsed.get(sessionKey) !== instructions) void live.close().catch(() => undefined);
+      if (live.isAlive() && !selectionChanged && commentInstrUsed.get(sessionKey) === instructions) return live;
+      await live.close().catch(() => undefined);
       sessions.delete(sessionKey);
       commentInstrUsed.delete(sessionKey);
-      log.info('agent', alive ? 'comment-instr-changed-evict' : 'dead-thread-evict', { sessionKey });
     }
-    const rec = await getSession(sessionKey);
-    if (rec) {
+    if (rec && rec.backend === be.id) {
       try {
-        // Same record-backend routing as resolveThread (doc sessions persist too).
-        const resumed = await backendFor(rec.backend).resumeThread({
-          cwd: rec.cwd,
-          sessionId: rec.sessionId,
-          model: rec.model,
-          effort: rec.effort,
-        });
+        const resumed = await be.resumeThread({ cwd: rec.cwd, sessionId: rec.sessionId, model, effort });
+        await patchSession(sessionKey, { model, effort });
         trackSession(sessionKey, resumed);
         commentInstrUsed.set(sessionKey, instructions);
         return resumed;
@@ -5322,15 +5209,6 @@ export function createOrchestrator(
         log.fail('agent', err, { phase: 'comment-resume', sessionKey });
       }
     }
-    // Fresh thread: backend + model/effort from the global comments config.
-    // backendFor falls back to the default backend for an unset/unknown id;
-    // pickDefault carries the configured model/effort when the live list supports them.
-    const comments = getCommentsConfig(cfg);
-    const be = backendFor(comments.backend);
-    const { model, effort } = pickDefault(await listModels(be), {
-      model: comments.model,
-      effort: comments.effort,
-    });
     const fresh = await be.startThread({ cwd, model, effort });
     trackSession(sessionKey, fresh);
     commentInstrUsed.set(sessionKey, instructions);
@@ -5650,16 +5528,17 @@ export function createOrchestrator(
   // 首次真实调用会自动重试，fallback 绝不被钉死（listModels 包装层也不缓存）。
   void backend.listModels().catch((err) => log.fail('agent', err, { phase: 'models-prewarm' }));
 
-  // 管理面写执行器（Web 控制台 / supervisor IPC 入口）：与上面 DM 回调共用
-  // admin/ops.ts 的 perform*，注入同一个 backendFor + evictLiveSessionsForChat
-  // —— 双端写行为同源（同校验、同落盘、同驱逐）。
-  const executeAdminWrite = createAdminWriteExecutor({ cfg, backendFor, evictLiveSessionsForChat, writePreferences, voiceAction: voice.action });
-  const adminExecute = async (op: AdminWriteOp): Promise<void> => {
-    await executeAdminWrite(op);
+  const settings = createSettingsOwner({ cfg, backendFor, evictLiveSessionsForChat, writePreferences, voiceAction: voice.action, refreshCompletionReminders: refreshCompletionReminderCards,
+    cliBridge: cliBridge?.start && cliBridge.shutdown ? { start: cliBridge.start, shutdown: cliBridge.shutdown, isRunning: cliBridge.isRunning } : undefined,
+  });
+  const executeAdminWrite = createAdminWriteExecutor({ cfg, backendFor, evictLiveSessionsForChat, writePreferences, voiceAction: voice.action, settings });
+  const adminExecute = async (op: AdminWriteOp): Promise<AdminWriteResult> => {
+    const result = await executeAdminWrite(op);
     if (op.kind === 'setCompletionReminder') refreshCompletionReminderCards();
+    return result;
   };
 
-  return { onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, shutdown };
+  return { onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, settings, shutdown };
 }
 
 /** Resolve a message's thread_id via raw API (reply response omits it). The

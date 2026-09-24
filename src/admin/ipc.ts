@@ -1,3 +1,4 @@
+import type { BotSettingsScope, ModelQuery } from './settings-types';
 import { GroupUpstreamError, InvalidGroupInput, type AdminGroupOp } from './groups';
 import { AdminWriteError, type AdminWriteOp } from './ops';
 
@@ -20,8 +21,8 @@ import { AdminWriteError, type AdminWriteOp } from './ops';
 export const ADMIN_IPC_REQ = 'fcb.admin.req' as const;
 export const ADMIN_IPC_RES = 'fcb.admin.res' as const;
 
-/** 转发给子进程的结构化写 op + 实时连接状态查询（替代锁文件探测）。 */
-export type AdminIpcOp = AdminWriteOp | AdminGroupOp | { kind: 'status' };
+export type AdminSettingsReadOp = { kind: 'settingsRead'; scope: BotSettingsScope } | { kind: 'settingsModels'; query: ModelQuery };
+export type AdminIpcOp = AdminWriteOp | AdminGroupOp | AdminSettingsReadOp | { kind: 'status' };
 
 export interface AdminIpcRequest {
   fcb: typeof ADMIN_IPC_REQ;

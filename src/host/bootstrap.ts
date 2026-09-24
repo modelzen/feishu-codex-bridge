@@ -3,6 +3,7 @@ import { acquireMutex, closeMutex } from '../config/data-access';
 import { readHostEndpoint } from './discovery';
 import { observeShutdown, type ShutdownControl } from './lifecycle';
 import { assertKnownOwnersStopped, inspectInstallation } from '../service/control';
+import { readServiceCodexBin } from '../service/codex-bin';
 
 export async function runHostRuntime(options: { bot?: string; managed: boolean; control?: ShutdownControl }): Promise<void> {
   const control = options.control ?? observeShutdown(options.managed);
@@ -19,6 +20,11 @@ export async function runHostRuntime(options: { bot?: string; managed: boolean; 
       }
     }
     if (control.requested) return;
+    if (options.managed) {
+      const codexBin = readServiceCodexBin();
+      if (codexBin === null) delete process.env.CODEX_BIN;
+      else if (codexBin !== undefined) process.env.CODEX_BIN = codexBin;
+    }
     const { runRun } = await import('../cli/commands/run');
     await runRun(options.bot, { control, managed: options.managed });
   } finally {

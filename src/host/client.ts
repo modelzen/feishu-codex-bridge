@@ -104,3 +104,5 @@ export async function connectHost(input: HostOptions): Promise<HostHandle | Host
     };
   } catch (error) { return { ...refusal(error), reason: 'startup-failed' }; }
 }
+
+export type * from '../admin/settings-types';
