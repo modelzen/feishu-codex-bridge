@@ -127,15 +127,32 @@ export async function diagnoseEventSubscription(
     return { state: 'unchecked', reason: `code=${body.code ?? '?'} msg=${body.msg ?? '<no msg>'}${scopeHint}` };
   }
 
-  const live = (body.data?.items ?? []).find((v) => v.status === 1);
+  if (!Array.isArray(body.data?.items)) {
+    return { state: 'unchecked', reason: '版本接口未返回可用的版本列表' };
+  }
+  const live = body.data.items.find((v) => v.status === 1);
   if (!live) return { state: 'unpublished' };
 
-  // The API localizes `events` (e.g. "接收消息" for lang=zh_cn).
-  // Compare stable event IDs from event_infos, never display names. Retain
-  // compatibility with responses that expose IDs directly in events.
-  const events = live.event_infos !== undefined
-    ? [...new Set(live.event_infos.map((event) => event.event_type).filter((type): type is string => typeof type === 'string' && type.length > 0))]
-    : live.events ?? [];
+  // `events` can contain localized names; only stable IDs establish subscription state.
+  let events: string[];
+  if (live.event_infos !== undefined) {
+    if (!Array.isArray(live.event_infos)) {
+      return { state: 'unchecked', reason: '已发布版本的事件信息格式无效', version: live.version };
+    }
+    const types: string[] = [];
+    for (const event of live.event_infos) {
+      if (!event || typeof event.event_type !== 'string' || event.event_type.length === 0) {
+        return { state: 'unchecked', reason: '已发布版本的事件信息格式无效', version: live.version };
+      }
+      types.push(event.event_type);
+    }
+    events = [...new Set(types)];
+  } else if (Array.isArray(live.events) && live.events.every((event) =>
+    typeof event === 'string' && /^[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+$/.test(event))) {
+    events = [...new Set(live.events)];
+  } else {
+    return { state: 'unchecked', reason: '已发布版本未返回可识别的事件 ID', version: live.version };
+  }
   const has = new Set(events);
   const missingRequired = REQUIRED_EVENTS.filter((e) => !has.has(e));
   const missingOptional = OPTIONAL_EVENTS.filter((e) => !has.has(e));
@@ -152,11 +169,11 @@ export async function diagnoseEventSubscription(
 export function summarizeEventDiagnosis(d: EventDiagnosis): string {
   switch (d.state) {
     case 'ok':
-      return `✅ 已生效（版本 v${d.version ?? '?'} 已订阅 ${REQUIRED_EVENTS.join(' / ')}）`;
+      return `✅ 已发布版本 v${d.version ?? '?'} 已订阅 ${REQUIRED_EVENTS.join(' / ')}`;
     case 'missing':
-      return `❌ 已发布版本 v${d.version ?? '?'} 缺事件：${(d.missingRequired ?? []).join('、')} —— @我 不会有反应`;
+      return `❌ 已发布版本 v${d.version ?? '?'} 缺事件：${(d.missingRequired ?? []).join('、')}`;
     case 'unpublished':
-      return '❌ 从未发布过版本 —— 事件订阅尚未生效，@我 不会有反应';
+      return '❌ 未找到已发布版本，请在配置事件后发布版本';
     case 'unchecked':
       return `⚠️ 未能自动检测（${d.reason ?? '未知原因'}）`;
   }

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { UI_PURE_JS, UI_HTML } from '../src/web/ui';
+import type { EventDiagnosis } from '../src/utils/event-diagnosis';
 
 /**
  * Web 控制台前端「纯逻辑片段」单测（design web-tabs.md / web-onboarding-qr.md /
@@ -13,8 +14,9 @@ import { UI_PURE_JS, UI_HTML } from '../src/web/ui';
 // UI_PURE_JS 是一段函数声明集合；包一层 return 暴露需要测的函数。
 const pure = new Function(
   UI_PURE_JS +
-    '\nreturn { parseRoute, qrEncode, qrSvg, depTriState, groupBackends, summarizeState, parseSseDataBlock, scanStatusText, scanErrorText };',
+    '\nreturn { parseRoute, qrEncode, qrSvg, depTriState, groupBackends, summarizeState, parseSseDataBlock, scanStatusText, scanErrorText, eventDiagnosisView };',
 )() as {
+  eventDiagnosisView: (d?: EventDiagnosis) => { icon: string; title: string; detail: string; showConfig: boolean };
   parseRoute: (h: string) => { tab: string; botId?: string };
   qrEncode: (t: string) => { size: number; modules: boolean[][] };
   qrSvg: (t: string, opts?: { size?: number }) => string;
@@ -255,4 +257,40 @@ it('parses every embedded browser script, including voice settings', () => {
   for (const match of UI_HTML.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)) {
     expect(() => new Function(match[1]!)).not.toThrow();
   }
+});
+
+
+describe('event subscription guidance', () => {
+  it('does not assign a configuration task to a fully subscribed bot', () => {
+    const view = pure.eventDiagnosisView({ state: 'ok', version: '1.0', missingOptional: [] });
+    expect(view.icon).toBe('✅');
+    expect(view.detail).toContain('v1.0');
+    expect(view.detail).toContain('已订阅 im.message.receive_v1');
+    expect(view.showConfig).toBe(false);
+  });
+
+  it('offers an optional configuration link without marking required events missing', () => {
+    const view = pure.eventDiagnosisView({ state: 'ok', missingOptional: ['application.bot.menu_v6'] });
+    expect(view.icon).toBe('✅');
+    expect(view.showConfig).toBe(true);
+  });
+
+  it('lists only the missing required events and asks to publish the correction', () => {
+    const view = pure.eventDiagnosisView({ state: 'missing', version: '1.2', missingRequired: ['im.message.receive_v1'] });
+    expect(view.icon).toBe('❌');
+    expect(view.detail).toContain('im.message.receive_v1');
+    expect(view.detail).toContain('发布新版本');
+    expect(view.detail).not.toContain('application.bot.menu_v6');
+    expect(view.showConfig).toBe(true);
+  });
+
+  it('distinguishes unpublished versions from an unavailable query', () => {
+    expect(pure.eventDiagnosisView({ state: 'unpublished' }).detail).toContain('版本管理与发布');
+    const view = pure.eventDiagnosisView({ state: 'unchecked', reason: 'missing scope' });
+    expect(view.icon).toBe('⚠️');
+    expect(view.detail).toBe('missing scope');
+    expect(view.title).not.toContain('缺少');
+    expect(view.showConfig).toBe(true);
+    expect(pure.eventDiagnosisView().title).toContain('未检测');
+  });
 });
