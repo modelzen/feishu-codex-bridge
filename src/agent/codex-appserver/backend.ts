@@ -806,6 +806,7 @@ function mapModel(m: RawModel): ModelInfo {
   };
 }
 
+/** Static fallback when codex binary is unavailable — includes all bridge-configured custom models. */
 const STATIC_MODELS: ModelInfo[] = [
   {
     id: 'gpt-5.5',
@@ -813,6 +814,52 @@ const STATIC_MODELS: ModelInfo[] = [
     description: '默认模型',
     hidden: false,
     isDefault: true,
+    supportedEfforts: ['low', 'medium', 'high'],
+    defaultEffort: 'medium',
+  },
+  // Custom models configured via bridge (must match MODEL_ID_MAP keys)
+  {
+    id: 'qwen38-35b-a3b-distill-q4_k_m',
+    displayName: 'Qwen 3.8 (本地)',
+    description: '本地 Qwen 3.8 35B Q4_K_M，1M 上下文',
+    hidden: false,
+    isDefault: false,
+    supportedEfforts: ['low', 'medium', 'high'],
+    defaultEffort: 'medium',
+  },
+  {
+    id: 'claude-opus-4-7',
+    displayName: 'Claude Opus 4.7',
+    description: 'Opus 4.7，复杂推理',
+    hidden: false,
+    isDefault: false,
+    supportedEfforts: ['low', 'medium', 'high'],
+    defaultEffort: 'high',
+  },
+  {
+    id: 'claude-opus-4-8',
+    displayName: 'Claude Opus 4.8',
+    description: 'Opus 4.8，最强推理',
+    hidden: false,
+    isDefault: false,
+    supportedEfforts: ['low', 'medium', 'high'],
+    defaultEffort: 'high',
+  },
+  {
+    id: 'MiniMax-M2.7',
+    displayName: 'MiniMax 2.7',
+    description: 'MiniMax 2.7',
+    hidden: false,
+    isDefault: false,
+    supportedEfforts: ['low', 'medium', 'high'],
+    defaultEffort: 'medium',
+  },
+  {
+    id: 'MiniMax-M2.5',
+    displayName: 'MiniMax 2.5',
+    description: 'MiniMax 2.5',
+    hidden: false,
+    isDefault: false,
     supportedEfforts: ['low', 'medium', 'high'],
     defaultEffort: 'medium',
   },

@@ -405,31 +405,50 @@ function mapClaudeModel(model: ClaudeModelInfo, index: number): ModelInfo {
 }
 
 /** Failure-only fallback when SDK model discovery cannot initialize. Successful
- * discovery is cached above and remains the normal model-picker source. */
+ * discovery is cached above and remains the normal model-picker source.
+ * Includes all bridge-configured custom models (local qwen, minimax, remote claude). */
 const STATIC_MODELS: ModelInfo[] = [
+  {
+    id: 'qwen38-35b-a3b-distill-q4_k_m',
+    displayName: 'Qwen 3.8 (本地)',
+    description: '本地 Qwen 3.8 35B Q4_K_M，1M 上下文',
+    supportedEfforts: EFFORTS,
+    defaultEffort: 'medium',
+    isDefault: true,
+    hidden: false,
+  },
+  {
+    id: 'claude-opus-4-7',
+    displayName: 'Claude Opus 4.7',
+    description: 'Opus 4.7，复杂推理',
+    supportedEfforts: EFFORTS,
+    defaultEffort: 'high',
+    isDefault: false,
+    hidden: false,
+  },
   {
     id: 'claude-opus-4-8',
     displayName: 'Claude Opus 4.8',
     description: '最强，复杂推理 / 长程 agentic',
     supportedEfforts: EFFORTS,
     defaultEffort: 'high',
-    isDefault: true,
+    isDefault: false,
     hidden: false,
   },
   {
-    id: 'claude-sonnet-4-6',
-    displayName: 'Claude Sonnet 4.6',
-    description: '均衡，日常编码',
+    id: 'MiniMax-M2.7',
+    displayName: 'MiniMax 2.7',
+    description: 'MiniMax 2.7',
     supportedEfforts: EFFORTS,
     defaultEffort: 'medium',
     isDefault: false,
     hidden: false,
   },
   {
-    id: 'claude-haiku-4-5',
-    displayName: 'Claude Haiku 4.5',
-    description: '最快，轻量任务',
-    supportedEfforts: ['low', 'medium', 'high'],
+    id: 'MiniMax-M2.5',
+    displayName: 'MiniMax 2.5',
+    description: 'MiniMax 2.5',
+    supportedEfforts: EFFORTS,
     defaultEffort: 'low',
     isDefault: false,
     hidden: false,
