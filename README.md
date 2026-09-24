@@ -34,7 +34,7 @@ npm i -g @modelzen/feishu-codex-bridge
 
 # 2. 打开本机网页控制台
 # 启动服务、添加好机器人后，这条前台命令即可 Ctrl+C 关闭
-feishu-codex-bridge web
+vonvon-bridge web
 ```
 
 不想自己敲？把下面这段发给 **Codex / Claude** 等 AI agent，让它替你装好并跑起来：
@@ -47,14 +47,14 @@ feishu-codex-bridge web
 3) 全局安装：
    npm i -g @modelzen/feishu-codex-bridge
 4) 前台运行，打开本机 Web 控制台：
-   feishu-codex-bridge web
+   vonvon-bridge web
    它一启动会打印一个 http://127.0.0.1:xxxx/?token=... 的链接。
 5) 把那个链接发给我；
 6) 然后用文字告诉我接下来怎么做：
    - 我在浏览器打开这个链接；
    - 点页面上的「启动」按钮，把后台服务跑起来；
    - 启动后页面会自动进入可写控制台，在里面扫码添加我的第一个飞书机器人；
-   - 成功创建机器人后，前台那条 feishu-codex-bridge web 就可以 Ctrl+C 关掉，不影响后台服务。
+   - 成功创建机器人后，前台那条 vonvon-bridge web 就可以 Ctrl+C 关掉，不影响后台服务。
 ```
 
 ### 三分钟，看它入职你的飞书
@@ -107,16 +107,16 @@ feishu-codex-bridge web
 
 ## 🖥️ CLI 一览
 
-日常基本只用 `start`（起后台）和 `web`（开控制台），其余动作网页里都有按钮。
+主命令是 `vonvon-bridge`；旧命令 `feishu-codex-bridge` 仍可使用。日常基本只用 `start`（起后台）和 `web`（开控制台），其余动作网页里都有按钮。
 
 ```
-feishu-codex-bridge run [--bot <名>]            前台启动（没配置先扫码 init；Ctrl+C 优雅退出）
-feishu-codex-bridge start                       后台 daemon：装系统服务、开机/登录自启、崩溃自动拉起
-feishu-codex-bridge status|logs|restart|stop    daemon 生命周期（logs -f 跟随日志）
-feishu-codex-bridge update [--check]            更新到最新版（npm i -g）并自动重启 daemon
-feishu-codex-bridge web [--port <端口>]          打开本机网页控制台（默认端口 51847）
-feishu-codex-bridge bot init|list|use|rm        多机器人：扫码注册 / 列表 / 选要连接的 / 移除
-feishu-codex-bridge doctor                      本地自检：后端 / 登录 / 当前机器人
+vonvon-bridge run [--bot <名>]            前台启动（没配置先扫码 init；Ctrl+C 优雅退出）
+vonvon-bridge start                       后台 daemon：装系统服务、开机/登录自启、崩溃自动拉起
+vonvon-bridge status|logs|restart|stop    daemon 生命周期（logs -f 跟随日志）
+vonvon-bridge update [--check]            更新到最新版（npm i -g）并自动重启 daemon
+vonvon-bridge web [--port <端口>]          打开本机网页控制台（默认端口 51847）
+vonvon-bridge bot init|list|use|rm        多机器人：扫码注册 / 列表 / 选要连接的 / 移除
+vonvon-bridge doctor                      本地自检：后端 / 登录 / 当前机器人
 ```
 
 > ⚠️ 后台服务必须**全局安装**（`npm i -g`），别用 npx —— 服务里硬编码了 CLI 路径，npx 临时缓存会被清理。前台 `run` 用 npx 没问题（单次进程）。
@@ -127,11 +127,13 @@ feishu-codex-bridge doctor                      本地自检：后端 / 登录 /
 
 ## ⚙️ 配置与数据
 
-所有本地状态都在 `~/.feishu-codex-bridge/`（机器人配置、项目 / 会话注册表、AES-256-GCM 加密的密钥库）。卸载时删掉这个目录即可清干净。
+新安装的本地状态写入 `~/.vonvon-bridge/`，包括机器人配置、项目与会话注册表、加密密钥库。如果只有旧目录 `~/.feishu-codex-bridge/`，Bridge 会继续使用它。当前版本不会自动迁移数据。
+
+两个路径指向同一目录时，Bridge 使用新路径。如果两个路径各有独立数据，Bridge 会报错并停止，避免产生两份状态。
 
 ### 自定义空白项目目录（可选）
 
-「新建项目」时把**文件夹路径留空**，默认会创建到 `~/.feishu-codex-bridge/projects/<项目名>`。如需改到其他磁盘，可编辑诊断卡所显示的当前机器人 `config.json`（通常是 `~/.feishu-codex-bridge/bots/<appId>/config.json`），在已有 `preferences` 中加入：
+「新建项目」时把**文件夹路径留空**，默认会创建到当前数据目录的 `projects/<项目名>`。如需改到其他磁盘，可编辑诊断卡所显示的当前机器人 `config.json`（新安装通常在 `~/.vonvon-bridge/bots/<appId>/config.json`），在已有 `preferences` 中加入：
 
 ```json
 {

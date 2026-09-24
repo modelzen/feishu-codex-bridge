@@ -2,6 +2,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { paths } from '../src/config/paths';
 import {
   buildDaemonControlCommand,
   collectHostDoctor,
@@ -109,7 +110,7 @@ describe('host · collectHostDoctor（宿主机域聚合，绝不抛错）', () 
     expect(h.node).toBe(process.version);
     expect(typeof h.platform).toBe('string');
     expect(typeof h.arch).toBe('string');
-    expect(h.appDir).toContain('.feishu-codex-bridge');
+    expect(h.appDir).toBe(paths.appDir);
     expect(h.logsDir).toBe(logsDir);
     expect(h.logBytes).toBe(150); // 100 + 50（含子目录）
     expect(h.version).toBeTruthy();

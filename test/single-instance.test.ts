@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -114,15 +115,10 @@ describe('acquireSingleInstanceLock 协议逻辑', () => {
 
 // ── 真并发：多进程同时抢同一把锁（F4 的 TOCTOU 路径）────────────────
 
-/**
- * 把 single-instance 及其两个依赖转译成 CJS 落到 node_modules/.cache 下（在
- * 项目树内，子进程 require('cross-spawn') 才解析得到），4 个真实 node 进程经
- * go 文件对齐后同时抢同一把锁——断言恰一个 ACQUIRED，其余全部被
- * BridgeAlreadyRunningError 拒绝。
- */
 const here = dirname(fileURLToPath(import.meta.url));
 const root = dirname(here);
-const harnessDir = join(root, 'node_modules', '.cache', `fcb-si-test-${process.pid}`);
+const harnessDir = mkdtempSync(join(tmpdir(), 'fcb-si-test-'));
+const require = createRequire(import.meta.url);
 
 const DRIVER = `'use strict';
 const { existsSync } = require('node:fs');
@@ -146,17 +142,19 @@ try {
 
 describe('并发多进程抢锁', () => {
   beforeAll(() => {
-    mkdirSync(harnessDir, { recursive: true });
     const compile = (srcPath: string, outName: string, rewrites: Record<string, string> = {}): void => {
       let src = readFileSync(join(root, srcPath), 'utf8');
-      for (const [from, to] of Object.entries(rewrites)) src = src.replaceAll(`'${from}'`, `'${to}'`);
+      for (const [from, to] of Object.entries(rewrites)) src = src.replaceAll(`'${from}'`, () => JSON.stringify(to));
       const out = ts.transpileModule(src, {
         compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
       }).outputText;
       writeFileSync(join(harnessDir, outName), out);
     };
-    compile('src/config/paths.ts', 'paths.cjs');
-    compile('src/platform/spawn.ts', 'spawn.cjs');
+    compile('src/config/data-root.ts', 'data-root.cjs');
+    compile('src/config/paths.ts', 'paths.cjs', { './data-root': './data-root.cjs' });
+    compile('src/platform/spawn.ts', 'spawn.cjs', {
+      'cross-spawn': require.resolve('cross-spawn').replaceAll('\\', '/'),
+    });
     compile('src/core/single-instance.ts', 'single-instance.cjs', {
       '../config/paths': './paths.cjs',
       '../platform/spawn': './spawn.cjs',
