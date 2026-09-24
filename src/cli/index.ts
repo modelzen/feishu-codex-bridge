@@ -13,7 +13,7 @@ import { secretsGet, secretsSet, secretsList, secretsRemove } from './commands/s
 const program = new Command();
 
 program
-  .name('feishu-codex-bridge')
+  .name('vonvon-bridge')
   .description('把飞书/Lark 桥接到本机 Codex（项目=群, 话题=会话）')
   .version(bridgeVersion());
 

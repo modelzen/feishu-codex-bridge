@@ -1,19 +1,19 @@
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { resolveDataRoot } from './data-root';
 
-const appDir = join(homedir(), '.feishu-codex-bridge');
+const appDir = resolveDataRoot(homedir()).path;
 const larkCliDir = join(appDir, 'lark-cli');
 const codexCliDir = join(appDir, 'codex-cli');
 
 /**
  * Per-bot state directory. Each saved bot keeps its own config / projects /
- * sessions / single-instance lock under `~/.feishu-codex-bridge/bots/<appId>/`
+ * sessions / single-instance lock under `appDir/bots/<appId>/`
  * so switching the active bot (`use`) never mixes one bot's groups with
  * another's. `currentBotDir` defaults to `appDir` (the legacy flat layout) so
- * code that runs before a bot is selected — and pre-migration installs — keeps
- * reading the old top-level files; `useBotDir()` repoints it once the active
- * bot is known.
+ * code that runs before a bot is selected keeps reading the top-level files;
+ * `useBotDir()` repoints it once the active bot is known.
  */
 let currentBotDir = appDir;
 
@@ -105,7 +105,7 @@ export const paths = {
   npmCacheDir: join(appDir, 'npm-cache'),
   /**
    * 按需后端（npm-ondemand 包）私装目录：一个扁平
-   * `~/.feishu-codex-bridge/backends/node_modules` 放所有按需后端的 npm 包。
+   * `appDir/backends/node_modules` 放所有按需后端的 npm 包。
    * （通用基础设施；当前内置后端 codex 是 external-cli，不落此目录，保留以备将来。）
    * 永远在用户 HOME 下、用户可写（零 sudo/brew），与全局包目录的权限死结解耦。
    * 解析靠 createRequire(backendsDir/...).resolve（见 agent/backend-loader）；
