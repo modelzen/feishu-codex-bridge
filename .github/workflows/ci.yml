@@ -39,6 +39,8 @@ jobs:
         run: npm run build
       - name: Built CLI and data-root smoke test
         run: npm run test:cli-data-root
+      - name: Built owned Host and offline migration smoke test
+        run: npm run test:host-lifecycle
       - name: Unit and subprocess tests
         run: npm test
       - name: Prepare user systemd manager

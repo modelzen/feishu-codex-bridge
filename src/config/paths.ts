@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { bridgePipeName } from './data-compatibility';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveDataRoot } from './data-root';
@@ -95,8 +95,7 @@ export const paths = {
    */
   get cliBridgeSocket(): string {
     if (process.platform === 'win32') {
-      const tag = createHash('sha1').update(currentBotDir).digest('hex').slice(0, 16);
-      return `\\\\.\\pipe\\feishu-cli-bridge-${tag}`;
+      return bridgePipeName(homedir(), appDir, currentBotDir);
     }
     return join(currentBotDir, 'cli-bridge.sock');
   },

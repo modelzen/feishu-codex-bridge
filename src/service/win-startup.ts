@@ -1,3 +1,5 @@
+import { homedir } from 'node:os';
+import { stopInstallation, runKeyName, runKeyPath, relaunchTaskName } from './control';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -21,7 +23,7 @@ import {
 } from './common';
 
 /** Name of the one-shot Scheduled Task used as the no-PowerShell relaunch fallback. */
-const RELAUNCH_TASK_NAME = 'feishu-codex-bridge-relaunch';
+const RELAUNCH_TASK_NAME = relaunchTaskName;
 
 /**
  * Windows background service **without administrator privileges**.
@@ -43,8 +45,8 @@ const RELAUNCH_TASK_NAME = 'feishu-codex-bridge-relaunch';
  * Trade-off vs launchd/systemd: the logon trigger has no crash-restart (it only
  * relaunches at the next login) — same limitation the schtasks ONLOGON path had.
  */
-const RUN_KEY_PATH = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
-const RUN_KEY_NAME = 'feishu-codex-bridge';
+const RUN_KEY_PATH = runKeyPath;
+const RUN_KEY_NAME = runKeyName;
 /** Set in the launcher env so a service-launched bridge records its own PID.
  * Exported so the multi-bot supervisor can STRIP it from its children's env —
  * only the supervisor (the actual service process) should own service.pid. */
@@ -204,10 +206,7 @@ export async function installWinStartup(): Promise<ServiceStatus> {
 }
 
 export async function uninstallWinStartup(): Promise<void> {
-  // Remove autostart (reg delete is fine even if the value is already gone).
-  spawnSync('reg', ['delete', RUN_KEY_PATH, '/v', RUN_KEY_NAME, '/f'], { stdio: 'ignore', windowsHide: true });
-  killService();
-  rmSync(servicePidFile(), { force: true });
+  await stopInstallation(homedir());
 }
 
 /**
@@ -660,18 +659,5 @@ function pidAlive(pid: number): boolean {
   } catch (err) {
     // EPERM: the process exists but we may not signal it → still alive.
     return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
-
-/** Tree-kill the running service bridge (and its codex children), if any. Used
- * by uninstall (stop). A non-zero taskkill (e.g. Access Denied on an elevated
- * daemon) used to be swallowed by `stdio:'ignore'` — a prime source of "stopped
- * in the UI but still running"; now it lands in service.err.log. */
-function killService(): void {
-  const pid = readServicePid();
-  if (pid === null || !pidAlive(pid)) return;
-  const r = spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { encoding: 'utf8', windowsHide: true });
-  if (r.status !== 0) {
-    appendServiceErr('kill', `taskkill pid=${pid} exit=${r.status ?? '?'} ${(r.stderr || '').toString().trim()}`);
   }
 }

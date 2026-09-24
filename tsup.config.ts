@@ -19,7 +19,7 @@ export default defineConfig([
     external,
   },
   {
-    entry: { index: 'src/index.ts' },
+    entry: { index: 'src/index.ts', host: 'src/host/client.ts' },
     outDir: 'dist',
     format: ['esm'],
     target: 'node20',

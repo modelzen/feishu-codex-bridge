@@ -1,8 +1,9 @@
+import { stopInstallation, systemdUnit, installationPaths } from './control';
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import { normalizeServiceCodexBin, saveServiceCodexBin, selectInstallCodexBin } from './codex-bin';
 import {
   ensureLogFiles,
@@ -24,12 +25,11 @@ import {
  * `/etc/wsl.conf`; otherwise `systemctl --user` can't connect — we detect that
  * and raise a friendly error pointing at foreground `run`.
  */
-export const SYSTEMD_UNIT_NAME = 'feishu-codex-bridge.service';
+export const SYSTEMD_UNIT_NAME = systemdUnit;
 
 /** User unit path: `$XDG_CONFIG_HOME/systemd/user/` (defaults to ~/.config). */
 function systemdUnitPath(): string {
-  const base = process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config');
-  return join(base, 'systemd', 'user', SYSTEMD_UNIT_NAME);
+  return installationPaths(homedir()).systemd;
 }
 
 /**
@@ -131,12 +131,7 @@ export async function installSystemd(): Promise<ServiceStatus> {
 }
 
 export async function uninstallSystemd(): Promise<void> {
-  if (systemdAvailable() && unitExists()) {
-    // disable --now = stop + remove autostart (≈ launchd bootout).
-    runSystemctl(['disable', '--now', SYSTEMD_UNIT_NAME]); // best-effort
-  }
-  await rm(systemdUnitPath(), { force: true });
-  if (systemdAvailable()) runSystemctl(['daemon-reload']);
+  await stopInstallation(homedir());
 }
 
 export async function restartSystemd(): Promise<ServiceStatus> {
