@@ -30,7 +30,7 @@ describe('Host child shutdown', () => {
     const child = spawn(process.execPath, ['-e', `process.on('message',()=>process.kill(process.pid,'SIGKILL')); process.on('SIGTERM',()=>{}); process.send('ready');`], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
     try {
       await new Promise((resolve) => child.once('message', resolve));
-      await expect(stopChild(child, 1000)).rejects.toThrow(/signal SIGKILL/);
+      await expect(stopChild(child, 1000)).rejects.toThrow(process.platform === 'win32' ? /code 1/ : /signal SIGKILL/);
     } finally { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); }
   });
   it('rejects endpoint escape before any network access', () => {

@@ -15,22 +15,23 @@ export function isDead(pid: number): boolean {
   }
 }
 
-export function coordinationPort(home: string, role: 'admission' | 'host'): number {
+function coordinationAddress(home: string, role: 'admission' | 'host'): { path: string } | { host: string; port: number; exclusive: true } {
   const path = realpathSync(home);
   const normalized = process.platform === 'win32' ? path.toLowerCase() : path;
-  const hash = createHash('sha256').update(`vonvon-bridge-v1:${role}:${normalized}`).digest().readUInt32BE(0);
-  return 20000 + hash % 30000;
+  const hash = createHash('sha256').update(`vonvon-bridge-v1:${role}:${normalized}`).digest();
+  if (process.platform === 'win32') return { path: `\\\\.\\pipe\\vonvon-bridge-${role}-${hash.toString('hex')}` };
+  return { host: '127.0.0.1', port: 20000 + hash.readUInt32BE(0) % 30000, exclusive: true };
 }
 
 export async function acquireMutex(home: string, role: 'admission' | 'host', timeoutMs = 1500): Promise<Server> {
-  const port = coordinationPort(home, role);
+  const address = coordinationAddress(home, role);
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const server = createServer((socket) => socket.destroy());
     try {
       await new Promise<void>((resolve, reject) => {
         server.once('error', reject);
-        server.listen({ host: '127.0.0.1', port, exclusive: true }, () => {
+        server.listen(address, () => {
           server.removeListener('error', reject);
           resolve();
         });
@@ -39,7 +40,7 @@ export async function acquireMutex(home: string, role: 'admission' | 'host', tim
     } catch (error) {
       server.close();
       if (!(error instanceof Error && 'code' in error && error.code === 'EADDRINUSE')) throw error;
-      if (Date.now() >= deadline) throw new DataAccessError(`Bridge ${role} is busy on local coordination port ${port}.`);
+      if (Date.now() >= deadline) throw new DataAccessError(`Bridge ${role} is busy on its local coordination endpoint.`);
       await new Promise((resolve) => setTimeout(resolve, 40));
     }
   }
