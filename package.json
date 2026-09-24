@@ -11,6 +11,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./host": {
+      "types": "./dist/host.d.ts",
+      "import": "./dist/host.js"
     }
   },
   "files": [
@@ -28,7 +32,8 @@
     "test:native-service": "node scripts/test-native-service.mjs",
     "start": "node bin/feishu-codex-bridge.mjs run",
     "prepare": "npm run build",
-    "release": "bash scripts/release.sh"
+    "release": "bash scripts/release.sh",
+    "test:host-lifecycle": "node scripts/test-host-lifecycle.mjs && node scripts/test-supervisor-shutdown.mjs"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.65.0",

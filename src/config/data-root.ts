@@ -6,6 +6,26 @@ export type DataRoot = {
   kind: 'fresh' | 'legacy' | 'canonical';
 };
 
+export const migrationJournalName = '.vonvon-bridge-migration.json';
+export const migrationWitnessName = '.vonvon-bridge-migration-witness.json';
+
+export class DataRootMigrationError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(`${message} Keep both data paths intact and complete offline recovery before starting Bridge.`, options);
+    this.name = 'DataRootMigrationError';
+  }
+}
+
+function refusePendingMetadata(path: string): void {
+  try {
+    lstatSync(path);
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return;
+    throw new DataRootMigrationError(`Cannot inspect migration metadata ${path}.`, { cause: error });
+  }
+  throw new DataRootMigrationError(`Pending or orphaned migration metadata at ${path}.`);
+}
+
 function inspectRoot(path: string): string | null {
   try {
     lstatSync(path);
@@ -28,8 +48,11 @@ function inspectRoot(path: string): string | null {
 export function resolveDataRoot(home: string): DataRoot {
   const canonicalPath = join(home, '.vonvon-bridge');
   const legacyPath = join(home, '.feishu-codex-bridge');
+  refusePendingMetadata(join(home, migrationJournalName));
   const canonical = inspectRoot(canonicalPath);
   const legacy = inspectRoot(legacyPath);
+  if (canonical) refusePendingMetadata(join(canonicalPath, migrationWitnessName));
+  if (legacy) refusePendingMetadata(join(legacyPath, migrationWitnessName));
 
   if (canonical && legacy) {
     if (canonical !== legacy) {

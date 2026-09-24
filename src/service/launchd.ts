@@ -1,8 +1,9 @@
+import { stopInstallation, launchdLabel, installationPaths } from './control';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { homedir, userInfo } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeServiceCodexBin, saveServiceCodexBin, selectInstallCodexBin } from './codex-bin';
 import {
@@ -13,7 +14,7 @@ import {
   type ServiceStatus,
 } from './common';
 
-export const LAUNCHD_LABEL = 'ai.feishu-codex-bridge.bot';
+export const LAUNCHD_LABEL = launchdLabel;
 
 interface LaunchctlResult {
   ok: boolean;
@@ -23,7 +24,7 @@ interface LaunchctlResult {
 }
 
 export function launchAgentPlistPath(): string {
-  return join(homedir(), 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`);
+  return installationPaths(homedir()).launchd;
 }
 
 function resolveCliBinPath(): string {
@@ -101,25 +102,7 @@ export async function installLaunchd(): Promise<ServiceStatus> {
 }
 
 export async function uninstallLaunchd(): Promise<void> {
-  // Remove the plist FIRST, bootout LAST. When this runs from the detached `stop`
-  // helper, the helper is itself a member of the launchd job (detached/setsid does
-  // NOT escape launchd job membership), so the `bootout` below tears down the whole
-  // job tree and frequently kills this helper — and even the `launchctl` child —
-  // before it returns. If the plist were removed only AFTER bootout (the old order),
-  // that rm got skipped on every such race → the plist lingered in
-  // ~/Library/LaunchAgents and launchd auto-bootstrapped the daemon again at the
-  // next login ("停止" not sticking). bootout's teardown is committed server-side by
-  // launchd the moment it receives the request, so it still kills the daemon even if
-  // the helper dies mid-call; only the post-bootout steps are at risk — so nothing
-  // load-bearing may follow it. Same self-kill hazard restartLaunchd dodges via
-  // `kickstart -k`. (Run from a terminal the helper isn't in the job, so order is
-  // immaterial there — this only ever helps the in-job case.)
-  await rm(launchAgentPlistPath(), { force: true });
-  if (isLoaded()) {
-    const bootout = runLaunchctl(['bootout', serviceTarget()]);
-    if (!bootout.ok) throw launchctlError('launchctl bootout', bootout);
-    await waitUntilUnloaded();
-  }
+  await stopInstallation(homedir());
 }
 
 export async function restartLaunchd(): Promise<ServiceStatus> {

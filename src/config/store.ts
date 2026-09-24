@@ -1,3 +1,4 @@
+import { homedir } from 'node:os';
 import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
@@ -36,7 +37,9 @@ export async function buildEncryptedAccountConfig(
     },
     secrets: {
       providers: {
-        bridge: { source: 'exec', command: wrapperPath, args: [] },
+        bridge: process.platform === 'win32'
+          ? { source: 'exec', command: process.execPath, args: [process.argv[1] ?? '', 'secrets', 'get'], env: { HOME: homedir(), USERPROFILE: homedir() } }
+          : { source: 'exec', command: wrapperPath, args: [] },
       },
     },
     ...(preferences ? { preferences } : {}),

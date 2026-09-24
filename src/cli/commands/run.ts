@@ -1,3 +1,4 @@
+import { observeShutdown, type ShutdownControl } from '../../host/lifecycle';
 import { ensureOnboarded, announceEventsWhenLive } from '../../bot/onboarding';
 import { startBridge } from '../../bot/bridge';
 import { runSupervisor } from '../../bot/supervisor';
@@ -27,11 +28,13 @@ import { mountWebConsole, type MountedWebConsole } from '../../web/mount';
  * bridge. SIGINT/SIGTERM trigger a graceful teardown that closes every codex
  * session (no orphan app-servers) and drops the WS before exiting.
  */
-export async function runRun(botName?: string): Promise<void> {
+export async function runRun(botName?: string, options: { control?: ShutdownControl; managed?: boolean } = {}): Promise<void> {
+  const control = options.control ?? observeShutdown();
+  const managed = Boolean(options.managed);
   // Explicit selector always runs exactly that one bot inline (this is also how
   // the supervisor launches each child: `run --bot <appId>`).
   if (botName) {
-    await runSingle(botName);
+    await runSingle(botName, control, managed);
     return;
   }
 
@@ -42,14 +45,14 @@ export async function runRun(botName?: string): Promise<void> {
   // 终端扫码）→ 起「引导控制台」：不连任何 bot，只挂可写 Web 控制台让用户在浏览器里扫码
   // 创建第一个机器人（registerBotByQr 自给自足，不需要在跑的 bot）。TTY 仍走终端扫码向导。
   if (active.length === 0 && !process.stdout.isTTY) {
-    await runOnboardingConsole();
+    await runOnboardingConsole(control, managed);
     return;
   }
   if (active.length > 1) {
-    await runSupervisor(active);
+    await runSupervisor(active, { control, managed });
     return;
   }
-  await runSingle(active[0]?.name);
+  await runSingle(active[0]?.name, control, managed);
 }
 
 /**
@@ -58,7 +61,7 @@ export async function runRun(botName?: string): Promise<void> {
  * 重启 daemon（空注册表→首 bot 自动成为 current/active）该 bot 即上线。这是「一句话安装」
  * 落地体验的关键：codex/claude 非交互地起好它 + 打印网址，用户全程在浏览器里点完。
  */
-async function runOnboardingConsole(): Promise<void> {
+async function runOnboardingConsole(control: ShutdownControl, managed: boolean): Promise<void> {
   let releaseLock: () => void;
   try {
     releaseLock = acquireSingleInstanceLock('__onboarding__');
@@ -81,9 +84,13 @@ async function runOnboardingConsole(): Promise<void> {
       daemonStartedAt: startedAt,
       // 引导态没有 bot → 不注入 executeWrite/liveStatus；但全局能力齐备：扫码建 bot
       // （registerBotByQr 自给自足）、按需下载后端、重启/升级。
-      restartDaemon: () => spawnDaemonControl('restart'),
-      applyUpdate: () => spawnDaemonControl('update'),
-      stopDaemon: () => spawnDaemonControl('stop'),
+      ...(managed ? {} : {
+        ...(managed ? {} : {
+          restartDaemon: () => spawnDaemonControl('restart'),
+          applyUpdate: () => spawnDaemonControl('update'),
+          stopDaemon: () => spawnDaemonControl('stop'),
+        }),
+      }),
       installBackend: installBackendDep,
       uninstallBackend: uninstallBackendDep,
     }),
@@ -106,27 +113,15 @@ async function runOnboardingConsole(): Promise<void> {
   }
   log.info('run', 'onboarding-console-up', { port: webConsole.port });
 
-  let stopping = false;
-  const stop = (sig: NodeJS.Signals): void => {
-    if (stopping) return;
-    stopping = true;
-    console.log(`\n收到 ${sig}，正在退出引导控制台…`);
-    void (webConsole.close() ?? Promise.resolve())
-      .catch(() => undefined)
-      .finally(() => {
-        releaseLock();
-        process.exit(0);
-      });
-  };
-  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
-    process.once(sig, () => stop(sig));
-  }
-  await new Promise<never>(() => {});
+  await control.waitForRequest();
+  try { await webConsole.close(); }
+  finally { releaseLock(); }
+
 }
 
 /** Run a single bot inline in this process. `botName` undefined → the implicit
  *  current/default bot (with first-run onboarding allowed). */
-async function runSingle(botName?: string): Promise<void> {
+async function runSingle(botName: string | undefined, control: ShutdownControl, managed: boolean): Promise<void> {
   const ready = await ensureOnboarded({ allowCreate: !botName, bot: botName });
   if (!ready) {
     process.exitCode = 1;
@@ -210,9 +205,11 @@ async function runSingle(botName?: string): Promise<void> {
             : undefined,
         daemonStartedAt: startedAt,
         // 重启 / 升级 / 停止走 detached helper：本进程被 service stop 杀掉后由 helper 续命。
-        restartDaemon: () => spawnDaemonControl('restart'),
-        applyUpdate: () => spawnDaemonControl('update'),
-        stopDaemon: () => spawnDaemonControl('stop'),
+        ...(managed ? {} : {
+          restartDaemon: () => spawnDaemonControl('restart'),
+          applyUpdate: () => spawnDaemonControl('update'),
+          stopDaemon: () => spawnDaemonControl('stop'),
+        }),
         // 按需后端安装在 daemon 进程内直跑（owns runtime，装完即能解析加载）。
         installBackend: installBackendDep,
         uninstallBackend: uninstallBackendDep,
@@ -231,24 +228,9 @@ async function runSingle(botName?: string): Promise<void> {
     }
   }
 
-  let stopping = false;
-  const stop = (sig: NodeJS.Signals): void => {
-    if (stopping) return;
-    stopping = true;
-    console.log(`\n收到 ${sig}，正在优雅退出（关闭所有 codex 会话）…`);
-    void (webConsole?.close() ?? Promise.resolve())
-      .catch(() => undefined)
-      .then(() => handle.shutdown())
-      .catch((err) => log.fail('run', err, { phase: 'shutdown' }))
-      .finally(() => {
-        releaseLock();
-        process.exit(0);
-      });
-  };
-  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
-    process.once(sig, () => stop(sig));
-  }
-
-  // keep the process alive; the WS connection drives everything.
-  await new Promise<never>(() => {});
+  await control.waitForRequest();
+  try {
+    await webConsole?.close();
+    await handle.shutdown();
+  } finally { releaseLock(); }
 }

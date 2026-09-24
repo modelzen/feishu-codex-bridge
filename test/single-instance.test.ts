@@ -151,7 +151,8 @@ describe('并发多进程抢锁', () => {
       writeFileSync(join(harnessDir, outName), out);
     };
     compile('src/config/data-root.ts', 'data-root.cjs');
-    compile('src/config/paths.ts', 'paths.cjs', { './data-root': './data-root.cjs' });
+    compile('src/config/data-compatibility.ts', 'data-compatibility.cjs');
+    compile('src/config/paths.ts', 'paths.cjs', { './data-root': './data-root.cjs', './data-compatibility': './data-compatibility.cjs' });
     compile('src/platform/spawn.ts', 'spawn.cjs', {
       'cross-spawn': require.resolve('cross-spawn').replaceAll('\\', '/'),
     });

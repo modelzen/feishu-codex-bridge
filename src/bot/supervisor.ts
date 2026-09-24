@@ -1,3 +1,4 @@
+import { CHILD_SHUTDOWN_GRACE_MS, observeShutdown, stopChild, type ShutdownControl } from '../host/lifecycle';
 import type { ChildProcess } from 'node:child_process';
 import { spawnProcess } from '../platform/spawn';
 import { recordServicePid, SERVICE_ENV_FLAG } from '../service/win-startup';
@@ -33,8 +34,6 @@ const BACKOFF_MIN_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
 /** A child that stays up at least this long resets its backoff to the minimum. */
 const HEALTHY_UPTIME_MS = 60_000;
-/** Grace period for children to exit on a signal before we SIGKILL them. */
-const SHUTDOWN_GRACE_MS = 8_000;
 
 interface Child {
   bot: BotEntry;
@@ -51,7 +50,8 @@ interface Child {
  * 假死子进程拖住整页——超时按 connection:'unknown' 渲染。 */
 const STATUS_IPC_TIMEOUT_MS = 2_000;
 
-export async function runSupervisor(bots: BotEntry[]): Promise<void> {
+export async function runSupervisor(bots: BotEntry[], options: { control?: ShutdownControl; managed?: boolean } = {}): Promise<void> {
+  const control = options.control ?? observeShutdown();
   const supervisorStartedAt = Date.now();
   const cliEntry = process.argv[1];
   if (!cliEntry) throw new Error('supervisor: 无法解析 CLI 入口（process.argv[1] 为空）');
@@ -140,79 +140,64 @@ export async function runSupervisor(bots: BotEntry[]): Promise<void> {
     });
   };
 
-  for (const c of children) spawnChild(c);
+  let webConsole: Awaited<ReturnType<typeof mountWebConsole>>;
+  try {
+    for (const c of children) spawnChild(c);
 
-  // ── 全局 Web 控制台（多 bot 聚合）─────────────────────────────────────────
-  // 读 = 各 bot 目录文件快照（显式路径，不切全局目录）；写 + 实时连接状态 =
-  // IPC 转发给对应子进程（崩溃重启窗口内明确拒绝，绝不静默丢写）。
-  const byAppId = (botId: string): Child | undefined => children.find((c) => c.bot.appId === botId);
-  const webConsole = await mountWebConsole(
-    createAdminService({
-      executeWrite: async (botId, op) => {
-        const c = byAppId(botId);
-        if (!c) throw new AdminWriteError(`机器人「${botId}」不在本次启动的活跃集里（先 \`bot use\` 勾选后重启）。`);
-        if (!c.proc || !c.ipc) throw new AdminWriteError(`机器人「${c.bot.name}」进程未在运行（崩溃重启中），稍后重试。`);
-        await c.ipc.call(op);
-      },
-      liveStatus: async (botId) => {
-        const c = byAppId(botId);
-        if (!c?.proc || !c.ipc) return undefined; // 不归本 supervisor 管 → 锁文件探测兜底
-        const r = (await c.ipc.call({ kind: 'status' }, STATUS_IPC_TIMEOUT_MS).catch(() => undefined)) as
-          | { connection?: string }
-          | undefined;
-        return {
-          running: true,
-          pid: c.proc.pid,
-          startedAt: c.startedAt,
-          connection: r?.connection ?? 'unknown',
-        };
-      },
-      daemonStartedAt: supervisorStartedAt,
-      // 重启 / 升级 / 停止走 detached helper：supervisor 被 service stop 杀掉后由 helper
-      // 续命/收尾。stopDaemon **必须**在此注入——漏了它，多 bot（supervisor）下 Web 点
-      // 「停止」会抛 NotWiredYetError（501，文案误导成「只读预览」），用户根本停不掉。
-      // supervisor 的 SIGTERM handler 会级联 SIGTERM→SIGKILL 所有 bot 子进程，不留孤儿。
-      restartDaemon: () => spawnDaemonControl('restart'),
-      applyUpdate: () => spawnDaemonControl('update'),
-      stopDaemon: () => spawnDaemonControl('stop'),
-      // 按需后端安装在 daemon 进程内直跑（owns runtime，装完即能解析加载）。
-      installBackend: installBackendDep,
-      uninstallBackend: uninstallBackendDep,
-    }),
-  );
-  if (webConsole) {
-    if (process.stdout.isTTY) {
-      // 含 token 的 URL 只在前台 TTY 打印（后台 stdout 会落盘成日志，token 不进
-      // 日志——后台用 `web` 命令经 0600 发现文件跳转）。
-      console.log(`🌐 Web 控制台（聚合 ${bots.length} 个机器人）：${webConsole.url}\n`);
-    } else {
-      console.log(`🌐 Web 控制台已内嵌启动（127.0.0.1:${webConsole.port}）：运行 \`feishu-codex-bridge web\` 获取登录链接。`);
-    }
-  }
-
-  await new Promise<void>((resolve) => {
-    const stop = (sig: NodeJS.Signals): void => {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      console.log(`\n收到 ${sig}，正在关闭全部机器人…`);
-      void webConsole?.close().catch(() => undefined);
-      for (const c of children) {
-        if (c.restartTimer) clearTimeout(c.restartTimer);
-        c.proc?.kill('SIGTERM');
+    // ── 全局 Web 控制台（多 bot 聚合）─────────────────────────────────────────
+    // 读 = 各 bot 目录文件快照（显式路径，不切全局目录）；写 + 实时连接状态 =
+    // IPC 转发给对应子进程（崩溃重启窗口内明确拒绝，绝不静默丢写）。
+    const byAppId = (botId: string): Child | undefined => children.find((c) => c.bot.appId === botId);
+    webConsole = await mountWebConsole(
+      createAdminService({
+        executeWrite: async (botId, op) => {
+          const c = byAppId(botId);
+          if (!c) throw new AdminWriteError(`机器人「${botId}」不在本次启动的活跃集里（先 \`bot use\` 勾选后重启）。`);
+          if (!c.proc || !c.ipc) throw new AdminWriteError(`机器人「${c.bot.name}」进程未在运行（崩溃重启中），稍后重试。`);
+          await c.ipc.call(op);
+        },
+        liveStatus: async (botId) => {
+          const c = byAppId(botId);
+          if (!c?.proc || !c.ipc) return undefined; // 不归本 supervisor 管 → 锁文件探测兜底
+          const r = (await c.ipc.call({ kind: 'status' }, STATUS_IPC_TIMEOUT_MS).catch(() => undefined)) as
+            | { connection?: string }
+            | undefined;
+          return {
+            running: true,
+            pid: c.proc.pid,
+            startedAt: c.startedAt,
+            connection: r?.connection ?? 'unknown',
+          };
+        },
+        daemonStartedAt: supervisorStartedAt,
+        ...(options.managed ? {} : {
+          restartDaemon: () => spawnDaemonControl('restart'),
+          applyUpdate: () => spawnDaemonControl('update'),
+          stopDaemon: () => spawnDaemonControl('stop'),
+        }),
+        // 按需后端安装在 daemon 进程内直跑（owns runtime，装完即能解析加载）。
+        installBackend: installBackendDep,
+        uninstallBackend: uninstallBackendDep,
+      }),
+    );
+    if (webConsole) {
+      if (process.stdout.isTTY) {
+        // 含 token 的 URL 只在前台 TTY 打印（后台 stdout 会落盘成日志，token 不进
+        // 日志——后台用 `web` 命令经 0600 发现文件跳转）。
+        console.log(`🌐 Web 控制台（聚合 ${bots.length} 个机器人）：${webConsole.url}\n`);
+      } else {
+        console.log(`🌐 Web 控制台已内嵌启动（127.0.0.1:${webConsole.port}）：运行 \`feishu-codex-bridge web\` 获取登录链接。`);
       }
-      // Give children a grace period to close their codex sessions, then force.
-      const deadline = Date.now() + SHUTDOWN_GRACE_MS;
-      const poll = setInterval(() => {
-        const alive = children.filter((c) => c.proc && !c.proc.killed);
-        if (alive.length === 0 || Date.now() >= deadline) {
-          clearInterval(poll);
-          for (const c of alive) c.proc?.kill('SIGKILL');
-          resolve();
-        }
-      }, 200);
-    };
-    for (const sig of ['SIGINT', 'SIGTERM'] as const) process.once(sig, () => stop(sig));
-  });
+    }
 
-  process.exit(0);
+    await control.waitForRequest();
+  } finally {
+    shuttingDown = true;
+    for (const child of children) if (child.restartTimer) clearTimeout(child.restartTimer);
+    const live = children.flatMap((child) => child.proc ? [stopChild(child.proc, CHILD_SHUTDOWN_GRACE_MS)] : []);
+    const cleanup = await Promise.allSettled([webConsole?.close(), ...live]);
+    control.dispose();
+    const failures = cleanup.filter((result) => result.status === 'rejected');
+    if (failures.length) throw new AggregateError(failures.map((failure) => failure.reason), 'Supervisor cleanup failed.');
+  }
 }

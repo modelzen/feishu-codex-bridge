@@ -1,3 +1,5 @@
+import { homedir } from 'node:os';
+import { isBridgeGetter } from './data-compatibility';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -94,13 +96,7 @@ async function resolveExecRef(
 }
 
 function isSelfBridgeCommand(command: string, args: string[] | undefined): boolean {
-  if (command === paths.secretsGetterScript) return true;
-  if (args && args.length >= 2) {
-    const a = args[args.length - 2];
-    const b = args[args.length - 1];
-    if (a === 'secrets' && b === 'get') return true;
-  }
-  return false;
+  return isBridgeGetter(command, args, homedir(), paths.secretsGetterScript);
 }
 
 async function spawnExecProvider(pc: ProviderConfig, ref: SecretRef): Promise<string> {
