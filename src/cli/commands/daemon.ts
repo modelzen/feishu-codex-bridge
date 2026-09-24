@@ -1,4 +1,4 @@
-import { ensureOnboarded, confirmReadyForDaemon } from '../../bot/onboarding';
+import { ensureOnboarded } from '../../bot/onboarding';
 import { activeBots, loadBots } from '../../config/bots';
 import { getServiceAdapter, type ServiceStatus } from '../../service/adapter';
 import { readWebConsole, type WebConsoleRecord } from '../../web/discovery';
@@ -12,8 +12,7 @@ import { readWebConsole, type WebConsoleRecord } from '../../web/discovery';
  *
  * Onboarding happens here in the foreground first — this terminal has a TTY for
  * the scan — so the detached service never enters the wizard. With a multi-bot
- * active set we walk every active bot through onboarding + the readiness gate
- * (sequentially, so each bot's scope prompts stay legible).
+ * active set we check each bot sequentially so its diagnostic output stays together.
  */
 export async function runStart(): Promise<void> {
   const active = activeBots(await loadBots());
@@ -38,27 +37,16 @@ export async function runStart(): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    if (!(await confirmReadyForDaemon(ready))) {
-      process.exitCode = 1;
-      return;
-    }
   } else {
     if (active.length > 1) {
       console.log(`\n后台服务将托管 ${active.length} 个机器人（supervisor 多进程，各自独立进程）：`);
       for (const b of active) console.log(`  • ${b.name}  (${b.appId})  [${b.tenant}]`);
       console.log('');
     }
-    // Don't daemonize a bot that can't receive messages — block until the
-    // operator has finished authorizing each one (scopes granted, events
-    // subscribed, version published).
     for (const bot of active) {
       if (active.length > 1) console.log(`\n──── 机器人「${bot.name}」(${bot.appId}) ────`);
       const ready = await ensureOnboarded({ bot: bot.appId });
       if (!ready) {
-        process.exitCode = 1;
-        return;
-      }
-      if (!(await confirmReadyForDaemon(ready))) {
         process.exitCode = 1;
         return;
       }

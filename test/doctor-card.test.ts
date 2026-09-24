@@ -273,7 +273,7 @@ describe('buildDoctorCard — 事件订阅诊断（版本信息 API）', () => {
       buildDoctorCard(info({ eventDiagnosis: { state: 'unpublished' }, eventConfigUrl: EVT_URL })),
     );
     expect(prompt).toContain('事件订阅：');
-    expect(prompt).toContain('从未发布');
+    expect(prompt).toContain('未找到已发布版本');
   });
 
   it('join 块在 events 可知时按真实订阅状态渲染', () => {

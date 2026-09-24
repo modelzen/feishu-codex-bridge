@@ -29,6 +29,21 @@ import { VOICE_TITLE, VOICE_DESCRIPTION, VOICE_NOTICE, VOICE_DOC_URL } from '../
  * 约束：纯字符串拼接、不用反引号 / ${}（这段会被原样塞进 <script>）。
  */
 export const UI_PURE_JS = `
+  function eventDiagnosisView(d) {
+    if (!d) return { icon: '⚠️', title: '事件订阅未检测', detail: '未获取到事件订阅诊断结果，请重试。', showConfig: true };
+    var version = d.version || '?';
+    switch (d.state) {
+      case 'ok':
+        return { icon: '✅', title: '必需事件已订阅', detail: '已发布版本 v' + version + ' 已订阅 im.message.receive_v1。', showConfig: !!(d.missingOptional && d.missingOptional.length) };
+      case 'missing':
+        return { icon: '❌', title: '缺少必需事件', detail: '已发布版本 v' + version + ' 缺少：' + (d.missingRequired || []).join('、') + '。添加后发布新版本。', showConfig: true };
+      case 'unpublished':
+        return { icon: '⚠️', title: '未找到已发布版本', detail: '在事件配置中添加 im.message.receive_v1，然后到「版本管理与发布」发布版本。', showConfig: true };
+      default:
+        return { icon: '⚠️', title: '事件订阅未能检测', detail: d.reason || '未获取到可用的订阅信息，请重试。', showConfig: true };
+    }
+  }
+
   // ── hash 路由：''/#overview → 仪表盘；#bot/<appId> → 某机器人；#backends/#doctor/#logs
   //    → 系统分页（后端管理 / 宿主机体检 / 实时日志）。侧栏导航与这些一一对应。──────────
   function parseRoute(hash) {
@@ -935,12 +950,23 @@ ${UI_PURE_JS}
       ? '所有人：' + tierLabel(p.mode)
       : '管理员：' + tierLabel(p.mode) + ' · 其他人：' + tierLabel(p.guestMode);
   }
-  function eventDiagText(d) {
-    if (!d) return '（未检测）';
-    if (d.state === 'ok') return '✅ 已生效（版本 v' + (d.version || '?') + ' 已订阅 im.message.receive_v1）';
-    if (d.state === 'missing') return '❌ 已发布版本 v' + (d.version || '?') + ' 缺事件：' + (d.missingRequired || []).join('、') + ' —— @机器人不会有反应';
-    if (d.state === 'unpublished') return '❌ 从未发布过版本 —— 事件订阅尚未生效，@机器人不会有反应';
-    return '⚠️ 未能自动检测（' + (d.reason || '未知原因') + '）';
+  function appendEventDiagnosis(parent, d, configUrl) {
+    var view = eventDiagnosisView(d);
+    var item = checkItem(view.icon, view.title, view.detail);
+    var body = item.lastChild;
+    if (d && d.missingOptional && d.missingOptional.length) {
+      body.appendChild(el('div', 'note', '可选事件未订阅：' + d.missingOptional.join('、') + '。不影响基本消息功能，需要时添加并发布版本。'));
+    }
+    if (view.showConfig && configUrl) {
+      var link = el('a', null, '打开「事件与回调」配置页 ↗');
+      link.href = configUrl; link.target = '_blank'; link.rel = 'noopener';
+      body.appendChild(link);
+    }
+    var help = el('details', 'note');
+    help.appendChild(el('summary', null, '消息或卡片按钮无响应时'));
+    help.appendChild(el('div', null, '若消息未送达，检查事件订阅方式是否为长连接；若按钮无响应，检查「回调配置」中的 card.action.trigger。'));
+    body.appendChild(help);
+    parent.appendChild(item);
   }
   function connText(s) {
     if (s === 'connected') return '✅ 已连接';
@@ -2239,7 +2265,7 @@ ${UI_PURE_JS}
     box.textContent = '';
     box.className = 'note';
     if (!diag) return;
-    box.appendChild(el('div', null, 'ℹ️ 事件订阅：请自行到「事件与回调」确认已订阅 im.message.receive_v1（长连接）；此项系统无法可靠检测，仅作提醒。'));
+    appendEventDiagnosis(box, diag.event, diag.eventConfigUrl);
     var title = el('div', null, '🧠 后端环境：');
     title.style.marginTop = '6px';
     box.appendChild(title);
@@ -2686,7 +2712,7 @@ ${UI_PURE_JS}
     var w = $('wizBody');
     w.textContent = '';
     w.appendChild(el('h3', null, '② 接入检测'));
-    w.appendChild(el('div', 'note', '机器人「' + (wizBotId || '') + '」已注册。下面逐项检测接入状态，事件订阅生效后即可去群里 @它。'));
+    w.appendChild(el('div', 'note', '机器人「' + (wizBotId || '') + '」已注册。下面逐项查询凭据、权限和已发布版本的事件订阅。'));
     w.appendChild(wizStepBar(2));
     var s = wizSetup;
     if (!s || !s.credentials) {
@@ -2715,14 +2741,7 @@ ${UI_PURE_JS}
     }
     // 「加入活跃集 + 拉起上线」全程静默：新 bot 已在 pollWizSetup 自动加入活跃集，真正拉起
     // 靠最后一步「完成」弹窗确认重启——这里不再显示「待拉起上线」之类的中间态项。
-    // 事件订阅：系统无法可靠检测（长连接订阅在已发布版本里的体现不稳定），故只做提醒、不下结论、
-    // 不阻塞「下一步」。用户自行去后台核对。
-    var evHint = el('div');
-    var ea = el('a', null, '打开「事件与回调」配置页 ↗');
-    ea.href = (s.eventConfigUrl || '#'); ea.target = '_blank'; ea.rel = 'noopener';
-    evHint.appendChild(ea);
-    w.appendChild(checkItem('ℹ️', '事件订阅（请自行确认）',
-      '请到「事件与回调」确认已订阅 im.message.receive_v1（长连接模式）并已发布版本，否则 @机器人不会有反应。此项系统无法可靠检测，仅作提醒。', evHint));
+    appendEventDiagnosis(w, s.event, s.eventConfigUrl);
     w.appendChild(wizChecklistActions());
   }
 

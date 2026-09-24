@@ -344,6 +344,7 @@ describe('web server · 只读 API', () => {
     expect(body.bot).toBe('cli_a');
     expect(body.backends[0]).toMatchObject({ id: 'codex-appserver', ok: true });
     expect(body.event.state).toBe('unchecked');
+    expect(body.eventConfigUrl).toBe('https://open.feishu.cn/app/cli_a/event');
   });
 
   it('/api/project/:name/sessions：话题列表', async () => {

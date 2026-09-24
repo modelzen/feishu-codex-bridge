@@ -5,6 +5,7 @@ import { mkdirSync, watch, type FSWatcher } from 'node:fs';
 import { open, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { paths } from '../config/paths';
+import { buildEventConfigUrl } from '../config/scopes';
 import {
   COMPLETION_REMINDER_LONG_TASK_MAX_MINUTES,
   COMPLETION_REMINDER_LONG_TASK_MIN_MINUTES,
@@ -745,12 +746,15 @@ export function createWebServer(opts: WebServerOptions): WebServer {
 
   /** GET /api/diagnosis —— 事件订阅三态 + 各后端环境体检（按需，较慢）。 */
   async function handleDiagnosis(res: ServerResponse, botParam: string | null): Promise<void> {
-    const botId = botParam ?? (await defaultBotId());
+    const bots = await opts.service.listBots();
+    const botId = botParam ?? (bots.find((b) => b.current) ?? bots[0])?.appId;
+    const bot = bots.find((b) => b.appId === botId);
     const [backends, event] = await Promise.all([
       opts.service.doctorBackends(),
       botId ? opts.service.eventDiagnosis(botId) : Promise.resolve(undefined),
     ]);
-    sendJson(res, 200, { bot: botId, backends, event });
+    const eventConfigUrl = bot ? buildEventConfigUrl(bot.appId, bot.tenant) : undefined;
+    sendJson(res, 200, { bot: botId, backends, event, eventConfigUrl });
   }
 
   /**
