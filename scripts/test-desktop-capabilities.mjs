@@ -1,6 +1,6 @@
 import '../test/fixtures/offline-service-probes.mjs';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -64,6 +64,8 @@ delete process.env.OPENAI_API_KEY;
 delete process.env.CODEX_API_KEY;
 const options = { home, nodePath: process.execPath, cliPath: fileURLToPath(new URL('../bin/feishu-codex-bridge.mjs', import.meta.url)) };
 let host;
+let phase = 'connect Host';
+let failure;
 const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const waitFor = async read => {
   const deadline = Date.now() + 10_000;
@@ -79,27 +81,32 @@ const start = async type => json(`/api/tools/codex/${type}`, { method: 'POST' })
 const job = async id => json(`/api/tools/codex/jobs/${id}`);
 try {
   host = await connectHost(options); assert.equal(host.kind, 'connected', JSON.stringify(host)); assert.equal(host.ownership, 'owned');
+  phase = 'install Codex and inspect account';
   const installed = await start('install');
   const completed = await waitFor(async () => { const value = await job(installed.id); return value.state !== 'running' && value; });
   assert.equal(completed.state, 'succeeded', JSON.stringify(completed));
   assert.equal((await json('/api/tools/codex/setup')).authentication, 'signedOut');
+  phase = 'cancel login';
   const login = await start('login');
   await waitFor(async () => (await job(login.id)).state === 'authorizing');
   assert.equal((await json(`/api/tools/codex/jobs/${login.id}`, { method: 'DELETE' })).state, 'cancelled');
   assert.equal((await json(`/api/tools/codex/jobs/${login.id}`, { method: 'DELETE' })).state, 'cancelled');
   const quittingLogin = await start('login');
   await waitFor(async () => (await job(quittingLogin.id)).state === 'authorizing');
+  phase = 'close Host during login';
   await host.close(); host = undefined;
   const accountCalls = readFileSync(accountTrace, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   assert.equal(accountCalls.filter(call => call.method === 'account/login/cancel').length, 2);
   assert.ok(accountCalls.every(call => call.home === join(home, '.codex') && !alive(call.pid)));
   const pointer = readFileSync(join(data, 'codex-cli/current.json'), 'utf8');
   process.env.NPM_PROBE_MODE = 'hold'; rmSync(trace);
+  phase = 'install with active npm descendant';
   host = await connectHost(options); assert.equal(host.kind, 'connected', JSON.stringify(host));
   await start('install');
   await waitFor(() => existsSync(trace) && JSON.parse(readFileSync(trace, 'utf8')).leaderPid);
   const npmChild = JSON.parse(readFileSync(trace, 'utf8'));
   assert.ok(!npmChild.prefix.startsWith(data));
+  phase = 'close Host during install';
   await host.close(); host = undefined;
   assert.equal(alive(npmChild.pid), false);
   assert.equal(alive(npmChild.leaderPid), false);
@@ -111,9 +118,24 @@ try {
   assert.ok(spawnedDescendants.length >= 2);
   assert.ok(spawnedDescendants.every(child => !alive(child.pid)), 'all inherited-pipe app-server descendants exited before Host close');
   console.log('PASS actual Host install, account probe, exact login cancellation, login quit, npm descendant quit, inherited-pipe descendants, retained install and existing data.');
+} catch (error) {
+  failure = error;
+  console.error(`Desktop capabilities failed during ${phase}:`, error);
+  const logs = join(data, 'logs');
+  if (existsSync(logs)) {
+    for (const file of readdirSync(logs).filter(file => file.endsWith('.log')).sort().slice(-2)) {
+      console.error(`Isolated fixture log ${file}:\n${readFileSync(join(logs, file), 'utf8').slice(-8192)}`);
+    }
+  }
+  throw error;
 } finally {
-  if (host?.kind === 'connected') await host.close();
-  for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
-  Object.assign(process.env, savedEnv);
-  rmSync(root, { recursive: true, force: true });
+  try {
+    if (host?.kind === 'connected') await host.close();
+    rmSync(root, { recursive: true, force: true });
+  } catch (cleanupError) {
+    throw failure ? new AggregateError([failure, cleanupError], 'Desktop capabilities and cleanup both failed.') : cleanupError;
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+    Object.assign(process.env, savedEnv);
+  }
 }
