@@ -377,6 +377,12 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       return;
     }
 
+    const refreshQr = pathName.match(/^\/api\/bots\/(cli_[A-Za-z0-9]{6,})\/refresh-qr\/stream$/);
+    if (req.method === 'GET' && refreshQr) {
+      handleRegisterQrStream(req, res, refreshQr[1]);
+      return;
+    }
+
     if (req.method === 'DELETE' && pathName === '/api/bots/register-qr') {
       const sessionId = url.searchParams.get('sessionId');
       if (sessionId !== null && !/^[a-f0-9-]{36}$/.test(sessionId)) {
@@ -666,7 +672,7 @@ export function createWebServer(opts: WebServerOptions): WebServer {
    * → abort 兜底（防僵尸轮询）。secret 绝不经前端：service 内 resolve 后直接进
    * keystore，done payload 只回白名单字段（appId/name/tenant/adminOpenId/botName/missingScopes）。
    */
-  function handleRegisterQrStream(req: IncomingMessage, res: ServerResponse): void {
+  function handleRegisterQrStream(req: IncomingMessage, res: ServerResponse, refreshAppId?: string): void {
     for (const [id, session] of qrSessions) {
       if (qrSessions.size < 32) break;
       if (session.settled) qrSessions.delete(id);
@@ -715,11 +721,14 @@ export function createWebServer(opts: WebServerOptions): WebServer {
     req.on('close', cleanup);
 
     session.done = Promise.resolve()
-      .then(() => opts.service.registerBotByQr({
-        signal: abort.signal,
-        onQr: (info) => sendEvent('qr', { qrUrl: info.url, expireIn: info.expireIn, sessionId: session.id }),
-        onStatus: (info) => sendEvent('status', { status: info.status, interval: info.interval }),
-      }))
+      .then(() => {
+        const callbacks = {
+          signal: abort.signal,
+          onQr: (info: { url: string; expireIn: number }) => sendEvent('qr', { qrUrl: info.url, expireIn: info.expireIn, sessionId: session.id }),
+          onStatus: (info: { status: string; interval?: number }) => sendEvent('status', { status: info.status, interval: info.interval }),
+        };
+        return refreshAppId ? opts.service.refreshBotByQr(refreshAppId, callbacks) : opts.service.registerBotByQr(callbacks);
+      })
       .then((result) => {
         if (result.ok) {
           // done payload 白名单字段——绝不含 client_secret（已进 keystore）。

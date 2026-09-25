@@ -37,7 +37,7 @@
     "test:host-lifecycle": "node scripts/test-host-lifecycle.mjs && node scripts/test-supervisor-shutdown.mjs"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.65.0",
+    "@larksuiteoapi/node-sdk": "1.71.1",
     "commander": "^12.1.0",
     "cross-spawn": "^7.0.6",
     "ogg-opus-decoder": "^1.7.5",

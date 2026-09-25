@@ -30,6 +30,7 @@ import { resolveAppSecret } from '../config/secret-resolver';
 import { diagnoseEventSubscription, type EventDiagnosis } from '../utils/event-diagnosis';
 import { validateAppCredentials } from '../utils/feishu-auth';
 import { buildScopeGrantUrl, buildEventConfigUrl } from '../config/scopes';
+import { refreshBotCredentials } from '../bot/refresh-bot';
 import { registerBotFromCredentials } from '../bot/register-bot';
 import {
   startRegistration,
@@ -163,6 +164,8 @@ export interface AdminService {
     onQr: (info: RegistrationQr) => void;
     onStatus?: (info: RegistrationStatus) => void;
   }): Promise<QrRegisterResult | QrRegisterFailure>;
+
+  refreshBotByQr(botId: string, opts: { signal: AbortSignal; onQr: (info: RegistrationQr) => void; onStatus?: (info: RegistrationStatus) => void }): Promise<QrRegisterResult | QrRegisterFailure>;
 
   // ── Web 专属：后端 catalog 预览 + 按需安装（backend-catalog-ondemand.md）──────
   /**
@@ -383,6 +386,8 @@ export interface QrRegisterFailure {
     | 'expired_token'
     | 'access_denied'
     | 'identity_missing'
+    | 'already_registered'
+    | 'stale_target'
     | 'persist_failed'
     | 'credential_rejected'
     | 'network'
@@ -788,7 +793,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
         // 写盘 / 探活失败 → 据 register-bot 的 code 映射（invalid_input 理论不该出现，
         // 扫码拿到的 appId 必合法，归为 unknown 兜底）。
         const code: QrRegisterFailure['code'] =
-          r.code === 'credential_rejected' ? 'credential_rejected' : r.code === 'persist_failed' ? 'persist_failed' : 'unknown';
+          r.code === 'already_registered' ? 'already_registered' : r.code === 'credential_rejected' ? 'credential_rejected' : r.code === 'persist_failed' ? 'persist_failed' : 'unknown';
         return { ok: false, code, reason: r.reason };
       }
       return {
@@ -800,6 +805,11 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
         adminOpenId: ownerOpenId,
         missingScopes: r.missingScopes,
       };
+    },
+
+    async refreshBotByQr(botId, opts) {
+      if (deps.readonlyPreview) throw new NotWiredYetError('刷新 Agent 凭据');
+      return refreshBotCredentials(botId, opts);
     },
 
     async listBackendCatalog(): Promise<AdminBackendCatalog> {

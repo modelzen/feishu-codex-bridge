@@ -1,8 +1,9 @@
-import { createCipheriv, createDecipheriv, pbkdf2Sync, randomBytes } from 'node:crypto';
-import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { createCipheriv, createDecipheriv, pbkdf2Sync, randomBytes, randomUUID } from 'node:crypto';
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { hostname, userInfo } from 'node:os';
 import { dirname } from 'node:path';
 import { paths } from './paths';
+import { acquireSingleInstanceLock } from '../core/single-instance';
 
 /**
  * Local AES-256-GCM keystore for App Secrets and similar.
@@ -46,12 +47,17 @@ async function readStore(): Promise<StoreFile> {
   }
 }
 
-async function writeStore(store: StoreFile): Promise<void> {
+async function writeStore(store: StoreFile, beforeCommit?: () => Promise<void>): Promise<void> {
   await mkdir(dirname(paths.secretsFile), { recursive: true });
-  const tmp = `${paths.secretsFile}.tmp-${process.pid}`;
+  const tmp = `${paths.secretsFile}.tmp-${process.pid}-${randomUUID()}`;
   await writeFile(tmp, `${JSON.stringify(store, null, 2)}\n`, 'utf8');
   await chmod(tmp, 0o600);
-  await rename(tmp, paths.secretsFile);
+  try {
+    await beforeCommit?.();
+    await rename(tmp, paths.secretsFile);
+  } finally {
+    await unlink(tmp).catch(() => undefined);
+  }
 }
 
 async function loadOrCreateSalt(): Promise<Buffer> {
@@ -104,20 +110,39 @@ export async function getSecret(id: string): Promise<string | undefined> {
   return decrypt(key, env);
 }
 
-export async function setSecret(id: string, plaintext: string): Promise<void> {
-  const key = await deriveKey();
-  const env = encrypt(key, plaintext);
-  const store = await readStore();
-  store.entries[id] = env;
-  await writeStore(store);
+let mutations: Promise<unknown> = Promise.resolve();
+function mutate<T>(operation: () => Promise<T>): Promise<T> {
+  const result = mutations.then(async () => {
+    const release = acquireSingleInstanceLock('__keystore__', `${paths.secretsFile}.lock`);
+    try {
+      return await operation();
+    } finally {
+      release();
+      process.removeListener('exit', release);
+    }
+  });
+  mutations = result.catch(() => undefined);
+  return result;
 }
 
-export async function removeSecret(id: string): Promise<boolean> {
-  const store = await readStore();
-  if (!(id in store.entries)) return false;
-  delete store.entries[id];
-  await writeStore(store);
-  return true;
+export function setSecret(id: string, plaintext: string, beforeCommit?: () => Promise<void>): Promise<void> {
+  return mutate(async () => {
+    const key = await deriveKey();
+    const env = encrypt(key, plaintext);
+    const store = await readStore();
+    store.entries[id] = env;
+    await writeStore(store, beforeCommit);
+  });
+}
+
+export function removeSecret(id: string): Promise<boolean> {
+  return mutate(async () => {
+    const store = await readStore();
+    if (!(id in store.entries)) return false;
+    delete store.entries[id];
+    await writeStore(store);
+    return true;
+  });
 }
 
 export async function listSecretIds(): Promise<string[]> {

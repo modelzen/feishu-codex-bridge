@@ -99,6 +99,7 @@ function stubService(): AdminService {
         eventConfigUrl: 'https://open.feishu.cn/app/' + botId + '/event',
       };
     },
+    async refreshBotByQr() { return { ok: false, code: 'access_denied', reason: 'test' }; },
     async registerBotByQr(o) {
       // 默认 stub：吐一帧 qr + 一帧 status，再成功。被取消（abort）则返回 abort。
       o.onQr({ url: 'https://accounts.feishu.cn/scan?code=abc', expireIn: 600 });
@@ -651,6 +652,30 @@ async function readSseUntil(res: Response, needle: string, timeoutMs: number): P
 }
 
 describe('web server · 扫码注册 SSE', () => {
+  it('target refresh SSE dispatches the original App ID and preserves the session cancellation contract', async () => {
+    const svc = stubService();
+    svc.refreshBotByQr = async (appId, options) => {
+      expect(appId).toBe('cli_original123');
+      options.onQr({ url: 'https://accounts.feishu.cn/refresh', expireIn: 600 });
+      return { ok: true, appId, name: 'original', tenant: 'feishu', adminOpenId: 'ou_original' };
+    };
+    const server = createWebServer({ service: svc, token: TOKEN, logDir });
+    const { port } = await server.listen(0);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/bots/cli_original123/refresh-qr/stream`, {
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get('X-Registration-Session-Id')).toMatch(/^[a-f0-9-]{36}$/);
+      const output = await readSseUntil(res, 'event: done', 4000);
+      expect(output).toContain('"appId":"cli_original123"');
+      expect(output).toContain('"adminOpenId":"ou_original"');
+      expect(output).not.toContain('secret');
+    } finally {
+      await server.close();
+    }
+  });
+
   it('GET /api/bots/register-qr/stream：推 qr → status → done（done 不含 secret）', async () => {
     const res = await authed('/api/bots/register-qr/stream');
     expect(res.status).toBe(200);
