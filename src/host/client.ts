@@ -66,7 +66,7 @@ export async function connectHost(input: HostOptions): Promise<HostHandle | Host
     const existing = await readHostEndpoint(options.home);
     if (existing && 'kind' in existing) return existing;
     if (existing && options.bot) throw new HostOwnershipError('Stop the existing Host before a temporary Agent run.');
-    if (options.bot && !/^cli_[a-zA-Z0-9]+$/.test(options.bot)) throw new Error('Invalid Agent ID.');
+    if (options.bot && !/^cli_[\w-]{1,200}$/.test(options.bot)) throw new Error('Invalid Agent ID.');
     if (existing) endpoint = existing;
     else {
       const installation = inspectInstallation(options.home);
