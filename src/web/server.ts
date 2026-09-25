@@ -106,7 +106,8 @@ export function createWebServer(opts: WebServerOptions): WebServer {
   /** 进行中的安装，按 `${id}|${update}` 去重 —— 刷新/重连命中同一 job，绝不并发重复装。 */
   const installJobs = new Map<string, InstallJob>();
 
-  interface QrSession { id: string; abort: AbortController; done: Promise<void>; settled: boolean }
+  type QrOutcome = { state: 'running' | 'cancelled' } | { state: 'succeeded'; appId: string } | { state: 'failed'; code: string; message: string };
+  interface QrSession { id: string; abort: AbortController; done: Promise<void>; settled: boolean; outcome: QrOutcome }
   const qrSessions = new Map<string, QrSession>();
   let qrSession: QrSession | null = null;
 
@@ -380,6 +381,21 @@ export function createWebServer(opts: WebServerOptions): WebServer {
     const refreshQr = pathName.match(/^\/api\/bots\/(cli_[A-Za-z0-9]{6,})\/refresh-qr\/stream$/);
     if (req.method === 'GET' && refreshQr) {
       handleRegisterQrStream(req, res, refreshQr[1]);
+      return;
+    }
+
+    if (req.method === 'GET' && pathName === '/api/bots/register-qr') {
+      const sessionId = url.searchParams.get('sessionId');
+      if (sessionId === null || !/^[a-f0-9-]{36}$/.test(sessionId)) {
+        sendJson(res, 400, { error: 'invalid_session' });
+        return;
+      }
+      const session = qrSessions.get(sessionId);
+      if (!session) {
+        sendJson(res, 404, { error: 'session_not_found' });
+        return;
+      }
+      sendJson(res, 200, session.outcome);
       return;
     }
 
@@ -684,7 +700,7 @@ export function createWebServer(opts: WebServerOptions): WebServer {
     // 抢占式替换：先 abort 旧会话（旧 EventSource 收到 abort 静默关闭），再开新会话。
     qrSession?.abort.abort();
     const abort = new AbortController();
-    const session: QrSession = { id: randomUUID(), abort, done: Promise.resolve(), settled: false };
+    const session: QrSession = { id: randomUUID(), abort, done: Promise.resolve(), settled: false, outcome: { state: 'running' } };
     qrSession = session;
     qrSessions.set(session.id, session);
 
@@ -731,6 +747,7 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       })
       .then((result) => {
         if (result.ok) {
+          session.outcome = { state: 'succeeded', appId: result.appId };
           // done payload 白名单字段——绝不含 client_secret（已进 keystore）。
           sendEvent('done', {
             appId: result.appId,
@@ -741,13 +758,17 @@ export function createWebServer(opts: WebServerOptions): WebServer {
             missingScopes: result.missingScopes,
           });
         } else if (result.code === 'abort') {
+          session.outcome = { state: 'cancelled' };
           // 用户主动取消 / 连接断开：静默关闭，不渲染错误。
         } else {
-          sendEvent('error', { code: result.code, message: result.reason });
+          session.outcome = { state: 'failed', code: result.code, message: result.reason.slice(0, 1024) };
+          sendEvent('error', { code: session.outcome.code, message: session.outcome.message });
         }
       })
       .catch((err) => {
-        sendEvent('error', { code: 'unknown', message: err instanceof Error ? err.message : String(err) });
+        if (session.outcome.state === 'succeeded') return;
+        session.outcome = { state: 'failed', code: 'unknown', message: (err instanceof Error ? err.message : String(err)).slice(0, 1024) };
+        sendEvent('error', { code: session.outcome.code, message: session.outcome.message });
       })
       .finally(() => { session.settled = true; finish(); });
   }

@@ -50,9 +50,8 @@ async function readStore(): Promise<StoreFile> {
 async function writeStore(store: StoreFile, beforeCommit?: () => Promise<void>): Promise<void> {
   await mkdir(dirname(paths.secretsFile), { recursive: true });
   const tmp = `${paths.secretsFile}.tmp-${process.pid}-${randomUUID()}`;
-  await writeFile(tmp, `${JSON.stringify(store, null, 2)}\n`, 'utf8');
-  await chmod(tmp, 0o600);
   try {
+    await writeFile(tmp, `${JSON.stringify(store, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     await beforeCommit?.();
     await rename(tmp, paths.secretsFile);
   } finally {
