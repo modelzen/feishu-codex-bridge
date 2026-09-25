@@ -7,7 +7,7 @@ import { stopChild } from './lifecycle';
 export type { HostInspection, HostRefusal } from './discovery';
 export { migrateHostDataOffline, type HostMigration } from './migration';
 
-export interface HostOptions { home: string; nodePath: string; cliPath: string }
+export interface HostOptions { home: string; nodePath: string; cliPath: string; bot?: string }
 export interface HostHandle {
   kind: 'connected';
   ownership: 'owned' | 'attached';
@@ -33,7 +33,7 @@ export async function inspectHost(home: string): Promise<HostInspection> {
 async function launch(options: HostOptions): Promise<{ child: ChildProcess; endpoint: HostEndpoint }> {
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: options.home, USERPROFILE: options.home, XDG_CONFIG_HOME: `${options.home}/.config` };
   delete env.FEISHU_CODEX_BRIDGE_SERVICE;
-  const child = spawn(options.nodePath, [options.cliPath, 'host', '--parent-control'], {
+  const child = spawn(options.nodePath, [options.cliPath, 'host', '--parent-control', ...(options.bot ? ['--bot', options.bot] : [])], {
     env, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe', 'ignore', 'pipe'],
   });
   let failure = '';
@@ -65,6 +65,8 @@ export async function connectHost(input: HostOptions): Promise<HostHandle | Host
     let child: ChildProcess | undefined;
     const existing = await readHostEndpoint(options.home);
     if (existing && 'kind' in existing) return existing;
+    if (existing && options.bot) throw new HostOwnershipError('Stop the existing Host before a temporary Agent run.');
+    if (options.bot && !/^cli_[a-zA-Z0-9]+$/.test(options.bot)) throw new Error('Invalid Agent ID.');
     if (existing) endpoint = existing;
     else {
       const installation = inspectInstallation(options.home);

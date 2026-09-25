@@ -16,17 +16,21 @@ let control: ShutdownControl | undefined;
 program.hook('preAction', async (_command, action) => {
   const name = action.name();
   if (name === 'host' || name === 'run') control = observeShutdown(name === 'host');
-  if (action.parent?.name() === 'data' || name === 'status' || name === 'stop') return;
+  if (action.parent?.name() === 'data' || name === 'status' || name === 'stop' || name === '__desktop-service') return;
   lease = await enterDataAccess(homedir());
 });
 program.hook('postAction', () => { lease?.release(); control?.dispose(); });
 
 program.command('host', { hidden: true })
   .option('--parent-control', 'Owned Host controlled by parent stdin')
-  .action(async (options: { parentControl?: boolean }) => {
+  .option('--bot <appId>', 'Run only this Agent without changing the default selection')
+  .action(async (options: { parentControl?: boolean; bot?: string }) => {
     if (!options.parentControl) throw new Error('The Host entry requires --parent-control.');
-    await (await import('../host/bootstrap')).runHostRuntime({ managed: true, control });
+    await (await import('../host/bootstrap')).runHostRuntime({ managed: true, control, bot: options.bot });
   });
+program.command('__desktop-service <action>', { hidden: true }).action(async (action: string) => {
+  console.log(JSON.stringify(await (await import('../host/service')).controlDesktopService(action)));
+});
 const data = program.command('data').description('Inspect or migrate local Bridge data while offline');
 data.command('status').action(async () => {
   console.log(JSON.stringify(await (await import('../host/client')).inspectHost(homedir()), null, 2));

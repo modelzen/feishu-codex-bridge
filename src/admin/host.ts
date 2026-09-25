@@ -54,6 +54,8 @@ export interface DaemonStatus {
   uptimeMs?: number;
   /** 服务定义路径 / stdout / stderr 路径（诊断用）。 */
   servicePath?: string;
+  stdoutPath?: string;
+  stderrPath?: string;
   /** 本平台是否支持后台服务（不支持时 restart 按钮置灰，引导前台 run）。 */
   supported: boolean;
 }
@@ -101,6 +103,8 @@ export function toDaemonStatus(opts: {
     version: opts.version,
     uptimeMs: opts.startedAt !== undefined ? Math.max(0, (opts.now ?? Date.now()) - opts.startedAt) : undefined,
     servicePath: s?.servicePath,
+    stdoutPath: s?.stdoutPath,
+    stderrPath: s?.stderrPath,
     supported: s !== undefined,
   };
 }
