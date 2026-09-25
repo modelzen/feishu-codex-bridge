@@ -1,7 +1,8 @@
 import { managedCodexBin } from './managed-install';
+import { managedToolSelection } from './managed-tools';
 import { existsSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { extname, join } from 'node:path';
+import { extname, join, sep } from 'node:path';
 import { paths } from '../../config/paths';
 import { spawnProcess, spawnProcessSync } from '../../platform/spawn';
 
@@ -25,22 +26,26 @@ export function resolveCodexBin(opts: CodexResolutionOptions = {}): string | nul
   const env = opts.env ?? process.env;
   const root = opts.dataRoot ?? paths.appDir;
   if (env.CODEX_BIN) return existsSync(env.CODEX_BIN) ? env.CODEX_BIN : null;
-  for (const candidate of execCandidates(join(root, 'managed-tools', 'bin'), 'codex', env)) {
-    if (existsSync(candidate)) return candidate;
+  const selected = managedToolSelection(root, 'codex');
+  if (selected.kind === 'active') return selected.executable;
+  if (selected.kind === 'absent') {
+    for (const candidate of execCandidates(join(root, 'managed-tools', 'bin'), 'codex', env)) {
+      if (existsSync(candidate)) return candidate;
+    }
+    const managed = managedCodexBin(join(root, 'codex-cli'));
+    if (managed) return managed;
   }
-  const managed = managedCodexBin(join(root, 'codex-cli'));
-  if (managed) return managed;
   const customContext = opts.home !== undefined || opts.dataRoot !== undefined || opts.env !== undefined;
-  if (!customContext && !opts.force && binCache && existsSync(binCache)) return binCache;
-  const result = locateBin(opts.home ?? homedir(), root, env);
+  if (!customContext && !opts.force && binCache && existsSync(binCache) && (selected.kind === 'absent' || !inLegacyManagedRoot(binCache, root))) return binCache;
+  const result = locateBin(opts.home ?? homedir(), root, env, selected.kind !== 'absent');
   if (!customContext) binCache = result;
   return result;
 }
 
-function locateBin(home: string, root: string, env: NodeJS.ProcessEnv): string | null {
-  const onPath = which('codex', env);
+function locateBin(home: string, root: string, env: NodeJS.ProcessEnv, blockLegacyManaged: boolean): string | null {
+  const onPath = which('codex', env, blockLegacyManaged ? [join(root, 'managed-tools'), join(root, 'codex-cli')] : []);
   if (onPath) return onPath;
-  const directories = [join(root, 'codex-cli', 'node_modules', '.bin')];
+  const directories = blockLegacyManaged ? [] : [join(root, 'codex-cli', 'node_modules', '.bin')];
   if (process.platform === 'darwin') {
     directories.push('/Applications/Codex.app/Contents/Resources', join(home, 'Applications/Codex.app/Contents/Resources'));
   }
@@ -57,6 +62,10 @@ function locateBin(home: string, root: string, env: NodeJS.ProcessEnv): string |
   return null;
 }
 
+function inLegacyManagedRoot(candidate: string, root: string): boolean {
+  return [join(root, 'managed-tools'), join(root, 'codex-cli')].some(managed => candidate === managed || candidate.startsWith(managed + sep));
+}
+
 function execCandidates(dir: string, base: string, env: NodeJS.ProcessEnv): string[] {
   const exact = join(dir, base);
   if (!IS_WIN || extname(base)) return [exact];
@@ -64,15 +73,15 @@ function execCandidates(dir: string, base: string, env: NodeJS.ProcessEnv): stri
   return [exact, ...exts.map(e => join(dir, base + e.toLowerCase()))];
 }
 
-function which(cmd: string, env: NodeJS.ProcessEnv): string | null {
+function which(cmd: string, env: NodeJS.ProcessEnv, blockedRoots: string[]): string | null {
   try {
-    const res = spawnProcessSync(IS_WIN ? 'where' : '/usr/bin/which', [cmd], {
+    const res = spawnProcessSync(IS_WIN ? 'where' : '/usr/bin/which', IS_WIN ? [cmd] : ['-a', cmd], {
       env,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     });
     if (res.status !== 0 || typeof res.stdout !== 'string') return null;
-    const first = res.stdout.split('\n').map(l => l.trim()).find(Boolean);
+    const first = res.stdout.split('\n').map(l => l.trim()).find(candidate => candidate && existsSync(candidate) && !blockedRoots.some(root => candidate === root || candidate.startsWith(root + sep)));
     return first && existsSync(first) ? first : null;
   } catch {
     return null;
