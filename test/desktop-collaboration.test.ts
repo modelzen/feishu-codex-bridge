@@ -2,7 +2,7 @@ import { afterAll, beforeEach, expect, it, vi } from 'vitest';
 import { rm, mkdir, realpath } from 'node:fs/promises';
 import type { AppConfig } from '../src/config/schema';
 import { paths } from '../src/config/paths';
-import { addProject, getProjectByName, removeProject } from '../src/project/registry';
+import { addProject, getProjectByName, removeProject, updateProject } from '../src/project/registry';
 import { getSession, listSessions, upsertSession } from '../src/bot/session-store';
 import { createOrchestrator } from '../src/bot/handle-message';
 import { parseCollaborationRequest, projectRevision } from '../src/admin/collaboration';
@@ -12,7 +12,14 @@ vi.mock('../src/config/paths', async () => {
   const appDir = mkdtempSync(join(tmpdir(), 'desktop-collaboration-'));
   return { paths: { appDir, sessionsFile: join(appDir, 'sessions.json'), projectsFile: join(appDir, 'projects.json'), commentInstructionsFile: join(appDir, 'instructions.md'), commentsRootDir: join(appDir, 'comments'), projectsRootDir: join(appDir, 'projects') } };
 });
-const fixture = vi.hoisted(() => ({ backend: undefined as unknown, leave: vi.fn(), send: vi.fn(async () => ({ messageId: 'om_sent' })), usage: vi.fn(async () => ({ profile: { topInvocations: [], dailyBuckets: [] }, usage: { main: { name: 'main', windows: [] }, extras: [], fetchedAt: 1 } })) }));
+const fixture = vi.hoisted(() => ({ failProjectsWrite: false, backend: undefined as unknown, leave: vi.fn(), send: vi.fn(async () => ({ messageId: 'om_sent' })), usage: vi.fn(async () => ({ profile: { topInvocations: [], dailyBuckets: [] }, usage: { main: { name: 'main', windows: [] }, extras: [], fetchedAt: 1 } })) }));
+vi.mock('node:fs/promises', async original => {
+  const actual = await original<typeof import('node:fs/promises')>();
+  return { ...actual, rename: async (...args: Parameters<typeof actual.rename>) => {
+    if (fixture.failProjectsWrite && String(args[1]).endsWith('/projects.json')) throw new Error('project disk failure');
+    return actual.rename(...args);
+  } };
+});
 vi.mock('../src/agent', async original => ({ ...await original<object>(), createBackend: () => fixture.backend }));
 vi.mock('../src/agent/usage', () => ({ fetchUsageBundle: fixture.usage }));
 vi.mock('../src/project/group-ops', () => ({ leaveChat: fixture.leave, transferOwnership: vi.fn() }));
@@ -29,6 +36,7 @@ function backend() {
 function orchestrator(channel: unknown = { send: fixture.send }) { return createOrchestrator(channel as never, cfg, paths.appDir); }
 beforeEach(async () => {
   await rm(paths.projectsFile, { force: true }); await rm(paths.sessionsFile, { force: true });
+  fixture.failProjectsWrite = false;
   fixture.leave.mockReset(); fixture.send.mockClear();
   await addProject({ name: 'demo', chatId: 'oc_demo', cwd: paths.appDir, kind: 'single', blank: false, origin: 'joined', createdAt: 1, backend: 'codex-appserver' });
   await upsertSession({ threadId: 'oc_demo', chatId: 'oc_demo', cwd: paths.appDir, sessionId: 'old', backend: 'codex-appserver', summary: 'old', createdAt: 1, updatedAt: 1 });
@@ -139,4 +147,81 @@ it('retains bound history when the backend history source is unavailable', async
   const app = orchestrator();
   try { expect(await app.collaboration({ action: 'history', ...target })).toMatchObject({ sessions: [{ threadId: 'oc_demo' }], threads: [], threadsError: 'backend offline' }); }
   finally { await app.shutdown(); }
+});
+
+function incoming(threadId?: string) {
+  return { messageId: `message-${Date.now()}-${Math.random()}`, chatId: target.chatId, chatType: 'group' as const, threadId,
+    content: 'hello', senderId: 'ou_owner', senderName: 'Owner', mentionedBot: true, createTime: Date.now(), rawContentType: 'text', resources: [], mentions: [], mentionAll: false };
+}
+it('restores live bindings when the project commit fails after archiving', async () => {
+  backend(); const app = orchestrator();
+  const expectedRevision = projectRevision((await getProjectByName('demo'))!);
+  try {
+    fixture.failProjectsWrite = true;
+    await expect(app.collaboration({ action: 'editProject', ...target, expectedRevision, kind: 'multi' })).rejects.toThrow('project disk failure');
+    expect(await getProjectByName('demo')).toMatchObject({ kind: 'single' });
+    expect(await getSession('oc_demo')).toMatchObject({ sessionId: 'old' });
+    expect((await listSessions())[0]?.detached).not.toBe(true);
+  } finally { fixture.failProjectsWrite = false; await app.shutdown(); }
+});
+it('fences detached topic preparation against directory, disable and remove mutations', async () => {
+  const be = backend();
+  await updateProject('demo', { kind: 'multi' });
+  let rejectStart!: (error: Error) => void;
+  be.startThread.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectStart = reject; }));
+  const app = orchestrator();
+  try {
+    await app.onMessage(incoming());
+    await vi.waitFor(() => expect(be.startThread).toHaveBeenCalledOnce());
+    const expectedRevision = projectRevision((await getProjectByName('demo'))!);
+    await expect(app.collaboration({ action: 'editProject', ...target, expectedRevision, directory: paths.appDir })).rejects.toThrow('正在执行');
+    await expect(app.collaboration({ action: 'editProject', ...target, expectedRevision, enabled: false })).rejects.toThrow('正在执行');
+    await expect(app.collaboration({ action: 'removeProject', ...target, expectedRevision })).rejects.toThrow('正在执行');
+    rejectStart(new Error('controlled start failure'));
+    await vi.waitFor(() => expect(fixture.send).toHaveBeenCalled());
+    await vi.waitFor(async () => expect(await app.collaboration({ action: 'editProject', ...target, expectedRevision, enabled: false })).toHaveProperty('ok', true));
+  } finally { await app.shutdown(); }
+});
+it('fences visible topic replies until resume owns the resolved topic key', async () => {
+  const be = backend(); await updateProject('demo', { kind: 'multi' });
+  let resolveTopic!: (value: unknown) => void;
+  const get = vi.fn(() => new Promise(resolve => { resolveTopic = resolve; }));
+  const app = orchestrator({ send: fixture.send, rawClient: { im: { v1: { message: { get } } } } });
+  try {
+    const resuming = app.collaboration({ action: 'resume', ...target, sessionId: 'past', backend: be.id });
+    await vi.waitFor(() => expect(get).toHaveBeenCalledOnce());
+    await app.onMessage(incoming('omt_published'));
+    expect(be.startThread).not.toHaveBeenCalled();
+    expect(be.resumeThread).not.toHaveBeenCalled();
+    resolveTopic({ data: { items: [{ thread_id: 'omt_published' }] } });
+    await expect(resuming).resolves.toMatchObject({ threadId: 'omt_published' });
+    expect(await getSession('omt_published')).toMatchObject({ sessionId: 'past' });
+    expect(be.thread.close).not.toHaveBeenCalled();
+  } finally { await app.shutdown(); }
+});
+it('closes prepared backend work when a concurrent settings writer changes the project revision', async () => {
+  const be = backend(); await updateProject('demo', { kind: 'multi' });
+  let release!: (value: typeof be.thread) => void;
+  be.startThread.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+  const app = orchestrator();
+  try {
+    await app.onMessage(incoming());
+    await vi.waitFor(() => expect(be.startThread).toHaveBeenCalledOnce());
+    await updateProject('demo', { enabled: false });
+    release(be.thread);
+    await vi.waitFor(() => expect(be.thread.close).toHaveBeenCalledOnce());
+    expect(await listSessions()).toMatchObject([{ sessionId: 'old' }]);
+    expect(fixture.send).not.toHaveBeenCalled();
+  } finally { await app.shutdown(); }
+});
+it('recovers backend history after a kind change archives its old topic binding', async () => {
+  const be = backend(); await updateProject('demo', { kind: 'multi' });
+  const app = orchestrator();
+  try {
+    const expectedRevision = projectRevision((await getProjectByName('demo'))!);
+    await app.collaboration({ action: 'editProject', ...target, expectedRevision, kind: 'single' });
+    expect(await app.collaboration({ action: 'history', ...target })).toMatchObject({ sessions: [{ detached: true }], threads: [{ sessionId: 'past' }] });
+    await app.collaboration({ action: 'resume', ...target, backend: be.id, sessionId: 'past' });
+    expect(await getSession('oc_demo')).toMatchObject({ sessionId: 'past' });
+  } finally { await app.shutdown(); }
 });

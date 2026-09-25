@@ -183,11 +183,18 @@ export async function getSession(threadId: string): Promise<SessionRecord | unde
   return (await read()).sessions.find((s) => s.threadId === threadId && !s.detached);
 }
 
-export async function detachSessionsForChat(chatId: string): Promise<void> {
+export async function detachSessionsForChat<T>(chatId: string, commit: () => Promise<T>): Promise<T> {
   return withLock(async () => {
     const store = await read();
+    const original = structuredClone(store);
     for (const session of store.sessions) if (session.chatId === chatId) session.detached = true;
     await write(store);
+    try {
+      return await commit();
+    } catch (error) {
+      await write(original);
+      throw error;
+    }
   });
 }
 

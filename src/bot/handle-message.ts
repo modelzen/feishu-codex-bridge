@@ -904,6 +904,8 @@ export function createOrchestrator(
 
   // ── inbound messages ──────────────────────────────────────────────
   const intakeChats = new Map<string, number>();
+  const pendingTopics = new Map<string, number>();
+  const resumePublications = new Set<string>();
   const onMessage = async (msg: NormalizedMessage): Promise<void> => {
     intakeChats.set(msg.chatId, (intakeChats.get(msg.chatId) ?? 0) + 1);
     try { await handleMessage(msg); } finally {
@@ -939,7 +941,11 @@ export function createOrchestrator(
     }
 
     const project = await getProjectByChatId(msg.chatId);
-    if (project?.enabled === false || projectMutations.has(msg.chatId)) return;
+    if (resumePublications.has(msg.chatId)) {
+      await channel.send(msg.chatId, { markdown: '正在恢复历史会话，请完成后重发此消息。' }, { replyTo: msg.messageId });
+      return;
+    }
+    if (project?.enabled === false || projectMutations.has(msg.chatId) || resumePublications.has(msg.chatId)) return;
     // @门：没 @ 时只在「项目群 + 免@ 适用」才响应。免@默认开,但 multi 仅话题内、
     // single 整群;非项目群一律不响应非 @ 消息。
     if (!msg.mentionedBot && !(project && shouldRespondWithoutMention(project, msg))) return;
@@ -1269,7 +1275,7 @@ export function createOrchestrator(
    * `flat` = reply by quoting (no reply_in_thread / topic), for single groups.
    */
   function handleTurn(msg: NormalizedMessage, text: string, sessionKey: string, flat: boolean, project: Project | undefined, perm: TurnPerm): Promise<void> {
-    if (project?.enabled === false || projectMutations.has(msg.chatId)) return Promise.resolve();
+    if (project?.enabled === false || projectMutations.has(msg.chatId) || resumePublications.has(msg.chatId)) return Promise.resolve();
     const owner = active.get(sessionKey);
     return orderTurns(sessionKey, async () => {
       if (owner?.intakeCancelled) {
@@ -1409,7 +1415,7 @@ export function createOrchestrator(
     const titleSource: SessionTitleSource = goal
       ? { text, rawContentType: 'text' }
       : sessionTitleSourceFromMessage(msg, summaryText ?? text);
-    if (project?.enabled === false || projectMutations.has(msg.chatId)) return;
+    if (project?.enabled === false || projectMutations.has(msg.chatId) || resumePublications.has(msg.chatId)) return;
     const existing = active.get(sessionKey);
     if (existing) {
       // A goal can't co-run with (or queue behind) a turn on the same session —
@@ -1747,6 +1753,8 @@ export function createOrchestrator(
    * Detached — onMessage must return fast (see {@link handleTurn}); a new
    * topic has a unique reply target so no same-topic reservation is needed. */
   function startTopicDirectly(msg: NormalizedMessage, text: string, project?: Project, goal?: boolean): void {
+    if (resumePublications.has(msg.chatId) || projectMutations.has(msg.chatId)) return;
+    pendingTopics.set(msg.chatId, (pendingTopics.get(msg.chatId) ?? 0) + 1);
     const titleSource: SessionTitleSource = goal
       ? { text, rawContentType: 'text' }
       : sessionTitleSourceFromMessage(msg, text);
@@ -1800,8 +1808,8 @@ export function createOrchestrator(
         voiceReply = ingested.voice;
       } catch (err) {
         reaction?.done();
-        // 失败路互不拖死：threadP 若已成功则回收孤儿进程，若失败吞掉其 rejection。
-        void threadP.then((s) => s.thread.close()).catch(() => undefined);
+        // Keep the project reserved until any delayed backend process has closed.
+        await threadP.then((s) => s.thread.close()).catch(() => undefined);
         log.fail('card', err, { phase: 'start-topic' });
         await channel
           .send(msg.chatId, { markdown: `❌ 启动失败：${err instanceof Error ? err.message : String(err)}` }, { replyTo: msg.messageId })
@@ -1810,6 +1818,14 @@ export function createOrchestrator(
       }
       log.info('card', 'start', { project: project?.name ?? '(unregistered)', model, effort, images: images?.length ?? 0, goal: Boolean(goal) });
       const titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource);
+      if (project) {
+        const current = await getProjectByChatId(project.chatId);
+        if (!current || current.enabled === false || projectRevision(current) !== projectRevision(project)) {
+          await thread.close();
+          reaction?.done();
+          return;
+        }
+      }
       const launchOpts: LaunchOpts = {
         chatId: msg.chatId,
         replyTo: msg.messageId,
@@ -1838,7 +1854,10 @@ export function createOrchestrator(
           reaction,
           () => reaction?.done(), // topic created → ✅ DONE (don't wait for the reply)
         ));
-    }).catch((err) => log.fail('intake', err));
+    }).catch((err) => log.fail('intake', err)).finally(() => {
+      const remaining = (pendingTopics.get(msg.chatId) ?? 1) - 1;
+      if (remaining) pendingTopics.set(msg.chatId, remaining); else pendingTopics.delete(msg.chatId);
+    });
   }
 
   /** Group @bot /resume: post the history picker for this project's cwd. Owner-only
@@ -3940,7 +3959,7 @@ export function createOrchestrator(
     }
     if (request.action === 'editProject' || request.action === 'removeProject') {
       if (projectRevision(project) !== request.expectedRevision) throw new AdminWriteError('项目设置已改变，请刷新后重试');
-      if (projectMutations.has(project.chatId) || active.size > 0 || intakeChats.has(project.chatId)) throw new AdminWriteError('Agent 正在执行任务，请结束后修改项目');
+      if (projectMutations.has(project.chatId) || active.size > 0 || intakeChats.has(project.chatId) || pendingTopics.has(project.chatId)) throw new AdminWriteError('Agent 正在执行任务，请结束后修改项目');
       projectMutations.add(project.chatId);
       try {
         const current = await getProjectByName(project.name);
@@ -3968,11 +3987,12 @@ export function createOrchestrator(
         }
         if (request.kind !== undefined) patch.kind = request.kind;
         if (request.enabled !== undefined) patch.enabled = request.enabled;
-        const updated = await mutateProject(project.name, async latest => {
+        const commit = () => mutateProject(project.name, latest => {
           if (projectRevision(latest) !== request.expectedRevision) throw new AdminWriteError('项目设置已改变，请刷新后重试');
-          if ((patch.cwd !== undefined && patch.cwd !== project.cwd) || (patch.kind !== undefined && patch.kind !== (project.kind ?? 'multi'))) await detachSessionsForChat(project.chatId);
           Object.assign(latest, patch);
         });
+        const archive = (patch.cwd !== undefined && patch.cwd !== project.cwd) || (patch.kind !== undefined && patch.kind !== (project.kind ?? 'multi'));
+        const updated = archive ? await detachSessionsForChat(project.chatId, commit) : await commit();
         for (const rec of records) {
           const thread = sessions.get(rec.threadId); sessions.delete(rec.threadId);
           if (thread) await thread.close().catch(error => log.fail('desktop', error, { phase: 'project-session-close' }));
@@ -3989,9 +4009,11 @@ export function createOrchestrator(
       const current = await getProjectByName(project.name);
       if (!current || projectMutations.has(project.chatId) || projectRevision(current) !== projectRevision(project)) throw new AdminWriteError('项目已改变，请刷新后重试');
       const key = project.kind === 'single' ? perm.sessionKey : `desktop-resume:${project.chatId}`;
-      if (active.has(key)) throw new AdminWriteError('会话正在运行');
+      if (active.has(key) || intakeChats.has(project.chatId) || pendingTopics.has(project.chatId)) throw new AdminWriteError('会话正在运行');
       const reserved: ActiveState = { queue: [], requesterOpenId: owner };
       active.set(key, reserved);
+      if (project.kind !== 'single') resumePublications.add(project.chatId);
+      let publishedKey: string | undefined;
       try {
         const history = await be.readHistory(project.cwd, request.sessionId);
         let threadId = key;
@@ -4003,6 +4025,9 @@ export function createOrchestrator(
           const tid = await getThreadId(channel, sent.messageId, 4);
           if (!tid) throw new AdminWriteError('已创建话题，但飞书尚未返回话题标识；会话未绑定');
           threadId = turnSession(tid, project, owner).sessionKey;
+          if (active.has(threadId)) throw new AdminWriteError('新话题已有任务，会话未切换');
+          active.set(threadId, reserved);
+          publishedKey = threadId;
         }
         const old = sessions.get(threadId); sessions.delete(threadId); if (old) await old.close();
         lastUsage.delete(threadId);
@@ -4010,6 +4035,8 @@ export function createOrchestrator(
         await upsertSession({ threadId, chatId: project.chatId, cwd: project.cwd, sessionId: request.sessionId, backend: be.id, summary: history.name || history.preview || '(恢复会话)', createdAt: now, updatedAt: now });
         return { ok: true, threadId };
       } finally {
+        resumePublications.delete(project.chatId);
+        if (publishedKey && active.get(publishedKey) === reserved) active.delete(publishedKey);
         if (active.get(key) === reserved) active.delete(key);
         if (reserved.queue.length) await channel.send(project.chatId, { markdown: `切回期间收到的 ${reserved.queue.length} 条消息未执行，请重发。` });
       }
