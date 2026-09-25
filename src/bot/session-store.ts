@@ -13,6 +13,7 @@ import { DEFAULT_BACKEND_ID, type ReasoningEffort } from '../agent/types';
 export interface SessionRecord {
   /** Feishu topic thread_id (the key) */
   threadId: string;
+  detached?: boolean;
   chatId: string;
   cwd: string;
   /** backend session id（codex 的 thread id / claude 的 session UUID）—— pass to
@@ -179,7 +180,15 @@ export async function listSessions(): Promise<SessionRecord[]> {
 }
 
 export async function getSession(threadId: string): Promise<SessionRecord | undefined> {
-  return (await read()).sessions.find((s) => s.threadId === threadId);
+  return (await read()).sessions.find((s) => s.threadId === threadId && !s.detached);
+}
+
+export async function detachSessionsForChat(chatId: string): Promise<void> {
+  return withLock(async () => {
+    const store = await read();
+    for (const session of store.sessions) if (session.chatId === chatId) session.detached = true;
+    await write(store);
+  });
 }
 
 /** Insert or replace a session by threadId. */

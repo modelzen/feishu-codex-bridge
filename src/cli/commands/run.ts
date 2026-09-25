@@ -172,6 +172,7 @@ async function runSingle(botName: string | undefined, control: ShutdownControl, 
         if (op.kind === 'status') {
           return { connection: handle.channel.getConnectionStatus?.()?.state ?? 'unknown' };
         }
+        if (op.kind === 'collaboration') return handle.collaboration(op.request);
         if (op.kind === 'joinedGroups' || op.kind === 'bindGroup') return handle.adminGroups(op);
         if (op.kind === 'settingsRead') return handle.settings.read(op.scope);
         if (op.kind === 'settingsModels') return handle.settings.models(op.query);
@@ -188,6 +189,10 @@ async function runSingle(botName: string | undefined, control: ShutdownControl, 
     const startedAt = Date.now();
     webConsole = await mountWebConsole(
       createAdminService({
+        executeCollaboration: async (botId, request) => {
+          if (botId !== ownAppId) throw new AdminWriteError('机器人不在本进程的活跃集里');
+          return handle.collaboration(request);
+        },
         executeGroups: async (botId, op) => {
           if (botId !== ownAppId) throw new AdminWriteError('机器人不在本进程的活跃集里');
           return handle.adminGroups(op);

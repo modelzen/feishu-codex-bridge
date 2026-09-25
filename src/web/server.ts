@@ -1,3 +1,4 @@
+import { parseCollaborationRequest } from '../admin/collaboration';
 import { handleSettingsRoute } from './settings-routes';
 import { GroupUpstreamError, InvalidGroupInput, parseBindGroupInput } from '../admin/groups';
 import { CodexSetupConflict } from '../agent/codex-appserver/setup';
@@ -190,6 +191,23 @@ export function createWebServer(opts: WebServerOptions): WebServer {
         'Cache-Control': 'public, max-age=31536000, immutable',
       });
       res.end(LOGO_PNG);
+      return;
+    }
+
+    const collaborationRoute = /^\/api\/bots\/([^/]+)\/collaboration$/.exec(pathName);
+    if (collaborationRoute) {
+      try {
+        if (req.method !== 'POST') { sendJson(res, 405, { error: 'method_not_allowed' }); return; }
+        const appId = decodeURIComponent(collaborationRoute[1]!);
+        if (!/^cli_[\w-]{1,200}$/.test(appId)) throw new InvalidGroupInput('机器人标识无效');
+        const bot = (await opts.service.listBots()).find(item => item.appId === appId);
+        if (!bot?.active || !bot.running) throw new AdminWriteError('机器人未启用或尚未运行');
+        if (!opts.service.collaboration) throw new NotWiredYetError('协作管理');
+        let body: Record<string, unknown>;
+        try { body = await readJsonBody(req); } catch { throw new InvalidGroupInput('协作请求不是有效 JSON'); }
+        const request = parseCollaborationRequest(body);
+        sendJson(res, 200, await opts.service.collaboration(appId, request));
+      } catch (error) { companionError(res, error); }
       return;
     }
 

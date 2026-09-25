@@ -8,6 +8,9 @@ import type { PermissionMode, ReasoningEffort } from '../agent/types';
 export interface Project {
   /** unique project name (also the group name) */
   name: string;
+  enabled?: boolean;
+  creationRequestId?: string;
+  creationRequestSignature?: string;
   /** the bound Feishu group chat_id (oc_xxx) */
   chatId: string;
   /** absolute working directory codex runs in for this project */
@@ -221,11 +224,12 @@ export async function updateProject(
 }
 
 /** Remove (unbind) a project by name. Returns the removed entry, if any. */
-export async function removeProject(name: string): Promise<Project | undefined> {
+export async function removeProject(name: string, beforeRemove?: (project: Project) => void): Promise<Project | undefined> {
   return withLock(async () => {
     const projects = await read();
     const idx = projects.findIndex((p) => p.name === name);
     if (idx === -1) return undefined;
+    beforeRemove?.(projects[idx]!);
     const [removed] = projects.splice(idx, 1);
     await write(projects);
     return removed;

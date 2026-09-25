@@ -1,3 +1,7 @@
+import { realpath, stat } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { projectRevision, projectView, type CollaborationRequest } from '../admin/collaboration';
+import { AdminWriteError } from '../admin/ops';
 import { createSettingsOwner, settingsRevision } from '../admin/settings';
 import type { HostSettings } from '../admin/settings-types';
 import type { AdminWriteResult } from '../admin/ops';
@@ -190,6 +194,7 @@ import {
   getProjectByChatId,
   getProjectByName,
   listProjects,
+  mutateProject,
   removeProject,
   turnTier,
   updateProject,
@@ -201,6 +206,7 @@ import { refreshBranch } from '../project/announcement';
 import { leaveChat, transferOwnership } from '../project/group-ops';
 import {
   clearSessionTitleJobKey,
+  detachSessionsForChat,
   getSession,
   listSessions,
   patchSession,
@@ -505,6 +511,7 @@ interface RunReaction {
 }
 
 export interface Orchestrator {
+  collaboration: (request: CollaborationRequest) => Promise<unknown>;
   onMessage: (msg: NormalizedMessage) => Promise<void>;
   /** `comment` event handler: @bot in a cloud-doc comment → reply in-thread. */
   onComment: (evt: CommentEvent) => Promise<void>;
@@ -896,7 +903,15 @@ export function createOrchestrator(
   }
 
   // ── inbound messages ──────────────────────────────────────────────
+  const intakeChats = new Map<string, number>();
   const onMessage = async (msg: NormalizedMessage): Promise<void> => {
+    intakeChats.set(msg.chatId, (intakeChats.get(msg.chatId) ?? 0) + 1);
+    try { await handleMessage(msg); } finally {
+      const remaining = (intakeChats.get(msg.chatId) ?? 1) - 1;
+      if (remaining) intakeChats.set(msg.chatId, remaining); else intakeChats.delete(msg.chatId);
+    }
+  };
+  const handleMessage = async (msg: NormalizedMessage): Promise<void> => {
     if (seenInbound.seen(msg.messageId)) {
       log.info('intake', 'reject', { reason: 'duplicate', msgId: msg.messageId });
       return;
@@ -924,6 +939,7 @@ export function createOrchestrator(
     }
 
     const project = await getProjectByChatId(msg.chatId);
+    if (project?.enabled === false || projectMutations.has(msg.chatId)) return;
     // @门：没 @ 时只在「项目群 + 免@ 适用」才响应。免@默认开,但 multi 仅话题内、
     // single 整群;非项目群一律不响应非 @ 消息。
     if (!msg.mentionedBot && !(project && shouldRespondWithoutMention(project, msg))) return;
@@ -1253,6 +1269,7 @@ export function createOrchestrator(
    * `flat` = reply by quoting (no reply_in_thread / topic), for single groups.
    */
   function handleTurn(msg: NormalizedMessage, text: string, sessionKey: string, flat: boolean, project: Project | undefined, perm: TurnPerm): Promise<void> {
+    if (project?.enabled === false || projectMutations.has(msg.chatId)) return Promise.resolve();
     const owner = active.get(sessionKey);
     return orderTurns(sessionKey, async () => {
       if (owner?.intakeCancelled) {
@@ -1392,6 +1409,7 @@ export function createOrchestrator(
     const titleSource: SessionTitleSource = goal
       ? { text, rawContentType: 'text' }
       : sessionTitleSourceFromMessage(msg, summaryText ?? text);
+    if (project?.enabled === false || projectMutations.has(msg.chatId)) return;
     const existing = active.get(sessionKey);
     if (existing) {
       // A goal can't co-run with (or queue behind) a turn on the same session —
@@ -1665,6 +1683,7 @@ export function createOrchestrator(
     // later must not strand existing sessions on the wrong runtime; the project
     // is still consulted for cwd / tier defaults on the recreate path below.
     const project = await getProjectByChatId(chatId);
+    if (project && rec.cwd !== project.cwd) return { thread: undefined, recreated: true };
     const be = backendFor(rec.backend);
     try {
       const resumed = await be.resumeThread({
@@ -3868,6 +3887,192 @@ export function createOrchestrator(
     }
   }
 
+  const projectMutations = new Set<string>();
+  const runIds = new WeakMap<ActiveState, { run: AgentRun | undefined; id: string }>();
+  let createChain: Promise<unknown> = Promise.resolve();
+  const createRequests = new Map<string, { signature: string; result: Promise<unknown> }>();
+  const runId = (state: ActiveState): string => {
+    let identity = runIds.get(state);
+    if (!identity || identity.run !== state.run) { identity = { run: state.run, id: randomUUID() }; runIds.set(state, identity); }
+    return identity.id;
+  };
+  async function collaboration(request: CollaborationRequest): Promise<unknown> {
+    const owner = resolveOwner(cfg);
+    if (!owner) throw new AdminWriteError('请先配置此 Agent 的飞书管理员');
+    if (request.action === 'usage') return { data: await fetchUsageBundle(request.force) };
+    if (request.action === 'createProject') {
+      const signature = JSON.stringify(request);
+      const persisted = (await listProjects()).find(item => item.creationRequestId === request.requestId);
+      if (persisted) {
+        if (persisted.creationRequestSignature !== signature) throw new AdminWriteError('创建请求标识已用于其他参数');
+        return { ok: true, project: projectView(persisted) };
+      }
+      const prior = createRequests.get(request.requestId);
+      if (prior) {
+        if (prior.signature !== signature) throw new AdminWriteError('创建请求标识已用于其他参数');
+        return prior.result;
+      }
+      const result = createChain.then(async () => {
+        const directory = request.directory === undefined ? undefined : await realpath(request.directory);
+        if (directory !== undefined && !(await stat(directory)).isDirectory()) throw new AdminWriteError('所选文件夹不是目录');
+        const project = await createProject(channel, { requestId: request.requestId, requestSignature: signature, name: request.name, ownerOpenId: owner, existingPath: directory, projectsRootDir: cfg.preferences?.projectsRootDir, kind: request.kind, backend: request.backend, mode: bindModeFor(request.backend) });
+        return { ok: true, project: projectView(project) };
+      });
+      createChain = result.catch(() => undefined);
+      void result.then(() => createRequests.delete(request.requestId), () => createRequests.delete(request.requestId));
+      createRequests.set(request.requestId, { signature, result });
+      return result;
+    }
+    const project = await getProjectByName(request.projectName);
+    if (!project || project.chatId !== request.chatId) throw new AdminWriteError('项目已改变，请刷新后重试');
+    if (request.action === 'project') return { project: projectView(project) };
+    if (request.action === 'shareUsage') {
+      const sent = await sendManagedCard(channel, project.chatId, buildUsageShareCard(await fetchUsageBundle()));
+      return { messageId: sent.messageId };
+    }
+    const records = (await listSessions()).filter(record => record.chatId === project.chatId);
+    const currentProject = await getProjectByName(project.name);
+    if (!currentProject || projectRevision(currentProject) !== projectRevision(project)) throw new AdminWriteError('项目已改变，请刷新后重试');
+    const be = backendFor(project.backend);
+    if (request.action === 'history') {
+      try { return { sessions: records, threads: await be.listThreads(project.cwd), backend: be.id }; }
+      catch (error) { return { sessions: records, threads: [], backend: be.id, threadsError: error instanceof Error ? error.message : '无法读取后端历史' }; }
+    }
+    if (request.action === 'editProject' || request.action === 'removeProject') {
+      if (projectRevision(project) !== request.expectedRevision) throw new AdminWriteError('项目设置已改变，请刷新后重试');
+      if (projectMutations.has(project.chatId) || active.size > 0 || intakeChats.has(project.chatId)) throw new AdminWriteError('Agent 正在执行任务，请结束后修改项目');
+      projectMutations.add(project.chatId);
+      try {
+        const current = await getProjectByName(project.name);
+        if (!current || projectRevision(current) !== request.expectedRevision) throw new AdminWriteError('项目设置已改变，请刷新后重试');
+        if (request.action === 'removeProject') {
+          const removed = await removeProject(project.name, latest => {
+            if (projectRevision(latest) !== request.expectedRevision) throw new AdminWriteError('项目设置已改变，请刷新后重试');
+          });
+          if (!removed) throw new AdminWriteError('项目已移除，请刷新');
+          for (const rec of records) { const thread = sessions.get(rec.threadId); sessions.delete(rec.threadId); if (thread) await thread.close().catch(error => log.fail('desktop', error, { phase: 'project-session-close' })); }
+          let groupEffect: 'left' | 'transferred' | 'failed';
+          let warning: string | undefined;
+          try {
+            if (project.origin === 'joined') { await leaveChat(channel, project.chatId); groupEffect = 'left'; }
+            else { await transferOwnership(channel, project.chatId, owner); groupEffect = 'transferred'; }
+          } catch (error) { groupEffect = 'failed'; warning = error instanceof Error ? error.message : '飞书群操作失败'; }
+          return { ok: true, groupEffect, ...(warning ? { warning } : {}) };
+        }
+        const patch: Partial<Project> = {};
+        if (request.directory !== undefined) {
+          const cwd = await realpath(request.directory);
+          if (!(await stat(cwd)).isDirectory()) throw new AdminWriteError('所选文件夹不是目录');
+          patch.cwd = cwd;
+          if (cwd !== project.cwd) patch.blank = false;
+        }
+        if (request.kind !== undefined) patch.kind = request.kind;
+        if (request.enabled !== undefined) patch.enabled = request.enabled;
+        const updated = await mutateProject(project.name, async latest => {
+          if (projectRevision(latest) !== request.expectedRevision) throw new AdminWriteError('项目设置已改变，请刷新后重试');
+          if ((patch.cwd !== undefined && patch.cwd !== project.cwd) || (patch.kind !== undefined && patch.kind !== (project.kind ?? 'multi'))) await detachSessionsForChat(project.chatId);
+          Object.assign(latest, patch);
+        });
+        for (const rec of records) {
+          const thread = sessions.get(rec.threadId); sessions.delete(rec.threadId);
+          if (thread) await thread.close().catch(error => log.fail('desktop', error, { phase: 'project-session-close' }));
+        }
+        return { ok: true, project: projectView(updated) };
+      } finally { projectMutations.delete(project.chatId); }
+    }
+    if (projectMutations.has(project.chatId) || project.enabled === false) throw new AdminWriteError('项目已停用或正在修改');
+    const perm = turnSession(project.chatId, project, owner);
+    if (request.action === 'resume') {
+      if (request.backend !== be.id) throw new AdminWriteError('项目后端已改变');
+      const available = await be.listThreads(project.cwd);
+      if (!available.some(item => item.sessionId === request.sessionId)) throw new AdminWriteError('历史会话不属于当前项目');
+      const current = await getProjectByName(project.name);
+      if (!current || projectMutations.has(project.chatId) || projectRevision(current) !== projectRevision(project)) throw new AdminWriteError('项目已改变，请刷新后重试');
+      const key = project.kind === 'single' ? perm.sessionKey : `desktop-resume:${project.chatId}`;
+      if (active.has(key)) throw new AdminWriteError('会话正在运行');
+      const reserved: ActiveState = { queue: [], requesterOpenId: owner };
+      active.set(key, reserved);
+      try {
+        const history = await be.readHistory(project.cwd, request.sessionId);
+        let threadId = key;
+        if (project.kind === 'single') {
+          await sendManagedCard(channel, project.chatId, buildHistoryCard({ cwd: project.cwd, projectName: project.name, history }));
+        } else {
+          const root = await channel.send(project.chatId, { markdown: '从桌面端恢复历史会话' });
+          const sent = await sendManagedCard(channel, project.chatId, buildHistoryCard({ cwd: project.cwd, projectName: project.name, history }), root.messageId, true);
+          const tid = await getThreadId(channel, sent.messageId, 4);
+          if (!tid) throw new AdminWriteError('已创建话题，但飞书尚未返回话题标识；会话未绑定');
+          threadId = turnSession(tid, project, owner).sessionKey;
+        }
+        const old = sessions.get(threadId); sessions.delete(threadId); if (old) await old.close();
+        lastUsage.delete(threadId);
+        const now = Date.now();
+        await upsertSession({ threadId, chatId: project.chatId, cwd: project.cwd, sessionId: request.sessionId, backend: be.id, summary: history.name || history.preview || '(恢复会话)', createdAt: now, updatedAt: now });
+        return { ok: true, threadId };
+      } finally {
+        if (active.get(key) === reserved) active.delete(key);
+        if (reserved.queue.length) await channel.send(project.chatId, { markdown: `切回期间收到的 ${reserved.queue.length} 条消息未执行，请重发。` });
+      }
+    }
+    const record = records.find(item => item.threadId === request.threadId);
+    if (!record || record.detached) throw new AdminWriteError('此会话已归档或不属于当前项目，请开始新会话');
+    const key = record.threadId;
+    const state = active.get(key);
+    if (request.action === 'context') return { threadId: key, usage: lastUsage.get(key) ?? null, run: state ? { id: runId(state), goal: state.isGoal === true, canStop: Boolean(state.interrupt), canEndGoal: Boolean(state.endGoal), canRemind: state.requesterOpenId === owner && shouldShowCompletionReminderButton(cfg) && !state.isGoal, reminderRequested: state.completionReminderRequested === true } : null };
+    if (request.action === 'stop' || request.action === 'endGoal' || request.action === 'reminder') {
+      if (!state || runId(state) !== request.runId) throw new AdminWriteError('原任务已经结束，请刷新');
+      if (request.action === 'stop') { if (!state.interrupt) throw new AdminWriteError('任务正在准备，请稍后停止'); state.interrupt(); }
+      else if (request.action === 'endGoal') { if (!state.endGoal) throw new AdminWriteError('当前不是目标任务'); state.endGoal(); }
+      else {
+        if (state.requesterOpenId !== owner || !shouldShowCompletionReminderButton(cfg) || state.isGoal) throw new AdminWriteError('仅任务发起人可设置本次完成提醒，且需开启手动提醒模式');
+        state.completionReminderRequested = request.requested;
+        refreshCompletionReminderCards();
+      }
+      return { ok: true };
+    }
+    if (state) throw new AdminWriteError('会话正在运行，请完成后重试');
+    if (key.endsWith('#guest')) throw new AdminWriteError('请在管理员会话中操作，普通用户上下文保持独立');
+    if (record.cwd !== project.cwd) throw new AdminWriteError('此历史会话使用原项目目录，请选择新会话');
+    const sessionBackend = backendFor(record.backend);
+    if (request.action === 'startGoal' && sessionBackend.capabilities?.goal === false) throw new AdminWriteError('当前后端不支持自主目标');
+    if (request.action === 'compact' && sessionBackend.capabilities?.compact === false) throw new AdminWriteError('当前后端不支持手动压缩');
+    const reserved: ActiveState = { queue: [], requesterOpenId: owner };
+    active.set(key, reserved);
+    let launched = false;
+    try {
+      if (request.action === 'clear') {
+        if (project.kind !== 'single' || key !== perm.sessionKey) throw new AdminWriteError('只有单会话群可以清空当前上下文');
+        const fresh = await sessionBackend.startThread({ cwd: project.cwd, model: record.model, effort: record.effort, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
+        const now = Date.now();
+        try { await upsertSession({ ...record, sessionId: fresh.sessionId, summary: '(新会话)', createdAt: now, updatedAt: now }); }
+        catch (error) { await fresh.close(); throw error; }
+        const old = sessions.get(key); if (old) await old.close();
+        trackSession(key, fresh); lastUsage.delete(key);
+        return { ok: true, threadId: key };
+      }
+      const { thread } = await resolveThread(key, project.chatId, perm);
+      if (!thread) throw new AdminWriteError('会话尚未开始');
+      if (request.action === 'compact') {
+        const result = await thread.compact();
+        if (result.usage) lastUsage.set(key, { used: result.usage.usedTokens, window: result.usage.contextWindow }); else lastUsage.delete(key);
+        return { ok: true, threadId: key };
+      }
+      let replyTo: string | undefined;
+      if (project.kind !== 'single') {
+        const messages = await channel.rawClient.im.v1.message.list({ params: { container_id_type: 'thread', container_id: key.replace(/#(admin|guest)$/, ''), page_size: 1 } });
+        replyTo = messages.data?.items?.[0]?.message_id;
+        if (messages.code !== 0 || !replyTo) throw new AdminWriteError('无法定位原飞书话题，请在飞书确认话题仍然存在');
+      }
+      const root = await channel.send(project.chatId, { markdown: `桌面端启动目标：${request.objective}` }, replyTo ? { replyTo, replyInThread: true } : undefined);
+      launched = true;
+      void trackRun(launchGoalRun({ chatId: project.chatId, replyTo: root.messageId, thread, firstText: request.objective, knownThreadId: key, cwd: project.cwd, mode: perm.mode, model: record.model, effort: record.effort, flat: project.kind === 'single', roleSuffix: perm.roleSuffix, backendId: sessionBackend.id, requesterOpenId: owner, titleSource: { text: request.objective, rawContentType: 'text' } })).catch(error => log.fail('desktop', error));
+      return { ok: true, threadId: key };
+    } finally {
+      if (!launched && active.get(key) === reserved) active.delete(key);
+      if (!launched && reserved.queue.length) await channel.send(project.chatId, { markdown: `操作期间收到的 ${reserved.queue.length} 条消息未执行，请重发。` });
+    }
+  }
+
   // ── shared run loop ───────────────────────────────────────────────
   async function sendCompletionReminder(input: CompletionReminderReplyInput): Promise<void> {
     await sendCompletionReminderReply({ channel, cfg, dedupe: completionReminderSent }, input);
@@ -5538,7 +5743,7 @@ export function createOrchestrator(
     return result;
   };
 
-  return { onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, settings, shutdown };
+  return { collaboration, onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, settings, shutdown };
 }
 
 /** Resolve a message's thread_id via raw API (reply response omits it). The

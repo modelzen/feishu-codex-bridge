@@ -1,3 +1,4 @@
+import type { CollaborationRequest } from '../admin/collaboration';
 import type { HostSettings } from '../admin/settings-types';
 import type { AdminWriteResult } from '../admin/ops';
 import { createGroupExecutor, type AdminGroupOp, type JoinedGroups } from '../admin/groups';
@@ -36,6 +37,7 @@ export interface BridgeOptions {
 
 export interface BridgeHandle {
   channel: LarkChannel;
+  collaboration: (request: CollaborationRequest) => Promise<unknown>;
   adminGroups: (op: AdminGroupOp) => Promise<JoinedGroups | Project>;
   adminExecute: (op: AdminWriteOp) => Promise<AdminWriteResult>;
   settings: HostSettings;
@@ -162,5 +164,5 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
     await cliBridge.shutdown().catch((err) => log.fail('cli-bridge', err, { phase: 'shutdown' }));
     await channel.disconnect().catch((err) => log.fail('ws', err, { phase: 'disconnect' }));
   };
-  return { channel, adminGroups: createGroupExecutor(channel), adminExecute: orchestrator.adminExecute, settings: orchestrator.settings, shutdown };
+  return { channel, collaboration: orchestrator.collaboration, adminGroups: createGroupExecutor(channel), adminExecute: orchestrator.adminExecute, settings: orchestrator.settings, shutdown };
 }

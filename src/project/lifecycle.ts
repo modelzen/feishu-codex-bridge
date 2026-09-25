@@ -38,6 +38,8 @@ export function bindModeFor(backend?: string): PermissionMode | undefined {
 }
 
 export interface CreateProjectInput {
+  requestId?: string;
+  requestSignature?: string;
   name: string;
   /** DM sender open_id — invited to the new group + set as a member. */
   ownerOpenId: string;
@@ -143,7 +145,7 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
   //    disband / transfer / manage-admins to itself — those can't be shared
   //    because Feishu allows exactly one owner.
   const res = await channel.rawClient.im.v1.chat.create({
-    params: { user_id_type: 'open_id' },
+    params: { user_id_type: 'open_id', ...(input.requestId ? { uuid: input.requestId } : {}) },
     data: { name, user_id_list: [input.ownerOpenId] },
   });
   const chatId = (res.data as { chat_id?: string } | undefined)?.chat_id;
@@ -161,6 +163,7 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
 
   // 3. register
   const project: Project = {
+    ...(input.requestId ? { creationRequestId: input.requestId, creationRequestSignature: input.requestSignature } : {}),
     name,
     chatId,
     cwd,
@@ -172,7 +175,9 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
     backend: input.backend || undefined,
     network: input.network ?? false,
   };
-  await addProject(project);
+  try { await addProject(project); } catch (error) {
+    throw new Error(`飞书群已创建（${chatId}），项目保存失败；请使用相同请求重试或绑定已有群：${error instanceof Error ? error.message : String(error)}`);
+  }
   log.info('project', 'create', { name, chatId, cwd, blank, mode: project.mode, backend: project.backend });
 
   // 4. group announcement (top banner) + onboarding (welcome card / Pin / tab),

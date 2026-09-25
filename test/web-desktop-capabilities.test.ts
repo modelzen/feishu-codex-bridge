@@ -41,6 +41,21 @@ describe('authenticated desktop companion HTTP', () => {
     expect((await request('/api/bots/cli_a/bind-group', 'POST', bind)).status).toBe(409);
   });
 
+  it('routes authenticated collaboration to only the selected running owner and validates the request', async () => {
+    const admin = service(); admin.collaboration = vi.fn(async () => ({ ok: true }));
+    const { request } = await http(admin);
+    const body = { action: 'compact', projectName: 'Project', chatId: 'oc_chat', threadId: 'omt_topic' };
+    expect((await request('/api/bots/cli_a/collaboration', 'POST', body, 'wrong')).status).toBe(401);
+    expect((await request('/api/bots/cli_unknown/collaboration', 'POST', body)).status).toBe(409);
+    expect((await request('/api/bots/cli_a/collaboration', 'POST', { ...body, actor: 'ou_forged' })).status).toBe(400);
+    expect(admin.collaboration).not.toHaveBeenCalled();
+    expect((await request('/api/bots/cli_a/collaboration', 'POST', body)).status).toBe(200);
+    expect(admin.collaboration).toHaveBeenCalledWith('cli_a', body);
+    expect((await request('/api/bots/cli_a/collaboration')).status).toBe(405);
+    admin.collaboration = async () => { throw new AdminWriteError('session is busy'); };
+    expect((await request('/api/bots/cli_a/collaboration', 'POST', body)).status).toBe(409);
+  });
+
   it('reports project read errors instead of an empty successful snapshot', async () => {
     const admin = service(); admin.listProjects = async () => { throw new Error('corrupt projects'); };
     const { request } = await http(admin);

@@ -1,3 +1,4 @@
+import type { CollaborationRequest } from './collaboration';
 import { createSettingsService } from './settings-service';
 import type { HostSettings } from './settings-types';
 import type { AdminSettingsReadOp } from './ipc';
@@ -99,6 +100,7 @@ import type { AdminWriteOp } from './ops';
  * 切目录会把在跑 bot 的 paths 指到别的 bot（第一棒遗留的坑，本棒修掉）。
  */
 export interface AdminService {
+  collaboration?(botId: string, request: CollaborationRequest): Promise<unknown>;
   settings?: HostSettings;
   codexSetup?(): Promise<CodexSetup>;
   startCodexJob?(type: CodexJobType): { id: string };
@@ -429,6 +431,7 @@ export interface AdminBackendCatalogEntry {
 export interface AdminServiceDeps {
   executeSettingsRead?: (botId: string, op: AdminSettingsReadOp) => Promise<unknown>;
   codexTools?: CodexSetupService;
+  executeCollaboration?: (botId: string, request: CollaborationRequest) => Promise<unknown>;
   executeGroups?: (botId: string, op: AdminGroupOp) => Promise<unknown>;
   executeWrite?: (botId: string, op: AdminWriteOp) => Promise<unknown>;
   /** 实时运行状态（daemon 进程内：本进程 channel / 子进程 IPC）。返回 undefined
@@ -553,6 +556,10 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     codexJob: id => codexTools.get(id),
     cancelCodexJob: id => codexTools.cancel(id),
     close: () => codexTools.close(),
+    async collaboration(botId, request) {
+      if (!deps.executeCollaboration) throw new NotWiredYetError('协作管理');
+      return deps.executeCollaboration(botId, request);
+    },
     async joinedGroups(botId, cursor) {
       if (!deps.executeGroups) throw new NotWiredYetError('群列表');
       return parseJoinedGroups(await deps.executeGroups(botId, { kind: 'joinedGroups', cursor }));

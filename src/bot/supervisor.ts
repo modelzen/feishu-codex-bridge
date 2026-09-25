@@ -150,6 +150,11 @@ export async function runSupervisor(bots: BotEntry[], options: { control?: Shutd
     const byAppId = (botId: string): Child | undefined => children.find((c) => c.bot.appId === botId);
     webConsole = await mountWebConsole(
       createAdminService({
+        executeCollaboration: async (botId, request) => {
+          const child = byAppId(botId);
+          if (!child?.proc || !child.ipc) throw new AdminWriteError('机器人不在运行中的活跃集里');
+          return child.ipc.call({ kind: 'collaboration', request }, 180_000);
+        },
         executeGroups: async (botId, op) => {
           const child = byAppId(botId);
           if (!child?.proc || !child.ipc) throw new AdminWriteError('机器人不在运行中的活跃集里');
