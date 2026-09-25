@@ -37,7 +37,7 @@ describe('desktop managed tool pointer', () => {
       expect(resolveCodexBin({ ...context, env: { PATH: '', CODEX_BIN: external } })).toBe(external);
       const externalDir = join(home, 'external');
       mkdirSync(externalDir);
-      const pathCodex = join(externalDir, 'codex');
+      const pathCodex = join(externalDir, process.platform === 'win32' ? 'codex.cmd' : 'codex');
       writeFileSync(pathCodex, 'external', { mode: 0o700 });
       expect(resolveCodexBin({ ...context, env: { PATH: [join(home, 'managed-tools', 'bin'), externalDir].join(delimiter), CODEX_BIN: undefined } })).toBe(pathCodex);
     } finally { rmSync(home, { recursive: true, force: true }); }

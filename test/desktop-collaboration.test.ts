@@ -1,5 +1,6 @@
 import { afterAll, beforeEach, expect, it, vi } from 'vitest';
 import { rm, mkdir, realpath } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 import type { AccountUsageBundle } from '../src/agent/types';
 import type { AppConfig } from '../src/config/schema';
 import { paths } from '../src/config/paths';
@@ -17,7 +18,7 @@ const fixture = vi.hoisted(() => ({ failProjectsWrite: false, backend: undefined
 vi.mock('node:fs/promises', async original => {
   const actual = await original<typeof import('node:fs/promises')>();
   return { ...actual, rename: async (...args: Parameters<typeof actual.rename>) => {
-    if (fixture.failProjectsWrite && String(args[1]).endsWith('/projects.json')) throw new Error('project disk failure');
+    if (fixture.failProjectsWrite && basename(String(args[1])) === 'projects.json') throw new Error('project disk failure');
     return actual.rename(...args);
   } };
 });
@@ -142,7 +143,7 @@ it('creates under the configured root once and preserves idempotency across owne
     expect(replies[0]).toEqual(replies[1]);
     expect(create).toHaveBeenCalledOnce();
     expect(create).toHaveBeenCalledWith({ params: { user_id_type: 'open_id', uuid: request.requestId }, data: { name: 'created', user_id_list: ['ou_owner'] } });
-    expect(await getProjectByName('created')).toMatchObject({ cwd: `${paths.projectsRootDir}/created`, creationRequestId: request.requestId });
+    expect(await getProjectByName('created')).toMatchObject({ cwd: join(paths.projectsRootDir, 'created'), creationRequestId: request.requestId });
     await app.shutdown(); app = orchestrator(channel);
     expect(await app.collaboration(request)).toEqual(replies[0]);
     expect(create).toHaveBeenCalledOnce();
