@@ -1,4 +1,5 @@
 import type { CollaborationRequest } from './collaboration';
+import {runtimeDistribution} from '../service/distribution';
 import { createSettingsService } from './settings-service';
 import type { HostSettings } from './settings-types';
 import type { AdminSettingsReadOp } from './ipc';
@@ -888,7 +889,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       } catch {
         status = undefined;
       }
-      return toDaemonStatus({ status, version: bridgeVersion(), startedAt: deps.daemonStartedAt });
+      return {...toDaemonStatus({ status, version: bridgeVersion(), startedAt: deps.daemonStartedAt }), distribution:await runtimeDistribution()};
     },
 
     async restartDaemon(): Promise<void> {
@@ -925,6 +926,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
 
     async applyUpdate(): Promise<void> {
       if (!deps.applyUpdate) throw new NotWiredYetError('⬆️ 升级');
+      if ((await runtimeDistribution()).kind !== 'global-npm') throw new Error('This Core is not owned by the global npm installation. Update its desktop app or source distribution instead.');
       // 清掉上一次的结果，之后 Web 轮询读到的状态才确定属于本次升级（helper 会重写）。
       clearUpdateStatus();
       deps.applyUpdate();

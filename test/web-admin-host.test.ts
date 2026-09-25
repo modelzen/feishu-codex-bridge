@@ -1,3 +1,4 @@
+import {runtimeDistribution} from '../src/service/distribution';
 import { rmSync, existsSync } from 'node:fs';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { paths, botDir, useBotDir } from '../src/config/paths';
@@ -7,6 +8,8 @@ import { upsertSession } from '../src/bot/session-store';
 import { setSecret, listSecretIds } from '../src/config/keystore';
 import { secretKeyForApp } from '../src/config/schema';
 import { createAdminService, createReadonlyAdminService, NotWiredYetError } from '../src/admin/service';
+
+vi.mock('../src/service/distribution',()=>({runtimeDistribution:vi.fn(async()=>({kind:'global-npm',cliPath:'/fixture/bin/bridge'}))}));
 
 // 临时目录隔离 ~/.feishu-codex-bridge（同 web-admin-service.test 的做法）。
 vi.mock('../src/config/paths', async () => {
@@ -133,6 +136,13 @@ describe('AdminService · restartDaemon / applyUpdate（detached helper 注入�
     const svc = createAdminService();
     await expect(svc.restartDaemon()).rejects.toBeInstanceOf(NotWiredYetError);
     await expect(svc.applyUpdate()).rejects.toBeInstanceOf(NotWiredYetError);
+  });
+
+  it('bundled service refuses global npm update before invoking its helper',async()=>{
+    vi.mocked(runtimeDistribution).mockResolvedValueOnce({kind:'bundled',cliPath:'/App/runtime/core/bin/bridge'});
+    const update=vi.fn();
+    await expect(createAdminService({applyUpdate:update}).applyUpdate()).rejects.toThrow('not owned');
+    expect(update).not.toHaveBeenCalled();
   });
 
   it('daemon 内：调用注入的 helper 触发器（不真跑，只验证被调一次）', async () => {

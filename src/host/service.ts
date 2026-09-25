@@ -8,6 +8,9 @@ export async function controlDesktopService(
   inspect:()=>Promise<HostInspection> = ()=>inspectHost(homedir()),
 ) {
   if (!['status','install','start','stop','uninstall'].includes(action)) throw new Error('Unknown service operation.');
+  const before = await adapter.status();
+  if (action === 'start' && (!before.installed || before.running)) throw new Error('Service must be installed and stopped before starting.');
+  if (action === 'install' && before.installed) throw new Error('Service is already installed.');
   if (action === 'install' || action === 'start') {
     const host = await inspect();
     if (host.kind !== 'absent') throw new Error('Stop the current Bridge before changing its service registration.');

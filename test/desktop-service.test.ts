@@ -3,9 +3,9 @@ import {controlDesktopService} from '../src/host/service';
 import type {ServiceAdapter} from '../src/service/adapter';
 
 const state={platformName:'fixture',installed:false,running:false,servicePath:'/isolated/service',stdoutPath:'/isolated/out',stderrPath:'/isolated/err',raw:'private manager output'};
-function fixture() {
+function fixture(installed=false) {
   const calls:string[]=[];
-  const adapter:ServiceAdapter={status:async()=>({...state}),install:async()=>{calls.push('install');return state;},restart:async()=>{calls.push('start');return state;},uninstall:async()=>{calls.push('uninstall');},logs:async()=>{}};
+  const adapter:ServiceAdapter={status:async()=>({...state,installed}),install:async()=>{calls.push('install');installed=true;return state;},restart:async()=>{calls.push('start');return state;},uninstall:async()=>{calls.push('uninstall');},logs:async()=>{}};
   return {adapter,calls};
 }
 describe('desktop service boundary',()=>{
@@ -19,10 +19,15 @@ describe('desktop service boundary',()=>{
   });
   it('does not replace a live or blocked host service registration',async()=>{
     for(const action of ['install','start']) {
-      const {adapter,calls}=fixture();
+      const {adapter,calls}=fixture(action==='start');
       await expect(controlDesktopService(action,adapter,async()=>({kind:'attached',pid:123}))).rejects.toThrow('Stop the current Bridge');
       expect(calls).toEqual([]);
     }
+  });
+  it('refuses starting an absent service without invoking restart',async()=>{
+    const {adapter,calls}=fixture();
+    await expect(controlDesktopService('start',adapter,async()=>({kind:'absent'}))).rejects.toThrow('installed and stopped');
+    expect(calls).toEqual([]);
   });
   it('maps fixed operations and rejects arbitrary commands',async()=>{
     const {adapter,calls}=fixture();

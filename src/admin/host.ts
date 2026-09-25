@@ -1,3 +1,4 @@
+import type {Distribution} from '../service/distribution';
 import { readdir, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -36,6 +37,7 @@ import type { UpdateCheck } from '../service/update';
 
 /** daemon 生命周期快照（GET /api/daemon）。service 注册状态 + 运行 pid/版本/时长。 */
 export interface DaemonStatus {
+  distribution?: Distribution;
   /** 本平台的服务管理器名（launchd / Task Scheduler / systemd），未支持平台为 undefined。 */
   platformName?: string;
   /** 服务定义（plist/task/unit）已注册到 OS。 */
