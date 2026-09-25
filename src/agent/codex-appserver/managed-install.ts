@@ -10,11 +10,11 @@ import { CodexProcessCleanupError, OwnedCodexProcess } from './owned-process';
 export const CODEX_INSTALL_VERSION = '0.156.1';
 export const privateCodexBin = (prefix: string): string => join(prefix, 'node_modules', '.bin', process.platform === 'win32' ? 'codex.cmd' : 'codex');
 
-export function managedCodexBin(): string | null {
+export function managedCodexBin(codexCliDir = paths.codexCliDir): string | null {
   try {
-    const data: unknown = JSON.parse(readFileSync(join(paths.codexCliDir, 'current.json'), 'utf8'));
+    const data: unknown = JSON.parse(readFileSync(join(codexCliDir, 'current.json'), 'utf8'));
     if (!data || typeof data !== 'object' || !('generation' in data) || typeof data.generation !== 'string' || !/^[a-f0-9-]{36}$/.test(data.generation)) return null;
-    const bin = privateCodexBin(join(paths.codexCliDir, 'releases', data.generation));
+    const bin = privateCodexBin(join(codexCliDir, 'releases', data.generation));
     return existsSync(bin) ? bin : null;
   } catch { return null; }
 }

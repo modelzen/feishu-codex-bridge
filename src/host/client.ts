@@ -108,3 +108,6 @@ export async function connectHost(input: HostOptions): Promise<HostHandle | Host
 }
 
 export type * from '../admin/settings-types';
+
+export { resolveDataRoot } from '../config/data-root';
+export { resolveCodexBin, type CodexResolutionOptions } from '../agent/codex-appserver/locate';
