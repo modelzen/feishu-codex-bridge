@@ -53,7 +53,7 @@ async function launch(options: HostOptions): Promise<{ child: ChildProcess; endp
     }
     throw new Error('Host readiness timed out.');
   } catch (error) {
-    await stopChild(child, undefined, process.platform !== 'win32').catch((shutdownError) => { throw new AggregateError([error, shutdownError], 'Host startup and cleanup failed.'); });
+    await stopChild(child, undefined, process.platform !== 'win32').catch((shutdownError) => { throw new AggregateError([error, shutdownError], `Host startup failed: ${error instanceof Error ? error.message : String(error)} Cleanup: ${shutdownError instanceof Error ? shutdownError.message : String(shutdownError)}`); });
     throw error;
   }
 }
