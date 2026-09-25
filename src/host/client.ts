@@ -110,4 +110,9 @@ export async function connectHost(input: HostOptions): Promise<HostHandle | Host
 export type * from '../admin/settings-types';
 
 export { resolveDataRoot } from '../config/data-root';
-export { resolveCodexBin, type CodexResolutionOptions } from '../agent/codex-appserver/locate';
+import type {CodexResolutionOptions} from '../agent/codex-appserver/locate';
+export type {CodexResolutionOptions};
+export async function resolveCodexBin(options: CodexResolutionOptions = {}): Promise<string | null> {
+  const resolver = await import('../agent/codex-appserver/locate');
+  return resolver.resolveCodexBin(options);
+}
