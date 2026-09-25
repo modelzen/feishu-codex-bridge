@@ -61,7 +61,7 @@ afterAll(() => { vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true
 describe('Codex account setup uses the task executable and home', { timeout: 40_000 }, () => {
   it('distinguishes installation, signed-out, signed-in, not-required and malformed account state', async () => {
     const value = service();
-    expect(await value.setup()).toMatchObject({ installation: 'installed', authentication: 'signedOut', version: 'codex-cli 0.156.1' });
+    expect(await value.setup()).toMatchObject({ installation: 'installed', authentication: 'signedOut', version: 'codex-cli 0.156.1', executable: fixture.bin });
     expect(resolveCodexBin()).toBe(fixture.bin);
     writeFileSync(join(auth, 'fixture-account'), 'fixture');
     expect(await value.setup()).toMatchObject({ authentication: 'signedIn' });

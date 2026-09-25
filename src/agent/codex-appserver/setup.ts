@@ -9,6 +9,7 @@ export interface CodexSetup {
   installation: 'missing' | 'installed' | 'unknown';
   authentication: 'signedOut' | 'signedIn' | 'notRequired' | 'unknown';
   version: string | null;
+  executable: string | null;
   message?: string;
 }
 export type CodexJobType = 'install' | 'login';
@@ -63,7 +64,7 @@ export class CodexSetupService {
 
   private async readSetup(signal: AbortSignal): Promise<CodexSetup> {
     const bin = resolveCodexBin({ force: true });
-    if (!bin) return { installation: process.env.CODEX_BIN ? 'unknown' : 'missing', authentication: 'unknown', version: null, message: process.env.CODEX_BIN ? `CODEX_BIN 指向不可用的文件：${process.env.CODEX_BIN}` : '尚未安装 Codex' };
+    if (!bin) return { installation: process.env.CODEX_BIN ? 'unknown' : 'missing', authentication: 'unknown', version: null, executable: null, message: process.env.CODEX_BIN ? `CODEX_BIN 指向不可用的文件：${process.env.CODEX_BIN}` : '尚未安装 Codex' };
     let version: string | null = null;
     const client = this.client(bin);
     const stop = (): void => { void client.close().catch(() => undefined); };
@@ -74,10 +75,10 @@ export class CodexSetupService {
       signal.throwIfAborted();
       await client.connect();
       const authentication = accountState(await client.request('account/read', { refreshToken: false }, 10_000));
-      return { installation: 'installed', authentication, version, message: `当前 Codex：${bin}` };
+      return { installation: 'installed', authentication, version, executable: bin, message: `当前 Codex：${bin}` };
     } catch (error) {
       if (error instanceof CodexProcessCleanupError) throw error;
-      return { installation: version && /^codex-cli \S+$/.test(version) ? 'installed' : 'unknown', authentication: 'unknown', version, message: `无法确认当前 Codex 的账户状态：${bin}` };
+      return { installation: version && /^codex-cli \S+$/.test(version) ? 'installed' : 'unknown', authentication: 'unknown', version, executable: bin, message: `无法确认当前 Codex 的账户状态：${bin}` };
     } finally {
       signal.removeEventListener('abort', stop);
       await client.close();
