@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { managedToolExecutable, managedToolSelection } from '../src/agent/codex-appserver/managed-tools';
@@ -39,7 +39,36 @@ describe('desktop managed tool pointer', () => {
       mkdirSync(externalDir);
       const pathCodex = join(externalDir, process.platform === 'win32' ? 'codex.cmd' : 'codex');
       writeFileSync(pathCodex, 'external', { mode: 0o700 });
-      expect(resolveCodexBin({ ...context, env: { ...context.env, PATH: [join(home, 'managed-tools', 'bin'), externalDir, ...(process.platform === 'win32' && process.env.SystemRoot ? [join(process.env.SystemRoot, 'System32')] : [])].join(delimiter) } })).toBe(pathCodex);
+      const resolved = resolveCodexBin({ ...context, env: { ...context.env, PATH: [join(home, 'managed-tools', 'bin'), externalDir, ...(process.platform === 'win32' && process.env.SystemRoot ? [join(process.env.SystemRoot, 'System32')] : [])].join(delimiter) } });
+      expect(resolved && realpathSync.native(resolved)).toBe(realpathSync.native(pathCodex));
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('does not rediscover a disabled managed installation through a directory alias', () => {
+    const home = mkdtempSync(join(tmpdir(), 'bridge-pointer-alias-'));
+    try {
+      const root = join(home, 'data');
+      const alias = join(home, 'data-alias');
+      const bin = join(root, 'managed-tools', 'bin');
+      mkdirSync(join(root, 'managed-tools', 'codex'), { recursive: true });
+      mkdirSync(bin);
+      symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+      writeFileSync(join(bin, process.platform === 'win32' ? 'codex.cmd' : 'codex'), 'legacy', { mode: 0o700 });
+      writeFileSync(join(root, 'managed-tools', 'codex', 'current.json'), JSON.stringify({ schemaVersion: 1, tool: 'codex', state: 'disabled' }));
+      const env = {
+        PATH: [bin, ...(process.platform === 'win32' && process.env.SystemRoot ? [join(process.env.SystemRoot, 'System32')] : [])].join(delimiter),
+        ...(process.platform === 'win32' ? { SystemRoot: process.env.SystemRoot, PATHEXT: '.COM;.EXE;.BAT;.CMD' } : {}),
+      };
+      expect(resolveCodexBin({ home, dataRoot: alias, env })).toBeNull();
+      const externalDir = join(home, 'external');
+      mkdirSync(externalDir);
+      const external = join(externalDir, process.platform === 'win32' ? 'codex.cmd' : 'codex');
+      writeFileSync(external, 'external', { mode: 0o700 });
+      const lookup = vi.spyOn(realpathSync, 'native').mockImplementationOnce(() => { throw Object.assign(new Error('removed during lookup'), { code: 'ENOENT' }); });
+      try {
+        const resolved = resolveCodexBin({ home, dataRoot: alias, env: { ...env, PATH: env.PATH + delimiter + externalDir } });
+        expect(resolved && realpathSync.native(resolved)).toBe(realpathSync.native(external));
+      } finally { lookup.mockRestore(); }
     } finally { rmSync(home, { recursive: true, force: true }); }
   });
 

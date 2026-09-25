@@ -1,8 +1,8 @@
 import { managedCodexBin } from './managed-install';
 import { managedToolSelection } from './managed-tools';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { extname, join, sep } from 'node:path';
+import { extname, isAbsolute, join, relative, sep } from 'node:path';
 import { paths } from '../../config/paths';
 import { spawnProcess, spawnProcessSync } from '../../platform/spawn';
 
@@ -43,7 +43,7 @@ export function resolveCodexBin(opts: CodexResolutionOptions = {}): string | nul
 }
 
 function locateBin(home: string, root: string, env: NodeJS.ProcessEnv, blockLegacyManaged: boolean): string | null {
-  const onPath = which('codex', env, blockLegacyManaged ? [join(root, 'managed-tools'), join(root, 'codex-cli')] : []);
+  const onPath = which('codex', env, blockLegacyManaged ? root : undefined);
   if (onPath) return onPath;
   const directories = blockLegacyManaged ? [] : [join(root, 'codex-cli', 'node_modules', '.bin')];
   if (process.platform === 'darwin') {
@@ -63,7 +63,16 @@ function locateBin(home: string, root: string, env: NodeJS.ProcessEnv, blockLega
 }
 
 function inLegacyManagedRoot(candidate: string, root: string): boolean {
-  return [join(root, 'managed-tools'), join(root, 'codex-cli')].some(managed => candidate === managed || candidate.startsWith(managed + sep));
+  try {
+    const target = realpathSync.native(candidate);
+    return [join(root, 'managed-tools'), join(root, 'codex-cli')].some(managed => {
+      if (!existsSync(managed)) return false;
+      const path = relative(realpathSync.native(managed), target);
+      return path !== '..' && !path.startsWith('..' + sep) && !isAbsolute(path);
+    });
+  } catch {
+    return true;
+  }
 }
 
 function execCandidates(dir: string, base: string, env: NodeJS.ProcessEnv): string[] {
@@ -73,7 +82,7 @@ function execCandidates(dir: string, base: string, env: NodeJS.ProcessEnv): stri
   return [exact, ...exts.map(e => join(dir, base + e.toLowerCase()))];
 }
 
-function which(cmd: string, env: NodeJS.ProcessEnv, blockedRoots: string[]): string | null {
+function which(cmd: string, env: NodeJS.ProcessEnv, blockedDataRoot?: string): string | null {
   try {
     const res = spawnProcessSync(IS_WIN ? 'where' : '/usr/bin/which', IS_WIN ? [cmd] : ['-a', cmd], {
       env,
@@ -81,7 +90,7 @@ function which(cmd: string, env: NodeJS.ProcessEnv, blockedRoots: string[]): str
       stdio: ['ignore', 'pipe', 'ignore'],
     });
     if (res.status !== 0 || typeof res.stdout !== 'string') return null;
-    const first = res.stdout.split('\n').map(l => l.trim()).find(candidate => candidate && existsSync(candidate) && !blockedRoots.some(root => candidate === root || candidate.startsWith(root + sep)));
+    const first = res.stdout.split('\n').map(l => l.trim()).find(candidate => candidate && existsSync(candidate) && (!blockedDataRoot || !inLegacyManagedRoot(candidate, blockedDataRoot)));
     return first && existsSync(first) ? first : null;
   } catch {
     return null;
