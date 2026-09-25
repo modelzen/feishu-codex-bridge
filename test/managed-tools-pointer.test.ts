@@ -17,7 +17,7 @@ describe('desktop managed tool pointer', () => {
       mkdirSync(join(home, 'managed-tools', 'bin'), { recursive: true });
       writeFileSync(legacy, 'legacy', { mode: 0o700 });
       writeFileSync(external, 'external');
-      const context = { home, dataRoot: home, env: { PATH: '', CODEX_BIN: undefined } };
+      const context = { home, dataRoot: home, env: { PATH: '', CODEX_BIN: undefined, ...(process.platform === 'win32' ? {SystemRoot: process.env.SystemRoot, PATHEXT: '.COM;.EXE;.BAT;.CMD'} : {}) } };
       expect(resolveCodexBin(context)).toBe(legacy);
       expect(managedToolSelection(home, 'codex').kind).toBe('absent');
       const firstBin = managedToolExecutable(join(toolRoot, 'releases', first), 'codex');
@@ -39,7 +39,7 @@ describe('desktop managed tool pointer', () => {
       mkdirSync(externalDir);
       const pathCodex = join(externalDir, process.platform === 'win32' ? 'codex.cmd' : 'codex');
       writeFileSync(pathCodex, 'external', { mode: 0o700 });
-      expect(resolveCodexBin({ ...context, env: { PATH: [join(home, 'managed-tools', 'bin'), externalDir].join(delimiter), CODEX_BIN: undefined } })).toBe(pathCodex);
+      expect(resolveCodexBin({ ...context, env: { ...context.env, PATH: [join(home, 'managed-tools', 'bin'), externalDir, ...(process.platform === 'win32' && process.env.SystemRoot ? [join(process.env.SystemRoot, 'System32')] : [])].join(delimiter) } })).toBe(pathCodex);
     } finally { rmSync(home, { recursive: true, force: true }); }
   });
 
