@@ -46,6 +46,24 @@ it('rejects untrusted identity, extra fields and relative paths at the HTTP boun
   expect(() => parseCollaborationRequest({ action: 'context', ...target, threadId: 'oc_demo', owner: 'ou_fake' })).toThrow();
   expect(() => parseCollaborationRequest({ action: 'editProject', ...target, expectedRevision: 'revision', directory: '../escape' })).toThrow();
   expect(parseCollaborationRequest({ action: 'usage', force: true })).toEqual({ action: 'usage', force: true });
+  expect(parseCollaborationRequest({ action: 'shareUsage', ...target, sections: ['stats', 'heatmap'] })).toMatchObject({ sections: ['stats', 'heatmap'] });
+  expect(() => parseCollaborationRequest({ action: 'shareUsage', ...target, sections: ['unknown'] })).toThrow('分享区块无效');
+  expect(() => parseCollaborationRequest({ action: 'shareUsage', ...target, sections: 'stats' })).toThrow('分享区块无效');
+});
+
+it('generates a share card with only the requested sections', async () => {
+  backend(); const app = orchestrator();
+  fixture.usage.mockResolvedValueOnce({
+    profile: { displayName: 'Tester', lifetimeTokens: 12345, topInvocations: [], dailyBuckets: [] },
+    usage: { main: { primary: { usedPercent: 25 } }, extras: [], fetchedAt: Date.now() },
+  });
+  try {
+    await app.collaboration({ action: 'shareUsage', ...target, sections: ['stats'] });
+    const card = JSON.stringify(fixture.send.mock.calls.at(-1));
+    expect(card).toContain('累计 Token 数');
+    expect(card).not.toContain('限额进度');
+    expect(card).not.toContain('剩余 75%');
+  } finally { await app.shutdown(); }
 });
 it('returns backend-wide history and only compacts the matching bound session', async () => {
   const be = backend(); const app = orchestrator();

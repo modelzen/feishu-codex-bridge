@@ -3946,7 +3946,8 @@ export function createOrchestrator(
     if (!project || project.chatId !== request.chatId) throw new AdminWriteError('项目已改变，请刷新后重试');
     if (request.action === 'project') return { project: projectView(project) };
     if (request.action === 'shareUsage') {
-      const sent = await sendManagedCard(channel, project.chatId, buildUsageShareCard(await fetchUsageBundle()));
+      const sections = parseShareSections(request.sections);
+      const sent = await sendManagedCard(channel, project.chatId, buildUsageShareCard(await fetchUsageBundle(), { sections }));
       return { messageId: sent.messageId };
     }
     const records = (await listSessions()).filter(record => record.chatId === project.chatId);
