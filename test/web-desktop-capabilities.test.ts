@@ -105,3 +105,17 @@ describe('authenticated desktop companion HTTP', () => {
     expect(await (await request(`/api/tools/codex/jobs/${id}`, 'DELETE')).json()).toEqual(first);
   });
 });
+
+it('exposes pending events without requiring a group executor and preserves errors', async () => {
+  const admin = service();
+  const groups = [{ chatId: 'oc_pending', name: 'Research', addedAt: 123 }];
+  admin.pendingGroups = vi.fn(async () => ({ groups }));
+  const { request } = await http(admin);
+  expect((await request('/api/bots/cli_a/pending-groups', 'GET', undefined, 'wrong')).status).toBe(401);
+  const result = await request('/api/bots/cli_a/pending-groups');
+  expect(result.status).toBe(200); expect(await result.json()).toEqual({ groups });
+  expect(admin.pendingGroups).toHaveBeenCalledWith('cli_a');
+  expect((await request('/api/bots/cli_a/pending-groups', 'POST', {})).status).toBe(405);
+  admin.pendingGroups = async () => { throw new Error('corrupt pending file'); };
+  expect((await request('/api/bots/cli_a/pending-groups')).status).toBe(500);
+});

@@ -1,3 +1,5 @@
+import { pendingGroupsFile, readPendingGroups, type PendingGroup } from '../project/pending-groups';
+import { isAdmin } from '../config/schema';
 import type { CollaborationRequest } from './collaboration';
 import {runtimeDistribution} from '../service/distribution';
 import { createSettingsService } from './settings-service';
@@ -110,6 +112,7 @@ export interface AdminService {
   codexJob?(id: string): CodexJob | undefined;
   cancelCodexJob?(id: string): Promise<CodexJob | undefined>;
   close?(): Promise<void>;
+  pendingGroups?(botId: string): Promise<{ groups: PendingGroup[] }>;
   joinedGroups?(botId: string, cursor?: string): Promise<JoinedGroups>;
   bindGroup?(botId: string, input: BindGroupInput): Promise<AdminProject>;
   getVoice(botId: string): Promise<VoiceView>;
@@ -579,6 +582,20 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     async collaboration(botId, request) {
       if (!deps.executeCollaboration) throw new NotWiredYetError('协作管理');
       return deps.executeCollaboration(botId, request);
+    },
+    async pendingGroups(botId) {
+      const registry = await loadBots();
+      const bot = registry.bots.find(item => item.appId === botId);
+      const active = registry.bots.some(item => item.active !== undefined) ? bot?.active === true : registry.current === botId;
+      if (!bot || !active || !(await runState(botId)).running) return { groups: [] };
+      const files = botPaths(botId);
+      const cfg = await loadConfig(files.configFile);
+      if (!isComplete(cfg)) return { groups: [] };
+      const bound = new Set((await listProjectsIn(files.projectsFile)).map(project => project.chatId));
+      const groups = (await readPendingGroups(pendingGroupsFile(files.projectsFile)))
+        .flatMap(group => group.state === 'ready' && isAdmin(cfg, group.operator) && !bound.has(group.chatId)
+          ? [{ chatId: group.chatId, name: group.name, addedAt: group.addedAt }] : []);
+      return { groups };
     },
     async joinedGroups(botId, cursor) {
       if (!deps.executeGroups) throw new NotWiredYetError('群列表');

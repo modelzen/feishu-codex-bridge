@@ -1,3 +1,4 @@
+import { createPendingGroups, pendingGroupsFile } from '../project/pending-groups';
 import { realpath, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { projectRevision, projectView, type CollaborationRequest } from '../admin/collaboration';
@@ -5460,6 +5461,25 @@ export function createOrchestrator(
     return fresh;
   }
 
+  const pendingGroups = createPendingGroups({
+    file: pendingGroupsFile(paths.projectsFile),
+    eligible: async ({ chatId, operator }) => isAdmin(cfg, operator) && !(await getProjectByChatId(chatId)),
+    verify: async chatId => {
+      const membership = await channel.rawClient.im.v1.chatMembers.isInChat({ path: { chat_id: chatId } });
+      if (membership.code !== 0 || typeof membership.data?.is_in_chat !== 'boolean') throw new Error('无法确认机器人群成员身份');
+      if (!membership.data.is_in_chat) return null;
+      const info = await channel.getChatInfo(chatId);
+      if (info.chatType !== 'group' || (channel.botIdentity?.openId && info.ownerId === channel.botIdentity.openId)) return null;
+      const name = info?.name?.trim();
+      if (!name) throw new Error('无法读取飞书群名称');
+      return name;
+    },
+    onError: error => log.fail('intake', error, { phase: 'pending-groups' }),
+  });
+  void pendingGroups.refresh();
+  const pendingGroupTimer = setInterval(() => { void pendingGroups.refresh(); }, 15_000);
+  pendingGroupTimer.unref();
+
   /**
    * `botAdded` event: a human added the bot to a group. If the adder is an admin
    * (binding ties the group to a cwd on the operator's machine — privileged) and
@@ -5481,6 +5501,8 @@ export function createOrchestrator(
         log.info('intake', 'bot-added-nonadmin', { chatId: evt.chatId.slice(-6), op: op?.slice(-6) });
         return;
       }
+      await pendingGroups.add(evt.chatId, op).catch(error => log.fail('intake', error, { phase: 'pending-group-add' }));
+      void pendingGroups.refresh();
       // Best-effort group name (needs im:chat:readonly); the bind card's name is
       // editable, so an empty/failed lookup just means the admin types one.
       const info = await channel.getChatInfo(evt.chatId).catch((err) => {
@@ -5506,6 +5528,7 @@ export function createOrchestrator(
    * bound project: the bot is already out, so no me_leave. Notify the binder.
    */
   async function onBotRemovedFromChat(chatId: string): Promise<void> {
+    await pendingGroups.remove(chatId).catch(error => log.fail('intake', error, { phase: 'pending-group-remove' }));
     const project = await getProjectByChatId(chatId);
     if (!project) return;
     // Remove first, then notify only if THIS call removed it — Feishu delivers
@@ -5732,6 +5755,7 @@ export function createOrchestrator(
   reaper.unref(); // 不挡进程退出（CLI/测试里 orchestrator 可能不走 shutdown）
 
   async function shutdown(): Promise<void> {
+    clearInterval(pendingGroupTimer);
     shuttingDown = true;
     clearInterval(reaper);
     for (const state of active.values()) {

@@ -212,14 +212,17 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       return;
     }
 
-    const groupRoute = /^\/api\/bots\/([^/]+)\/(joined-groups|bind-group)$/.exec(pathName);
+    const groupRoute = /^\/api\/bots\/([^/]+)\/(joined-groups|bind-group|pending-groups)$/.exec(pathName);
     if (groupRoute) {
       try {
         const appId = decodeURIComponent(groupRoute[1]!);
         if (!/^cli_[\w-]{1,200}$/.test(appId)) throw new InvalidGroupInput('机器人标识无效');
         const bot = (await opts.service.listBots()).find(item => item.appId === appId);
         if (!bot?.active || !bot.running) throw new AdminWriteError('机器人未启用或尚未运行');
-        if (req.method === 'GET' && groupRoute[2] === 'joined-groups') {
+        if (req.method === 'GET' && groupRoute[2] === 'pending-groups') {
+          if (!opts.service.pendingGroups) throw new NotWiredYetError('待绑定群列表');
+          sendJson(res, 200, await opts.service.pendingGroups(appId));
+        } else if (req.method === 'GET' && groupRoute[2] === 'joined-groups') {
           if (!opts.service.joinedGroups) throw new NotWiredYetError('群列表');
           const cursor = url.searchParams.get('cursor') ?? undefined;
           if (cursor !== undefined && (!cursor || cursor.length > 2048 || /[\x00-\x1f]/.test(cursor))) throw new InvalidGroupInput('群列表游标无效');

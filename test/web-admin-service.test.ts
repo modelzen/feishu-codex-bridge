@@ -1,3 +1,4 @@
+import { createPendingGroups, pendingGroupsFile } from '../src/project/pending-groups';
 import { rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { paths, botPaths, useBotDir } from '../src/config/paths';
@@ -397,4 +398,26 @@ describe('createAdminService · getSetupStatus（初始化 checklist 聚合）',
     expect(s.event.state).toBe('unchecked');
     expect(s.scopes.grantUrl).toContain('/auth?q='); // 深链总归得给
   });
+});
+
+it('reads pending events directly and filters bound groups, changed admins and disabled bots', async () => {
+  const id = 'cli_pending';
+  const prior = await import('../src/config/bots').then(module => module.loadBots());
+  await saveBots({ ...prior, bots: [...prior.bots, { appId: id, name: 'Pending', tenant: 'feishu', createdAt: 1, active: true }] });
+  const files = botPaths(id); mkdirSync(files.dir, { recursive: true });
+  const config = { accounts: { app: { id, secret: 'fixture', tenant: 'feishu' } }, preferences: { access: { admins: ['ou_admin'] } } };
+  writeFileSync(files.configFile, JSON.stringify(config));
+  const queue = createPendingGroups({ file: pendingGroupsFile(files.projectsFile), eligible: async () => true, verify: async () => 'Research', onError: error => { throw error; } });
+  await queue.add('oc_pending', 'ou_admin'); await queue.add('oc_other', 'ou_removed'); await queue.refresh();
+  const reader = createAdminService({ liveStatus: async () => ({ running: true }) });
+  try {
+    expect(await reader.pendingGroups?.(id)).toEqual({ groups: [{ chatId: 'oc_pending', name: 'Research', addedAt: expect.any(Number) }] });
+    useBotDir(id);
+    await addProject({ name: 'Bound', chatId: 'oc_pending', cwd: '/tmp', blank: false, createdAt: 1 });
+    expect(await reader.pendingGroups?.(id)).toEqual({ groups: [] });
+    expect(await reader.pendingGroups?.(BOT_B)).toEqual({ groups: [] });
+    expect(await reader.pendingGroups?.('cli_missing')).toEqual({ groups: [] });
+    writeFileSync(pendingGroupsFile(files.projectsFile), '{');
+    await expect(reader.pendingGroups?.(id)).rejects.toThrow();
+  } finally { await reader.close?.(); await saveBots(prior); }
 });
