@@ -13,6 +13,7 @@ import { DEFAULT_BACKEND_ID, type ReasoningEffort } from '../agent/types';
 export interface SessionRecord {
   /** Feishu topic thread_id (the key) */
   threadId: string;
+  detached?: boolean;
   chatId: string;
   cwd: string;
   /** backend session id（codex 的 thread id / claude 的 session UUID）—— pass to
@@ -135,7 +136,7 @@ async function readStoreIn(file: string): Promise<StoreFile> {
       typeof parsed.version === 'number' && parsed.version >= 3 && Array.isArray(parsed.titleJobs)
         ? (parsed.titleJobs as SessionTitleJob[])
         : [];
-    return { version: FILE_VERSION, sessions, titleJobs };
+    return { ...parsed, version: FILE_VERSION, sessions, titleJobs };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return emptyStore();
     throw err;
@@ -169,7 +170,7 @@ function withLock<T>(fn: () => Promise<T>): Promise<T> {
 async function write(store: StoreFile): Promise<void> {
   await mkdir(dirname(paths.sessionsFile), { recursive: true });
   const tmp = `${paths.sessionsFile}.tmp-${process.pid}-${randomUUID()}`;
-  const body: StoreFile = { version: FILE_VERSION, sessions: store.sessions, titleJobs: store.titleJobs };
+  const body: StoreFile = { ...store, version: FILE_VERSION };
   await writeFile(tmp, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
   await rename(tmp, paths.sessionsFile);
 }
@@ -179,7 +180,22 @@ export async function listSessions(): Promise<SessionRecord[]> {
 }
 
 export async function getSession(threadId: string): Promise<SessionRecord | undefined> {
-  return (await read()).sessions.find((s) => s.threadId === threadId);
+  return (await read()).sessions.find((s) => s.threadId === threadId && !s.detached);
+}
+
+export async function detachSessionsForChat<T>(chatId: string, commit: () => Promise<T>): Promise<T> {
+  return withLock(async () => {
+    const store = await read();
+    const original = structuredClone(store);
+    for (const session of store.sessions) if (session.chatId === chatId) session.detached = true;
+    await write(store);
+    try {
+      return await commit();
+    } catch (error) {
+      await write(original);
+      throw error;
+    }
+  });
 }
 
 /** Insert or replace a session by threadId. */
@@ -293,5 +309,17 @@ export async function updateSessionTitleJob(
     store.titleJobs[idx] = { ...replacement, updatedAt: Date.now() };
     await write(store);
     return true;
+  });
+}
+
+export async function mutateSession(threadId: string, mutate: (session: SessionRecord) => void | Promise<void>): Promise<SessionRecord> {
+  return withLock(async () => {
+    const store = await read();
+    const session = store.sessions.find(item => item.threadId === threadId);
+    if (!session) throw new Error('会话不存在或已被删除');
+    await mutate(session);
+    session.updatedAt = Date.now();
+    await write(store);
+    return session;
   });
 }

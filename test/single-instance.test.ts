@@ -185,7 +185,7 @@ describe('并发多进程抢锁', () => {
       await Promise.all(children.map((c) => waitExit(c)));
       const lines = outputs.map((f) => f().trim());
       expect(lines.filter((l) => l === 'ACQUIRED')).toHaveLength(1);
-      expect(lines.filter((l) => l === 'REJECTED:BridgeAlreadyRunningError')).toHaveLength(3);
+      expect(lines.filter((l) => l === 'REJECTED:BridgeAlreadyRunningError'), JSON.stringify(lines)).toHaveLength(3);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

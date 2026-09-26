@@ -172,8 +172,11 @@ async function runSingle(botName: string | undefined, control: ShutdownControl, 
         if (op.kind === 'status') {
           return { connection: handle.channel.getConnectionStatus?.()?.state ?? 'unknown' };
         }
-        await handle.adminExecute(op);
-        return { done: true };
+        if (op.kind === 'collaboration') return handle.collaboration(op.request);
+        if (op.kind === 'joinedGroups' || op.kind === 'bindGroup') return handle.adminGroups(op);
+        if (op.kind === 'settingsRead') return handle.settings.read(op.scope);
+        if (op.kind === 'settingsModels') return handle.settings.models(op.query);
+        return handle.adminExecute(op);
       },
       (msg) => void process.send?.(msg),
     );
@@ -186,13 +189,25 @@ async function runSingle(botName: string | undefined, control: ShutdownControl, 
     const startedAt = Date.now();
     webConsole = await mountWebConsole(
       createAdminService({
+        executeCollaboration: async (botId, request) => {
+          if (botId !== ownAppId) throw new AdminWriteError('机器人不在本进程的活跃集里');
+          return handle.collaboration(request);
+        },
+        executeGroups: async (botId, op) => {
+          if (botId !== ownAppId) throw new AdminWriteError('机器人不在本进程的活跃集里');
+          return handle.adminGroups(op);
+        },
+        executeSettingsRead: async (botId, op) => {
+          if (botId !== ownAppId) throw new AdminWriteError('机器人不在本进程的活跃集里');
+          return op.kind === 'settingsRead' ? handle.settings.read(op.scope) : handle.settings.models(op.query);
+        },
         executeWrite: async (botId, op) => {
           if (botId !== ownAppId) {
             throw new AdminWriteError(
               '该机器人不归本进程管：当前是单 bot 运行模式，只能改本 bot 的项目。多 bot 请 `bot use` 勾选后重启，由 supervisor 聚合管理。',
             );
           }
-          await handle.adminExecute(op);
+          return handle.adminExecute(op);
         },
         liveStatus: async (botId) =>
           botId === ownAppId

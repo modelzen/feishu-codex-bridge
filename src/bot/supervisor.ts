@@ -150,11 +150,26 @@ export async function runSupervisor(bots: BotEntry[], options: { control?: Shutd
     const byAppId = (botId: string): Child | undefined => children.find((c) => c.bot.appId === botId);
     webConsole = await mountWebConsole(
       createAdminService({
+        executeCollaboration: async (botId, request) => {
+          const child = byAppId(botId);
+          if (!child?.proc || !child.ipc) throw new AdminWriteError('机器人不在运行中的活跃集里');
+          return child.ipc.call({ kind: 'collaboration', request }, 180_000);
+        },
+        executeGroups: async (botId, op) => {
+          const child = byAppId(botId);
+          if (!child?.proc || !child.ipc) throw new AdminWriteError('机器人不在运行中的活跃集里');
+          return child.ipc.call(op, 60_000);
+        },
+        executeSettingsRead: async (botId, op) => {
+          const child = byAppId(botId);
+          if (!child?.proc || !child.ipc) throw new AdminWriteError('机器人不在运行中的活跃集里');
+          return child.ipc.call(op);
+        },
         executeWrite: async (botId, op) => {
           const c = byAppId(botId);
           if (!c) throw new AdminWriteError(`机器人「${botId}」不在本次启动的活跃集里（先 \`bot use\` 勾选后重启）。`);
           if (!c.proc || !c.ipc) throw new AdminWriteError(`机器人「${c.bot.name}」进程未在运行（崩溃重启中），稍后重试。`);
-          await c.ipc.call(op);
+          return c.ipc.call(op);
         },
         liveStatus: async (botId) => {
           const c = byAppId(botId);

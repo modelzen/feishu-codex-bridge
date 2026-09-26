@@ -1,3 +1,12 @@
+import { pendingGroupsFile, readPendingGroups, type PendingGroup } from '../project/pending-groups';
+import { isAdmin } from '../config/schema';
+import type { CollaborationRequest } from './collaboration';
+import {runtimeDistribution} from '../service/distribution';
+import { createSettingsService } from './settings-service';
+import type { HostSettings } from './settings-types';
+import type { AdminSettingsReadOp } from './ipc';
+import { CodexSetupService, type CodexSetup, type CodexJob, type CodexJobType } from '../agent/codex-appserver/setup';
+import { parseJoinedGroups, type AdminGroupOp, type BindGroupInput, type JoinedGroups } from './groups';
 import { voiceView } from '../voice/view';
 import type { VoiceAction, VoiceView } from '../voice/types';
 import { readFile, rm } from 'node:fs/promises';
@@ -21,9 +30,11 @@ import {
 import { listSessionsIn } from '../bot/session-store';
 import { loadConfig } from '../config/store';
 import { resolveAppSecret } from '../config/secret-resolver';
+import { createAgentAvatarProvider, createGroupAvatarProvider } from './avatar';
 import { diagnoseEventSubscription, type EventDiagnosis } from '../utils/event-diagnosis';
 import { validateAppCredentials } from '../utils/feishu-auth';
 import { buildScopeGrantUrl, buildEventConfigUrl } from '../config/scopes';
+import { refreshBotCredentials } from '../bot/refresh-bot';
 import { registerBotFromCredentials } from '../bot/register-bot';
 import {
   startRegistration,
@@ -94,6 +105,16 @@ import type { AdminWriteOp } from './ops';
  * 切目录会把在跑 bot 的 paths 指到别的 bot（第一棒遗留的坑，本棒修掉）。
  */
 export interface AdminService {
+  collaboration?(botId: string, request: CollaborationRequest): Promise<unknown>;
+  settings?: HostSettings;
+  codexSetup?(): Promise<CodexSetup>;
+  startCodexJob?(type: CodexJobType): { id: string };
+  codexJob?(id: string): CodexJob | undefined;
+  cancelCodexJob?(id: string): Promise<CodexJob | undefined>;
+  close?(): Promise<void>;
+  pendingGroups?(botId: string): Promise<{ groups: PendingGroup[] }>;
+  joinedGroups?(botId: string, cursor?: string): Promise<JoinedGroups>;
+  bindGroup?(botId: string, input: BindGroupInput): Promise<AdminProject>;
   getVoice(botId: string): Promise<VoiceView>;
   setVoice(botId: string, action: VoiceAction): Promise<void>;
   /** 全部已注册 bot + 进程在跑状态（daemon 内 = 真实 WS 状态；预览 = 锁文件探测）。 */
@@ -148,6 +169,8 @@ export interface AdminService {
     onQr: (info: RegistrationQr) => void;
     onStatus?: (info: RegistrationStatus) => void;
   }): Promise<QrRegisterResult | QrRegisterFailure>;
+
+  refreshBotByQr(botId: string, opts: { signal: AbortSignal; onQr: (info: RegistrationQr) => void; onStatus?: (info: RegistrationStatus) => void }): Promise<QrRegisterResult | QrRegisterFailure>;
 
   // ── Web 专属：后端 catalog 预览 + 按需安装（backend-catalog-ondemand.md）──────
   /**
@@ -254,6 +277,7 @@ export interface AdminBot {
   appId: string;
   tenant: 'feishu' | 'lark';
   botName?: string;
+  avatarDataUrl?: string;
   /** run/start 会带起它（bot use 的多选活跃集） */
   active: boolean;
   /** bots.json 的 current（单 bot 代码路径的主 bot） */
@@ -280,6 +304,7 @@ export interface BotLiveStatus {
 
 /** 项目快照——effective 值（缺省已按 registry 的单一事实源解析），UI 直接渲染。 */
 export interface AdminProject {
+  avatarDataUrl?: string;
   name: string;
   chatId: string;
   cwd: string;
@@ -368,6 +393,8 @@ export interface QrRegisterFailure {
     | 'expired_token'
     | 'access_denied'
     | 'identity_missing'
+    | 'already_registered'
+    | 'stale_target'
     | 'persist_failed'
     | 'credential_rejected'
     | 'network'
@@ -414,9 +441,11 @@ export interface AdminBackendCatalogEntry {
 
 /** daemon/预览两种进程形态的差异全部收进这几个注入点；读路径完全同源。 */
 export interface AdminServiceDeps {
-  /** 写执行器：botId + op → 完成或抛 AdminWriteError（校验拒绝）。
-   * 缺省 = 只读预览，写方法抛 {@link NotWiredYetError}（HTTP 501）。 */
-  executeWrite?: (botId: string, op: AdminWriteOp) => Promise<void>;
+  executeSettingsRead?: (botId: string, op: AdminSettingsReadOp) => Promise<unknown>;
+  codexTools?: CodexSetupService;
+  executeCollaboration?: (botId: string, request: CollaborationRequest) => Promise<unknown>;
+  executeGroups?: (botId: string, op: AdminGroupOp) => Promise<unknown>;
+  executeWrite?: (botId: string, op: AdminWriteOp) => Promise<unknown>;
   /** 实时运行状态（daemon 进程内：本进程 channel / 子进程 IPC）。返回 undefined
    * 或缺省 → 回退锁文件探测（该 bot 不归本 daemon 管，如未激活的 bot）。 */
   liveStatus?: (botId: string) => Promise<BotLiveStatus | undefined>;
@@ -462,6 +491,14 @@ export interface AdminServiceDeps {
  * 不自己解析 JSON；不碰全局 currentBotDir）；写路径与实时状态由 deps 注入。
  */
 export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
+  const codexTools = deps.codexTools ?? new CodexSetupService();
+  const credentials = async (botId: string) => {
+    const cfg = await loadConfig(botPaths(botId).configFile);
+    if (!isComplete(cfg)) throw new Error('机器人配置不完整');
+    return { appId: botId, tenant: cfg.accounts.app.tenant, appSecret: await resolveAppSecret(cfg) };
+  };
+  const avatars = createAgentAvatarProvider({ credentials });
+  const groupAvatars = createGroupAvatarProvider({ credentials });
   async function projectsWithCounts(botId: string): Promise<AdminProject[]> {
     const files = botPaths(botId);
     const projects = await listProjectsIn(files.projectsFile);
@@ -473,7 +510,9 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     for (const s of sessions) {
       countByChat.set(s.chatId, (countByChat.get(s.chatId) ?? 0) + 1);
     }
-    return projects.map((p) => ({
+    groupAvatars.retainChats(botId, new Set(projects.map(p => p.chatId).filter(Boolean)));
+    const result = projects.map((p) => ({
+      avatarDataUrl: groupAvatars.get(botId, p.chatId),
       name: p.name,
       chatId: p.chatId,
       cwd: p.cwd,
@@ -491,6 +530,8 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       sessionCount: p.chatId ? (countByChat.get(p.chatId) ?? 0) : 0,
       createdAt: p.createdAt,
     }));
+    for (const project of projects) if (project.chatId) void groupAvatars.refresh(botId, project.chatId);
+    return result;
   }
 
   /** 单实例锁文件（processes.json）→「bridge 进程在跑吗」。损坏/缺失一律视为
@@ -525,10 +566,48 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
 
   function executeWrite(botId: string, action: string, op: AdminWriteOp): Promise<void> {
     if (!deps.executeWrite) throw new NotWiredYetError(action);
-    return deps.executeWrite(botId, op);
+    return deps.executeWrite(botId, op).then(() => undefined);
   }
 
   return {
+    settings: createSettingsService(deps),
+    codexSetup: () => codexTools.setup(),
+    startCodexJob(type) {
+      if (deps.readonlyPreview || deps.daemonStartedAt === undefined) throw new NotWiredYetError('Codex 设置');
+      return codexTools.start(type);
+    },
+    codexJob: id => codexTools.get(id),
+    cancelCodexJob: id => codexTools.cancel(id),
+    close: () => codexTools.close(),
+    async collaboration(botId, request) {
+      if (!deps.executeCollaboration) throw new NotWiredYetError('协作管理');
+      return deps.executeCollaboration(botId, request);
+    },
+    async pendingGroups(botId) {
+      const registry = await loadBots();
+      const bot = registry.bots.find(item => item.appId === botId);
+      const active = registry.bots.some(item => item.active !== undefined) ? bot?.active === true : registry.current === botId;
+      if (!bot || !active || !(await runState(botId)).running) return { groups: [] };
+      const files = botPaths(botId);
+      const cfg = await loadConfig(files.configFile);
+      if (!isComplete(cfg)) return { groups: [] };
+      const bound = new Set((await listProjectsIn(files.projectsFile)).map(project => project.chatId));
+      const groups = (await readPendingGroups(pendingGroupsFile(files.projectsFile)))
+        .flatMap(group => group.state === 'ready' && isAdmin(cfg, group.operator) && !bound.has(group.chatId)
+          ? [{ chatId: group.chatId, name: group.name, addedAt: group.addedAt }] : []);
+      return { groups };
+    },
+    async joinedGroups(botId, cursor) {
+      if (!deps.executeGroups) throw new NotWiredYetError('群列表');
+      return parseJoinedGroups(await deps.executeGroups(botId, { kind: 'joinedGroups', cursor }));
+    },
+    async bindGroup(botId, input) {
+      if (!deps.executeGroups) throw new NotWiredYetError('绑定群聊');
+      await deps.executeGroups(botId, { kind: 'bindGroup', input });
+      const project = (await projectsWithCounts(botId)).find(p => p.chatId === input.chatId);
+      if (!project) throw new Error('群绑定结果读取失败');
+      return project;
+    },
     async getVoice(botId: string): Promise<VoiceView> {
       const cfg = await loadConfig(botPaths(botId).configFile);
       if (!isComplete(cfg)) throw new Error('机器人配置不完整');
@@ -539,6 +618,9 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     },
     async listBots(): Promise<AdminBot[]> {
       const reg = await loadBots();
+      const botIds = new Set(reg.bots.map(bot => bot.appId));
+      avatars.retain(botIds);
+      groupAvatars.retainBots(botIds);
       const configured = reg.bots.some((b) => b.active !== undefined);
       const out: AdminBot[] = [];
       for (const b of reg.bots) {
@@ -548,6 +630,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
           appId: b.appId,
           tenant: b.tenant,
           botName: b.botName,
+          avatarDataUrl: avatars.get(b.appId),
           // 与 config/bots.activeBots 同语义：从未配置过活跃集 → 回退 current。
           active: configured ? b.active === true : reg.current === b.appId,
           current: reg.current === b.appId,
@@ -557,6 +640,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
           connection: run.connection,
           completionReminder,
         });
+        void avatars.refresh(b.appId);
       }
       return out;
     },
@@ -746,7 +830,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
         // 写盘 / 探活失败 → 据 register-bot 的 code 映射（invalid_input 理论不该出现，
         // 扫码拿到的 appId 必合法，归为 unknown 兜底）。
         const code: QrRegisterFailure['code'] =
-          r.code === 'credential_rejected' ? 'credential_rejected' : r.code === 'persist_failed' ? 'persist_failed' : 'unknown';
+          r.code === 'already_registered' ? 'already_registered' : r.code === 'credential_rejected' ? 'credential_rejected' : r.code === 'persist_failed' ? 'persist_failed' : 'unknown';
         return { ok: false, code, reason: r.reason };
       }
       return {
@@ -758,6 +842,11 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
         adminOpenId: ownerOpenId,
         missingScopes: r.missingScopes,
       };
+    },
+
+    async refreshBotByQr(botId, opts) {
+      if (deps.readonlyPreview) throw new NotWiredYetError('刷新 Agent 凭据');
+      return refreshBotCredentials(botId, opts);
     },
 
     async listBackendCatalog(): Promise<AdminBackendCatalog> {
@@ -836,7 +925,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       } catch {
         status = undefined;
       }
-      return toDaemonStatus({ status, version: bridgeVersion(), startedAt: deps.daemonStartedAt });
+      return {...toDaemonStatus({ status, version: bridgeVersion(), startedAt: deps.daemonStartedAt }), distribution:await runtimeDistribution()};
     },
 
     async restartDaemon(): Promise<void> {
@@ -873,6 +962,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
 
     async applyUpdate(): Promise<void> {
       if (!deps.applyUpdate) throw new NotWiredYetError('⬆️ 升级');
+      if ((await runtimeDistribution()).kind !== 'global-npm') throw new Error('This Core is not owned by the global npm installation. Update its desktop app or source distribution instead.');
       // 清掉上一次的结果，之后 Web 轮询读到的状态才确定属于本次升级（helper 会重写）。
       clearUpdateStatus();
       deps.applyUpdate();
@@ -907,26 +997,19 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       const reg = await loadBots();
       const target = reg.bots.find((b) => b.appId === appId);
       if (!target) return { ok: false, reason: `机器人「${appId}」不存在。` };
-      // 保护①：唯一 bot 不许删（删完控制台空了、无从恢复，得引导重新 init）。
-      if (reg.bots.length <= 1) {
-        return { ok: false, reason: '这是当前唯一的机器人，不能删除——删完控制台就空了。先用 `bot init` 添加另一个再删。' };
-      }
-      // 保护②：带运行中会话（bridge 在跑 + 有话题记录）的 bot 不许删——会打断正在跑的
-      // codex 会话、留下孤儿 app-server。先 `bot use` 退活跃集 + 重启让进程退出再删。
       const run = await runState(appId);
       if (run.running) {
-        const sessions = await listSessionsIn(botPaths(appId).sessionsFile).catch(() => []);
-        if (sessions.length > 0) {
-          return {
-            ok: false,
-            reason: `机器人「${target.name}」正在运行且有 ${sessions.length} 个活跃会话，不能删除（会打断进行中的对话）。先在「多机器人」里关掉它并重启 daemon，等进程退出后再删。`,
-          };
-        }
+        return { ok: false, reason: `机器人「${target.name}」仍在运行。请先关闭启用状态并重启 Host，确认已停止后再删除。` };
+      }
+      const enabled = reg.bots.some(bot => bot.active !== undefined) ? target.active === true : reg.current === appId;
+      if (enabled) {
+        return { ok: false, reason: '请先关闭此机器人的启用状态并确认已经停止，再删除。' };
       }
       // 注册表 + keystore 密钥 + 状态目录（projects/sessions/config），与 `bot rm` 同语义。
       await removeBot(appId);
       await removeSecret(secretKeyForApp(appId)).catch(() => undefined);
       await rm(botDir(appId), { recursive: true, force: true }).catch(() => undefined);
+      avatars.retain(new Set(reg.bots.filter(bot => bot.appId !== appId).map(bot => bot.appId)));
       return { ok: true };
     },
   };

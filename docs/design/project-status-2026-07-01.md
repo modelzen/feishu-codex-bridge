@@ -130,6 +130,8 @@
 - ✅ **访问控制**：owner（扫码者，永久 admin）/ admins（能私聊建项目 + 破坏性操作）/ 项目级 allowedUsers / allowedChats。
 - ✅ **归一化偏好**：messageReply/showToolCalls/showModel/maxConcurrentRuns/requireMentionInGroup/pendingPolicy/agentStopGraceMs/runIdleTimeout 等（存值=生效值）。
 
+2026-09-25 核对。上项中的 `messageReply`、`requireMentionInGroup`、`agentStopGraceMs` 当前没有运行时调用，保留历史配置不代表生效。Agent 级 `access.allowedUsers` 也没有生效调用点；项目级成员白名单仍生效。桌面覆盖用例据此区分有效功能和历史字段，不能把字段可保存当作功能已实现。
+
 ### M. Onboarding / 自检
 - ✅ **扫码建飞书应用**（wizard registerApp，CLI ASCII QR + Web SSE 双路），扫码者设为 owner+admin。
 - ✅ **一键 scope 授权链接**（15 个必需细分 scope + 可选组），凭据校验 + 已授 scope 对比。

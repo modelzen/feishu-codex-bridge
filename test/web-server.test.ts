@@ -99,6 +99,7 @@ function stubService(): AdminService {
         eventConfigUrl: 'https://open.feishu.cn/app/' + botId + '/event',
       };
     },
+    async refreshBotByQr() { return { ok: false, code: 'access_denied', reason: 'test' }; },
     async registerBotByQr(o) {
       // 默认 stub：吐一帧 qr + 一帧 status，再成功。被取消（abort）则返回 abort。
       o.onQr({ url: 'https://accounts.feishu.cn/scan?code=abc', expireIn: 600 });
@@ -318,6 +319,34 @@ describe('web server · 安全（loopback + token + Host 校验）', () => {
 });
 
 describe('web server · 只读 API', () => {
+  it('keeps all Agent and project data when portraits exceed the snapshot budget', async () => {
+    const service = stubService();
+    const [template] = await service.listBots();
+    const bots = Array.from({length: 20}, (_, i) => ({...template!, appId: `cli_${i}`, avatarDataUrl: `data:image/png;base64,${'A'.repeat(349_000)}`}));
+    service.listBots = async () => bots;
+    const projects = (await service.listProjects(bots[0]!.appId)).map(project => ({...project, avatarDataUrl: bots[0]!.avatarDataUrl}));
+    service.listProjects = async () => projects;
+    const server = createWebServer({service, token: TOKEN, logDir});
+    const {port} = await server.listen(0);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/api/state`, {headers: {Authorization: `Bearer ${TOKEN}`}});
+      const text = await response.text();
+      expect(response.status).toBe(200);
+      expect(text.length).toBeLessThan(4_000_000);
+      const body = JSON.parse(text) as {bots: {appId: string; avatarDataUrl?: string; projects: {avatarDataUrl?: string}[]}[]};
+      expect(body.bots.map(bot => bot.appId)).toEqual(bots.map(bot => bot.appId));
+      expect(body.bots.every(bot => bot.projects.length === 1)).toBe(true);
+      expect(body.bots[0]?.avatarDataUrl).toBe(bots[0]?.avatarDataUrl);
+      expect(body.bots.at(-1)?.avatarDataUrl).toBeUndefined();
+      expect(bots.every(bot => Boolean(bot.avatarDataUrl))).toBe(true);
+      expect(projects.every(project => Boolean(project.avatarDataUrl))).toBe(true);
+      const portraitBytes = body.bots.flatMap(bot => [bot.avatarDataUrl, ...bot.projects.map(project => project.avatarDataUrl)]).reduce((sum, value) => sum + (value?.length ?? 0), 0);
+      expect(portraitBytes).toBeLessThanOrEqual(2_000_000);
+      expect(body.bots[0]?.projects[0]?.avatarDataUrl).toBe(projects[0]?.avatarDataUrl);
+      expect(body.bots.at(-1)?.projects[0]?.avatarDataUrl).toBeUndefined();
+    } finally { await server.close(); }
+  });
+
   it('/api/state 快照形状：version/generatedAt + bots[].projects[]', async () => {
     const body = await jsonOf(await authed('/api/state'));
     expect(typeof body.version).toBe('string');
@@ -651,6 +680,101 @@ async function readSseUntil(res: Response, needle: string, timeoutMs: number): P
 }
 
 describe('web server · 扫码注册 SSE', () => {
+  it('target refresh SSE dispatches the original App ID and preserves the session cancellation contract', async () => {
+    const svc = stubService();
+    svc.refreshBotByQr = async (appId, options) => {
+      expect(appId).toBe('cli_original123');
+      options.onQr({ url: 'https://accounts.feishu.cn/refresh', expireIn: 600 });
+      return { ok: true, appId, name: 'original', tenant: 'feishu', adminOpenId: 'ou_original' };
+    };
+    const server = createWebServer({ service: svc, token: TOKEN, logDir });
+    const { port } = await server.listen(0);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/bots/cli_original123/refresh-qr/stream`, {
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get('X-Registration-Session-Id')).toMatch(/^[a-f0-9-]{36}$/);
+      const output = await readSseUntil(res, 'event: done', 4000);
+      expect(output).toContain('"appId":"cli_original123"');
+      expect(output).toContain('"adminOpenId":"ou_original"');
+      expect(output).not.toContain('secret');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('retains committed refresh outcome when its SSE connection closes before done delivery', async () => {
+    const svc = stubService();
+    let complete: (() => void) | undefined;
+    svc.refreshBotByQr = async (appId, options) => {
+      options.onQr({ url: 'https://accounts.feishu.cn/refresh', expireIn: 600 });
+      await new Promise<void>(resolve => { complete = resolve; });
+      return { ok: true, appId, name: 'original', tenant: 'feishu', adminOpenId: 'ou_original' };
+    };
+    const server = createWebServer({ service: svc, token: TOKEN, logDir });
+    const { port } = await server.listen(0);
+    const headers = { Authorization: `Bearer ${TOKEN}` };
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      const response = await fetch(`${base}/api/bots/cli_original123/refresh-qr/stream`, { headers });
+      const sessionId = response.headers.get('X-Registration-Session-Id');
+      const path = `${base}/api/bots/register-qr?sessionId=${sessionId}`;
+      expect(await (await fetch(path, { headers })).json()).toEqual({ state: 'running' });
+      expect((await fetch(path)).status).toBe(401);
+      await response.body!.cancel();
+      complete!();
+      expect((await fetch(path, { method: 'DELETE', headers })).status).toBe(204);
+      expect(await (await fetch(path, { headers })).json()).toEqual({ state: 'succeeded', appId: 'cli_original123' });
+      expect((await fetch(`${base}/api/bots/register-qr?sessionId=00000000-0000-0000-0000-000000000000`, { headers })).status).toBe(404);
+      expect((await fetch(`${base}/api/bots/register-qr`, { headers })).status).toBe(400);
+    } finally { complete?.(); await server.close(); }
+  });
+
+  it('records cancellation before commit for the specific session without cancelling its successor', async () => {
+    const svc = stubService();
+    svc.registerBotByQr = options => new Promise(resolve => {
+      options.onQr({ url: 'https://accounts.feishu.cn/test', expireIn: 600 });
+      options.signal.addEventListener('abort', () => resolve({ ok: false, code: 'abort', reason: 'cancelled' }), { once: true });
+    });
+    const server = createWebServer({ service: svc, token: TOKEN, logDir });
+    const { port } = await server.listen(0);
+    const headers = { Authorization: `Bearer ${TOKEN}` };
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      const first = await fetch(`${base}/api/bots/register-qr/stream`, { headers });
+      const second = await fetch(`${base}/api/bots/register-qr/stream`, { headers });
+      const firstPath = `${base}/api/bots/register-qr?sessionId=${first.headers.get('X-Registration-Session-Id')}`;
+      const secondPath = `${base}/api/bots/register-qr?sessionId=${second.headers.get('X-Registration-Session-Id')}`;
+      expect((await fetch(firstPath, { method: 'DELETE', headers })).status).toBe(204);
+      expect(await (await fetch(firstPath, { headers })).json()).toEqual({ state: 'cancelled' });
+      expect(await (await fetch(secondPath, { headers })).json()).toEqual({ state: 'running' });
+      await fetch(secondPath, { method: 'DELETE', headers });
+      await first.body!.cancel();
+      await second.body!.cancel();
+    } finally { await server.close(); }
+  });
+
+  it('bounds retained outcomes and error text without exposing registration payloads', async () => {
+    const svc = stubService();
+    svc.registerBotByQr = async () => ({ ok: false, code: 'access_denied', reason: 'x'.repeat(2000) });
+    const server = createWebServer({ service: svc, token: TOKEN, logDir });
+    const { port } = await server.listen(0);
+    const headers = { Authorization: `Bearer ${TOKEN}` };
+    const base = `http://127.0.0.1:${port}`;
+    const ids: string[] = [];
+    try {
+      for (let index = 0; index < 33; index++) {
+        const response = await fetch(`${base}/api/bots/register-qr/stream`, { headers });
+        ids.push(response.headers.get('X-Registration-Session-Id')!);
+        await response.text();
+      }
+      expect((await fetch(`${base}/api/bots/register-qr?sessionId=${ids[0]}`, { headers })).status).toBe(404);
+      const outcome = await (await fetch(`${base}/api/bots/register-qr?sessionId=${ids[32]}`, { headers })).json();
+      expect(outcome).toEqual({ state: 'failed', code: 'access_denied', message: 'x'.repeat(1024) });
+    } finally { await server.close(); }
+  });
+
   it('GET /api/bots/register-qr/stream：推 qr → status → done（done 不含 secret）', async () => {
     const res = await authed('/api/bots/register-qr/stream');
     expect(res.status).toBe(200);

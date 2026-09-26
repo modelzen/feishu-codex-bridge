@@ -8,6 +8,15 @@ import {
   packageName,
   restartDaemon,
 } from '../../service/update';
+import { getDesktopRelease, desktopReleaseNoticeForHost } from '../../service/desktop-release';
+import { runtimeDistribution } from '../../service/distribution';
+
+async function printDesktopGuidance(): Promise<void> {
+  const release = await getDesktopRelease();
+  if (!release) return;
+  const notice = desktopReleaseNoticeForHost(release);
+  if (notice) console.log(`\n${notice}`);
+}
 
 /**
  * `feishu-codex-bridge update` — self-update to the latest npm release and, if a
@@ -15,6 +24,19 @@ import {
  * `--check`, only report whether a newer version exists (no install).
  */
 export async function runUpdate(opts: { check?: boolean } = {}): Promise<void> {
+  const distribution = await runtimeDistribution();
+  if (distribution.kind === 'bundled') {
+    console.log('此 CLI 随 Vonvon Bridge 桌面应用提供，请在桌面应用中更新。');
+    return;
+  }
+  try {
+    await runCliUpdate(opts);
+  } finally {
+    await printDesktopGuidance();
+  }
+}
+
+async function runCliUpdate(opts: { check?: boolean }): Promise<void> {
   const pkg = packageName();
   const current = currentVersion();
   console.log(`当前版本：v${current}`);

@@ -1,3 +1,4 @@
+import { pendingGroupsFile, retireBoundPendingGroup } from './pending-groups';
 import { mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -31,7 +32,15 @@ export function assertBackendUsable(backend: string | undefined, mode: Permissio
   throw new Error(`所选后端「${backend}」当前不可用（未下载或不支持该权限档），请回卡片重新选择`);
 }
 
+export function bindModeFor(backend?: string): PermissionMode | undefined {
+  const modes = backend ? catalogById(backend)?.supportedModes : undefined;
+  if (modes && !modes.includes('qa')) return modes.includes('full') ? 'full' : modes[0];
+  return undefined;
+}
+
 export interface CreateProjectInput {
+  requestId?: string;
+  requestSignature?: string;
   name: string;
   /** DM sender open_id — invited to the new group + set as a member. */
   ownerOpenId: string;
@@ -56,7 +65,7 @@ export interface JoinGroupInput {
   /** the pre-existing group the bot was added to. */
   chatId: string;
   /** open_id of the admin who added the bot + submitted the bind. */
-  addedBy: string;
+  addedBy?: string;
   /** when set, bind this existing folder; otherwise create a blank project. */
   existingPath?: string;
   /** optional config.json override for the parent directory of blank projects. */
@@ -137,7 +146,7 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
   //    disband / transfer / manage-admins to itself — those can't be shared
   //    because Feishu allows exactly one owner.
   const res = await channel.rawClient.im.v1.chat.create({
-    params: { user_id_type: 'open_id' },
+    params: { user_id_type: 'open_id', ...(input.requestId ? { uuid: input.requestId } : {}) },
     data: { name, user_id_list: [input.ownerOpenId] },
   });
   const chatId = (res.data as { chat_id?: string } | undefined)?.chat_id;
@@ -155,6 +164,7 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
 
   // 3. register
   const project: Project = {
+    ...(input.requestId ? { creationRequestId: input.requestId, creationRequestSignature: input.requestSignature } : {}),
     name,
     chatId,
     cwd,
@@ -166,7 +176,9 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
     backend: input.backend || undefined,
     network: input.network ?? false,
   };
-  await addProject(project);
+  try { await addProject(project); } catch (error) {
+    throw new Error(`飞书群已创建（${chatId}），项目保存失败；请使用相同请求重试或绑定已有群：${error instanceof Error ? error.message : String(error)}`);
+  }
   log.info('project', 'create', { name, chatId, cwd, blank, mode: project.mode, backend: project.backend });
 
   // 4. group announcement (top banner) + onboarding (welcome card / Pin / tab),
@@ -209,6 +221,7 @@ export async function joinExistingGroup(channel: LarkChannel, input: JoinGroupIn
     network: input.network ?? false,
   };
   await addProject(project);
+  await retireBoundPendingGroup(pendingGroupsFile(paths.projectsFile), project.chatId);
   log.info('project', 'join', { name, chatId: input.chatId, cwd, blank, kind: project.kind, mode: project.mode, backend: project.backend });
 
   // Onboarding only (no announcement / Pin / tab — see onboardGroup's joined

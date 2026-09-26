@@ -1,3 +1,7 @@
+import { parseCollaborationRequest } from '../admin/collaboration';
+import { handleSettingsRoute } from './settings-routes';
+import { GroupUpstreamError, InvalidGroupInput, parseBindGroupInput } from '../admin/groups';
+import { CodexSetupConflict } from '../agent/codex-appserver/setup';
 import { validateVoiceAction } from '../voice/service';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
@@ -102,14 +106,12 @@ export function createWebServer(opts: WebServerOptions): WebServer {
   /** 进行中的安装，按 `${id}|${update}` 去重 —— 刷新/重连命中同一 job，绝不并发重复装。 */
   const installJobs = new Map<string, InstallJob>();
 
-  /**
-   * 单例扫码会话槽（design §1.4）：同时只允许一个扫码会话——registerApp 每会话都吃
-   * 飞书 device_code 配额 + 持续轮询，多开纯浪费；控制台是单机 loopback 单用户工具，
-   * 不存在并发注册。新会话**抢占式替换**旧会话（先 abort 旧、再开新），用户刷新页面
-   * 不会被僵尸会话卡住。SSE 断开（req.on('close')）→ abort 兜底，杜绝僵尸轮询打飞书。
-   */
-  let qrSession: { id: string; abort: AbortController } | null = null;
+  type QrOutcome = { state: 'running' | 'cancelled' } | { state: 'succeeded'; appId: string } | { state: 'failed'; code: string; message: string };
+  interface QrSession { id: string; abort: AbortController; done: Promise<void>; settled: boolean; outcome: QrOutcome }
+  const qrSessions = new Map<string, QrSession>();
+  let qrSession: QrSession | null = null;
 
+  let closing: Promise<void> | undefined;
   const server = createServer((req, res) => {
     void handle(req, res).catch((err) => {
       if (!res.headersSent) {
@@ -160,6 +162,10 @@ export function createWebServer(opts: WebServerOptions): WebServer {
     }
     if (setCookie) res.setHeader('Set-Cookie', setCookie);
 
+    if (closing) { sendJson(res, 503, { error: 'closing', message: 'Host 正在退出' }); return; }
+
+    if (await handleSettingsRoute(req, res, url, opts.service.settings)) return;
+
     // ── 路由 ──────────────────────────────────────────────────────────────
     if (req.method === 'GET' && pathName === '/') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -186,6 +192,74 @@ export function createWebServer(opts: WebServerOptions): WebServer {
         'Cache-Control': 'public, max-age=31536000, immutable',
       });
       res.end(LOGO_PNG);
+      return;
+    }
+
+    const collaborationRoute = /^\/api\/bots\/([^/]+)\/collaboration$/.exec(pathName);
+    if (collaborationRoute) {
+      try {
+        if (req.method !== 'POST') { sendJson(res, 405, { error: 'method_not_allowed' }); return; }
+        const appId = decodeURIComponent(collaborationRoute[1]!);
+        if (!/^cli_[\w-]{1,200}$/.test(appId)) throw new InvalidGroupInput('机器人标识无效');
+        const bot = (await opts.service.listBots()).find(item => item.appId === appId);
+        if (!bot?.active || !bot.running) throw new AdminWriteError('机器人未启用或尚未运行');
+        if (!opts.service.collaboration) throw new NotWiredYetError('协作管理');
+        let body: Record<string, unknown>;
+        try { body = await readJsonBody(req); } catch { throw new InvalidGroupInput('协作请求不是有效 JSON'); }
+        const request = parseCollaborationRequest(body);
+        sendJson(res, 200, await opts.service.collaboration(appId, request));
+      } catch (error) { companionError(res, error); }
+      return;
+    }
+
+    const groupRoute = /^\/api\/bots\/([^/]+)\/(joined-groups|bind-group|pending-groups)$/.exec(pathName);
+    if (groupRoute) {
+      try {
+        const appId = decodeURIComponent(groupRoute[1]!);
+        if (!/^cli_[\w-]{1,200}$/.test(appId)) throw new InvalidGroupInput('机器人标识无效');
+        const bot = (await opts.service.listBots()).find(item => item.appId === appId);
+        if (!bot?.active || !bot.running) throw new AdminWriteError('机器人未启用或尚未运行');
+        if (req.method === 'GET' && groupRoute[2] === 'pending-groups') {
+          if (!opts.service.pendingGroups) throw new NotWiredYetError('待绑定群列表');
+          sendJson(res, 200, await opts.service.pendingGroups(appId));
+        } else if (req.method === 'GET' && groupRoute[2] === 'joined-groups') {
+          if (!opts.service.joinedGroups) throw new NotWiredYetError('群列表');
+          const cursor = url.searchParams.get('cursor') ?? undefined;
+          if (cursor !== undefined && (!cursor || cursor.length > 2048 || /[\x00-\x1f]/.test(cursor))) throw new InvalidGroupInput('群列表游标无效');
+          sendJson(res, 200, await opts.service.joinedGroups(appId, cursor));
+        } else if (req.method === 'POST' && groupRoute[2] === 'bind-group') {
+          if (!opts.service.bindGroup) throw new NotWiredYetError('绑定群聊');
+          let body: Record<string, unknown>;
+          try { body = await readJsonBody(req); } catch { throw new InvalidGroupInput('绑定请求不是有效 JSON'); }
+          const input = parseBindGroupInput(body);
+          sendJson(res, 200, { project: await opts.service.bindGroup(appId, input) });
+        } else sendJson(res, 405, { error: 'method_not_allowed' });
+      } catch (error) { companionError(res, error); }
+      return;
+    }
+
+    if (pathName.startsWith('/api/tools/codex/')) {
+      try {
+        if (req.method === 'GET' && pathName === '/api/tools/codex/setup') {
+          if (!opts.service.codexSetup) throw new NotWiredYetError('Codex 设置');
+          sendJson(res, 200, await opts.service.codexSetup());
+        } else if (req.method === 'POST' && (pathName === '/api/tools/codex/install' || pathName === '/api/tools/codex/login')) {
+          if (!opts.service.startCodexJob) throw new NotWiredYetError('Codex 设置');
+          let body: Record<string, unknown>;
+          try { body = await readJsonBody(req); } catch { throw new InvalidGroupInput('设置请求不是有效 JSON'); }
+          if (Object.keys(body).length) throw new InvalidGroupInput('设置请求不能包含额外参数');
+          sendJson(res, 202, opts.service.startCodexJob(pathName.endsWith('/install') ? 'install' : 'login'));
+        } else {
+          const route = /^\/api\/tools\/codex\/jobs\/([^/]+)$/.exec(pathName);
+          if (!route) { sendJson(res, 404, { error: 'not_found' }); return; }
+          const id = route[1]!;
+          if (!/^[a-f0-9-]{36}$/.test(id)) throw new InvalidGroupInput('操作标识无效');
+          if (!opts.service.codexJob || !opts.service.cancelCodexJob) throw new NotWiredYetError('Codex 设置');
+          if (req.method !== 'GET' && req.method !== 'DELETE') { sendJson(res, 405, { error: 'method_not_allowed' }); return; }
+          const job = req.method === 'DELETE' ? await opts.service.cancelCodexJob(id) : opts.service.codexJob(id);
+          sendJson(res, job ? 200 : 404, job ?? { error: 'not_found' });
+        }
+      } catch (error) { companionError(res, error); }
       return;
     }
 
@@ -307,13 +381,40 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       return;
     }
 
-    // DELETE /api/bots/register-qr —— 主动取消当前扫码会话（abort signal）。
+    const refreshQr = pathName.match(/^\/api\/bots\/(cli_[A-Za-z0-9]{6,})\/refresh-qr\/stream$/);
+    if (req.method === 'GET' && refreshQr) {
+      handleRegisterQrStream(req, res, refreshQr[1]);
+      return;
+    }
+
+    if (req.method === 'GET' && pathName === '/api/bots/register-qr') {
+      const sessionId = url.searchParams.get('sessionId');
+      if (sessionId === null || !/^[a-f0-9-]{36}$/.test(sessionId)) {
+        sendJson(res, 400, { error: 'invalid_session' });
+        return;
+      }
+      const session = qrSessions.get(sessionId);
+      if (!session) {
+        sendJson(res, 404, { error: 'session_not_found' });
+        return;
+      }
+      sendJson(res, 200, session.outcome);
+      return;
+    }
+
     if (req.method === 'DELETE' && pathName === '/api/bots/register-qr') {
       const sessionId = url.searchParams.get('sessionId');
-      // 带 sessionId 时仅当匹配当前会话才 abort（抢占式替换下防旧页面误杀新会话）。
-      if (sessionId === null || (qrSession && qrSession.id === sessionId)) {
-        qrSession?.abort.abort();
+      if (sessionId !== null && !/^[a-f0-9-]{36}$/.test(sessionId)) {
+        sendJson(res, 400, { error: 'invalid_session' });
+        return;
       }
+      const session = sessionId === null ? qrSession : qrSessions.get(sessionId);
+      if (sessionId !== null && !session) {
+        sendJson(res, 404, { error: 'session_not_found' });
+        return;
+      }
+      session?.abort.abort();
+      await session?.done;
       res.writeHead(204);
       res.end();
       return;
@@ -526,6 +627,14 @@ export function createWebServer(opts: WebServerOptions): WebServer {
         return;
       }
       try {
+        if ((action === 'no-mention' || action === 'auto-compact') && typeof body.on !== 'boolean') {
+          sendJson(res, 400, { error: 'bad_body', message: 'on 必须是布尔值' });
+          return;
+        }
+        if (action === 'permission' && body.network !== undefined && typeof body.network !== 'boolean') {
+          sendJson(res, 400, { error: 'bad_body', message: 'network 必须是布尔值' });
+          return;
+        }
         if (action === 'backend') {
           await opts.service.switchBackend(botId, project, String(body.backend ?? ''));
         } else if (action === 'permission') {
@@ -569,9 +678,19 @@ export function createWebServer(opts: WebServerOptions): WebServer {
   async function handleState(res: ServerResponse): Promise<void> {
     const bots = await opts.service.listBots();
     const out = [];
-    for (const b of bots) {
-      const projects = await opts.service.listProjects(b.appId).catch(() => []);
-      out.push({ ...b, projects });
+    let remainingAvatarBytes = 2_000_000;
+    function withAvatarBudget<T extends { avatarDataUrl?: string }>(item: T): T {
+      const copy = { ...item };
+      if (copy.avatarDataUrl) {
+        if (copy.avatarDataUrl.length > remainingAvatarBytes) delete copy.avatarDataUrl;
+        else remainingAvatarBytes -= copy.avatarDataUrl.length;
+      }
+      return copy;
+    }
+    for (const bot of bots) {
+      const b = withAvatarBudget(bot);
+      try { out.push({ ...b, projects: (await opts.service.listProjects(b.appId)).map(withAvatarBudget) }); }
+      catch (error) { out.push({ ...b, projects: [], projectsError: error instanceof Error ? error.message : '项目读取失败' }); }
     }
     sendJson(res, 200, { version: bridgeVersion(), generatedAt: Date.now(), bots: out });
   }
@@ -582,18 +701,28 @@ export function createWebServer(opts: WebServerOptions): WebServer {
    * → abort 兜底（防僵尸轮询）。secret 绝不经前端：service 内 resolve 后直接进
    * keystore，done payload 只回白名单字段（appId/name/tenant/adminOpenId/botName/missingScopes）。
    */
-  function handleRegisterQrStream(req: IncomingMessage, res: ServerResponse): void {
+  function handleRegisterQrStream(req: IncomingMessage, res: ServerResponse, refreshAppId?: string): void {
+    for (const [id, session] of qrSessions) {
+      if (qrSessions.size < 32) break;
+      if (session.settled) qrSessions.delete(id);
+    }
+    if (qrSessions.size >= 32) {
+      sendJson(res, 409, { error: 'registration_busy', message: '已有注册正在保存，请稍后重试。' });
+      return;
+    }
     // 抢占式替换：先 abort 旧会话（旧 EventSource 收到 abort 静默关闭），再开新会话。
     qrSession?.abort.abort();
     const abort = new AbortController();
-    const session = { id: randomUUID(), abort };
+    const session: QrSession = { id: randomUUID(), abort, done: Promise.resolve(), settled: false, outcome: { state: 'running' } };
     qrSession = session;
+    qrSessions.set(session.id, session);
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
+      'X-Registration-Session-Id': session.id,
     });
     res.write(': connected\n\n');
     const heartbeat = setInterval(() => res.write(': ka\n\n'), 15_000);
@@ -620,14 +749,18 @@ export function createWebServer(opts: WebServerOptions): WebServer {
     sseCleanups.add(cleanup);
     req.on('close', cleanup);
 
-    void opts.service
-      .registerBotByQr({
-        signal: abort.signal,
-        onQr: (info) => sendEvent('qr', { qrUrl: info.url, expireIn: info.expireIn, sessionId: session.id }),
-        onStatus: (info) => sendEvent('status', { status: info.status, interval: info.interval }),
+    session.done = Promise.resolve()
+      .then(() => {
+        const callbacks = {
+          signal: abort.signal,
+          onQr: (info: { url: string; expireIn: number }) => sendEvent('qr', { qrUrl: info.url, expireIn: info.expireIn, sessionId: session.id }),
+          onStatus: (info: { status: string; interval?: number }) => sendEvent('status', { status: info.status, interval: info.interval }),
+        };
+        return refreshAppId ? opts.service.refreshBotByQr(refreshAppId, callbacks) : opts.service.registerBotByQr(callbacks);
       })
       .then((result) => {
         if (result.ok) {
+          session.outcome = { state: 'succeeded', appId: result.appId };
           // done payload 白名单字段——绝不含 client_secret（已进 keystore）。
           sendEvent('done', {
             appId: result.appId,
@@ -638,15 +771,19 @@ export function createWebServer(opts: WebServerOptions): WebServer {
             missingScopes: result.missingScopes,
           });
         } else if (result.code === 'abort') {
+          session.outcome = { state: 'cancelled' };
           // 用户主动取消 / 连接断开：静默关闭，不渲染错误。
         } else {
-          sendEvent('error', { code: result.code, message: result.reason });
+          session.outcome = { state: 'failed', code: result.code, message: result.reason.slice(0, 1024) };
+          sendEvent('error', { code: session.outcome.code, message: session.outcome.message });
         }
       })
       .catch((err) => {
-        sendEvent('error', { code: 'unknown', message: err instanceof Error ? err.message : String(err) });
+        if (session.outcome.state === 'succeeded') return;
+        session.outcome = { state: 'failed', code: 'unknown', message: (err instanceof Error ? err.message : String(err)).slice(0, 1024) };
+        sendEvent('error', { code: session.outcome.code, message: session.outcome.message });
       })
-      .finally(finish);
+      .finally(() => { session.settled = true; finish(); });
   }
 
   /**
@@ -883,12 +1020,22 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       });
     },
     close(): Promise<void> {
-      for (const cleanup of [...sseCleanups]) cleanup();
-      return new Promise((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
-      });
+      closing ??= (async () => {
+        for (const cleanup of [...sseCleanups]) cleanup();
+        for (const session of qrSessions.values()) session.abort.abort();
+        await Promise.all([opts.service.close?.(), ...[...qrSessions.values()].map(session => session.done)]);
+        await new Promise<void>((resolve, reject) => {
+          server.close((err) => (err ? reject(err) : resolve()));
+        });
+      })();
+      return closing;
     },
   };
+}
+
+function companionError(res: ServerResponse, error: unknown): void {
+  const status = error instanceof InvalidGroupInput || error instanceof URIError ? 400 : error instanceof AdminWriteError || error instanceof CodexSetupConflict ? 409 : error instanceof NotWiredYetError ? 501 : error instanceof GroupUpstreamError ? 502 : 500;
+  sendJson(res, status, { error: status === 400 ? 'invalid_request' : status === 409 ? 'conflict' : status === 501 ? 'not_supported' : status === 502 ? 'upstream' : 'internal', message: error instanceof Error ? error.message : '操作失败' });
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────

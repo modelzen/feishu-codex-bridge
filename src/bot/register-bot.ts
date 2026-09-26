@@ -15,8 +15,6 @@ import { log } from '../core/logger';
  * （config/keystore.ts），config.json 里存的是指向 keystore 的 exec SecretRef（明文
  * 绝不落 config / bots.json / 日志）。日志只记 appId + botName，绝不记 secret。
  *
- * 幂等：appId 已注册过 → addBot 按 appId 覆盖（替换 entry），keystore setSecret 覆盖
- * 旧密钥（用于同一应用重复扫码后刷新凭据）。
  */
 
 export interface RegisterBotInput {
@@ -42,7 +40,7 @@ export interface RegisterBotResult {
 export interface RegisterBotFailure {
   ok: false;
   /** 机器可分支的失败原因：格式错 / 探活拒绝（密钥无效）/ 写盘失败。 */
-  code: 'invalid_input' | 'credential_rejected' | 'persist_failed';
+  code: 'invalid_input' | 'credential_rejected' | 'persist_failed' | 'already_registered';
   /** 面向人的中文原因（扫码页面展示，绝不含 secret）。 */
   reason: string;
 }
@@ -82,6 +80,10 @@ export async function registerBotFromCredentials(
     };
   }
 
+  if ((await loadBots()).bots.some(bot => bot.appId === appId)) {
+    return { ok: false, code: 'already_registered', reason: '此 Agent 已存在，请使用刷新凭据。' };
+  }
+
   // 真探活：换 tenant_access_token，密钥无效直接拒绝——不让坏密钥落进 keystore。
   const v = await validate(appId, appSecret, tenant);
   if (!v.ok) {
@@ -93,6 +95,9 @@ export async function registerBotFromCredentials(
   }
 
   try {
+    if ((await loadBots()).bots.some(bot => bot.appId === appId)) {
+      return { ok: false, code: 'already_registered', reason: '此 Agent 已存在，请使用刷新凭据。' };
+    }
     // secret 先进 keystore（AES-256-GCM），再写指向它的 exec SecretRef config——
     // 顺序保证 config 落盘时密钥已可解析；明文绝不进 config.json / bots.json。
     await setSecret(secretKeyForApp(appId), appSecret);
@@ -108,8 +113,12 @@ export async function registerBotFromCredentials(
     await saveConfig(cfg, files.configFile);
 
     const reg = await loadBots();
-    const name = uniqueName(reg, input.desiredName ?? v.botName ?? appId);
-    await addBot({ name, appId, tenant, botName: v.botName, createdAt: Date.now() });
+    const previous = reg.bots.find(bot => bot.appId === appId);
+    const name = uniqueName(
+      { ...reg, bots: reg.bots.filter(bot => bot.appId !== appId) },
+      input.desiredName ?? previous?.name ?? v.botName ?? appId,
+    );
+    await addBot({ ...previous, name, appId, tenant, botName: v.botName, createdAt: previous?.createdAt ?? Date.now() });
 
     log.info('register-bot', 'bot-registered', { name, appId, bot: v.botName ?? null });
     return { ok: true, name, appId, tenant, botName: v.botName, missingScopes: v.missingScopes };

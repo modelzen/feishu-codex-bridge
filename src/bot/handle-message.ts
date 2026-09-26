@@ -1,3 +1,11 @@
+import { createPendingGroups, pendingGroupsFile } from '../project/pending-groups';
+import { realpath, stat } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { projectRevision, projectView, type CollaborationRequest } from '../admin/collaboration';
+import { AdminWriteError } from '../admin/ops';
+import { createSettingsOwner, settingsRevision } from '../admin/settings';
+import type { HostSettings } from '../admin/settings-types';
+import type { AdminWriteResult } from '../admin/ops';
 import { registerVoiceConsole } from './voice-console';
 import { createVoiceService } from '../voice/service';
 import { ingestVoice, createIntakeQueue, type IngestedContext } from '../voice/inbound';
@@ -149,7 +157,7 @@ import {
   type DoctorInfo,
 } from '../card/dm-cards';
 import { cliBridgeSettingsSection, CLI } from '../cli-bridge/cards';
-import { inspectCliBridgeHooks, installCliBridgeHooks, resolveBridgeHookCommand } from '../cli-bridge/hooks';
+import { inspectCliBridgeHooks } from '../cli-bridge/hooks';
 import type { CliBridgeRuntimeHooks } from '../cli-bridge/service';
 export type { CliBridgeRuntimeHooks };
 import {
@@ -177,6 +185,8 @@ import {
 import { serviceStdoutPath, serviceStderrPath } from '../service/common';
 import { bridgeVersion } from '../core/version';
 import { webConsoleUrl } from '../web/discovery';
+import { getDesktopRelease } from '../service/desktop-release';
+import { runtimeDistribution } from '../service/distribution';
 import { paths } from '../config/paths';
 import { OutboundFiles } from './outbound-files';
 import { getSecret } from '../config/keystore';
@@ -187,16 +197,19 @@ import {
   getProjectByChatId,
   getProjectByName,
   listProjects,
+  mutateProject,
   removeProject,
   turnTier,
   updateProject,
   type Project,
 } from '../project/registry';
-import { createProject, joinExistingGroup } from '../project/lifecycle';
+import { bindModeFor, createProject, joinExistingGroup } from '../project/lifecycle';
+export { bindModeFor } from '../project/lifecycle';
 import { refreshBranch } from '../project/announcement';
 import { leaveChat, transferOwnership } from '../project/group-ops';
 import {
   clearSessionTitleJobKey,
+  detachSessionsForChat,
   getSession,
   listSessions,
   patchSession,
@@ -241,10 +254,8 @@ import {
   renderCommentInstructions,
   REPLY_MAX_CHARS,
   resolveComment,
-  saveCommentInstructions,
   stripMarkdown,
   SUPPORTED_FILE_TYPES,
-  syncAllCommentInstructions,
   syncCommentInstructions,
 } from './comments';
 import { createGracefulInterrupt, Semaphore, withIdleTimeout } from './watchdog';
@@ -389,17 +400,6 @@ function backendOptionsFor(mode: PermissionMode): SelectOption[] {
   return opts.length > 1 ? opts : [];
 }
 
-/**
- * 绑定『已有群』时该项目落哪个权限档。joined 群默认只读 qa（外部群安全考量）——但
- * claude 系后端仅支持 full，若用户在绑定卡里显式选了它，就以它支持的档（full）绑定，
- * 否则 joinExistingGroup 的 assertBackendUsable 会当场拒绝「不支持该档」。codex / 未选
- * → undefined → 沿用 joinExistingGroup 的 qa 默认（外部群仍只读，安全不变）。
- */
-export function bindModeFor(backend?: string): PermissionMode | undefined {
-  const modes = backend ? catalogById(backend)?.supportedModes : undefined;
-  if (modes && !modes.includes('qa')) return modes.includes('full') ? 'full' : modes[0];
-  return undefined;
-}
 /** 把卡片提交的 backend 收成安全值：必须是注册表里的 id，否则丢弃（落回默认 codex），防伪造。 */
 export function safeBackendId(formValue: Record<string, unknown> | undefined): string | undefined {
   const v = selectValue(formValue, 'backend');
@@ -514,6 +514,7 @@ interface RunReaction {
 }
 
 export interface Orchestrator {
+  collaboration: (request: CollaborationRequest) => Promise<unknown>;
   onMessage: (msg: NormalizedMessage) => Promise<void>;
   /** `comment` event handler: @bot in a cloud-doc comment → reply in-thread. */
   onComment: (evt: CommentEvent) => Promise<void>;
@@ -529,10 +530,8 @@ export interface Orchestrator {
   /** application.bot.menu_v6（raw-tap）：bot 单聊菜单点击 → DM 管理台菜单卡。 */
   onBotMenu: (evt: { openId?: string; eventKey?: string; eventId?: string }) => Promise<void>;
   dispatcher: CardDispatcher;
-  /** 进程内管理写面（Web 控制台 / supervisor IPC 共用）：四个写操作走与 DM
-   * 卡片回调完全同一套共享函数（admin/ops.ts），含同样的校验与活跃会话驱逐；
-   * 校验拒绝抛 AdminWriteError（HTTP 409 / IPC code 还原）。 */
-  adminExecute: (op: AdminWriteOp) => Promise<void>;
+  adminExecute: (op: AdminWriteOp) => Promise<AdminWriteResult>;
+  settings: HostSettings;
   /** Close every live codex session (SIGKILLs the app-server children) so a
    *  graceful exit leaves no orphan processes. */
   shutdown: () => Promise<void>;
@@ -907,7 +906,17 @@ export function createOrchestrator(
   }
 
   // ── inbound messages ──────────────────────────────────────────────
+  const intakeChats = new Map<string, number>();
+  const pendingTopics = new Map<string, number>();
+  const resumePublications = new Set<string>();
   const onMessage = async (msg: NormalizedMessage): Promise<void> => {
+    intakeChats.set(msg.chatId, (intakeChats.get(msg.chatId) ?? 0) + 1);
+    try { await handleMessage(msg); } finally {
+      const remaining = (intakeChats.get(msg.chatId) ?? 1) - 1;
+      if (remaining) intakeChats.set(msg.chatId, remaining); else intakeChats.delete(msg.chatId);
+    }
+  };
+  const handleMessage = async (msg: NormalizedMessage): Promise<void> => {
     if (seenInbound.seen(msg.messageId)) {
       log.info('intake', 'reject', { reason: 'duplicate', msgId: msg.messageId });
       return;
@@ -935,6 +944,11 @@ export function createOrchestrator(
     }
 
     const project = await getProjectByChatId(msg.chatId);
+    if (resumePublications.has(msg.chatId)) {
+      await channel.send(msg.chatId, { markdown: '正在恢复历史会话，请完成后重发此消息。' }, { replyTo: msg.messageId });
+      return;
+    }
+    if (project?.enabled === false || projectMutations.has(msg.chatId) || resumePublications.has(msg.chatId)) return;
     // @门：没 @ 时只在「项目群 + 免@ 适用」才响应。免@默认开,但 multi 仅话题内、
     // single 整群;非项目群一律不响应非 @ 消息。
     if (!msg.mentionedBot && !(project && shouldRespondWithoutMention(project, msg))) return;
@@ -1264,6 +1278,7 @@ export function createOrchestrator(
    * `flat` = reply by quoting (no reply_in_thread / topic), for single groups.
    */
   function handleTurn(msg: NormalizedMessage, text: string, sessionKey: string, flat: boolean, project: Project | undefined, perm: TurnPerm): Promise<void> {
+    if (project?.enabled === false || projectMutations.has(msg.chatId) || resumePublications.has(msg.chatId)) return Promise.resolve();
     const owner = active.get(sessionKey);
     return orderTurns(sessionKey, async () => {
       if (owner?.intakeCancelled) {
@@ -1403,6 +1418,7 @@ export function createOrchestrator(
     const titleSource: SessionTitleSource = goal
       ? { text, rawContentType: 'text' }
       : sessionTitleSourceFromMessage(msg, summaryText ?? text);
+    if (project?.enabled === false || projectMutations.has(msg.chatId) || resumePublications.has(msg.chatId)) return;
     const existing = active.get(sessionKey);
     if (existing) {
       // A goal can't co-run with (or queue behind) a turn on the same session —
@@ -1676,6 +1692,7 @@ export function createOrchestrator(
     // later must not strand existing sessions on the wrong runtime; the project
     // is still consulted for cwd / tier defaults on the recreate path below.
     const project = await getProjectByChatId(chatId);
+    if (project && rec.cwd !== project.cwd) return { thread: undefined, recreated: true };
     const be = backendFor(rec.backend);
     try {
       const resumed = await be.resumeThread({
@@ -1739,6 +1756,8 @@ export function createOrchestrator(
    * Detached — onMessage must return fast (see {@link handleTurn}); a new
    * topic has a unique reply target so no same-topic reservation is needed. */
   function startTopicDirectly(msg: NormalizedMessage, text: string, project?: Project, goal?: boolean): void {
+    if (resumePublications.has(msg.chatId) || projectMutations.has(msg.chatId)) return;
+    pendingTopics.set(msg.chatId, (pendingTopics.get(msg.chatId) ?? 0) + 1);
     const titleSource: SessionTitleSource = goal
       ? { text, rawContentType: 'text' }
       : sessionTitleSourceFromMessage(msg, text);
@@ -1792,8 +1811,8 @@ export function createOrchestrator(
         voiceReply = ingested.voice;
       } catch (err) {
         reaction?.done();
-        // 失败路互不拖死：threadP 若已成功则回收孤儿进程，若失败吞掉其 rejection。
-        void threadP.then((s) => s.thread.close()).catch(() => undefined);
+        // Keep the project reserved until any delayed backend process has closed.
+        await threadP.then((s) => s.thread.close()).catch(() => undefined);
         log.fail('card', err, { phase: 'start-topic' });
         await channel
           .send(msg.chatId, { markdown: `❌ 启动失败：${err instanceof Error ? err.message : String(err)}` }, { replyTo: msg.messageId })
@@ -1802,6 +1821,14 @@ export function createOrchestrator(
       }
       log.info('card', 'start', { project: project?.name ?? '(unregistered)', model, effort, images: images?.length ?? 0, goal: Boolean(goal) });
       const titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource);
+      if (project) {
+        const current = await getProjectByChatId(project.chatId);
+        if (!current || current.enabled === false || projectRevision(current) !== projectRevision(project)) {
+          await thread.close();
+          reaction?.done();
+          return;
+        }
+      }
       const launchOpts: LaunchOpts = {
         chatId: msg.chatId,
         replyTo: msg.messageId,
@@ -1830,7 +1857,10 @@ export function createOrchestrator(
           reaction,
           () => reaction?.done(), // topic created → ✅ DONE (don't wait for the reply)
         ));
-    }).catch((err) => log.fail('intake', err));
+    }).catch((err) => log.fail('intake', err)).finally(() => {
+      const remaining = (pendingTopics.get(msg.chatId) ?? 1) - 1;
+      if (remaining) pendingTopics.set(msg.chatId, remaining); else pendingTopics.delete(msg.chatId);
+    });
   }
 
   /** Group @bot /resume: post the history picker for this project's cwd. Owner-only
@@ -2503,39 +2533,15 @@ export function createOrchestrator(
     return saved;
   }
 
-  // CLI service state and its persisted enabled flag are one transition. Keep
-  // rapid on/off clicks ordered; if persistence fails after the side effect,
-  // compensate back to the last committed config so runtime and disk agree.
-  let cliEnabledTransition: Promise<unknown> = Promise.resolve();
+  let cardCliTransitions: Promise<unknown> = Promise.resolve();
   function setCliBridgeEnabled(evt: CardActionEvent, enabled: boolean): Promise<void> {
-    const run = cliEnabledTransition.then(async () => {
-      if (getCliBridgePreferences(cfg).enabled === enabled) return;
-      try {
-        if (enabled) await cliBridge?.start?.();
-        else await cliBridge?.shutdown?.();
-
-        const saved = await applyPref(
-          evt,
-          (p) => {
-            p.cliBridge = { ...(p.cliBridge ?? {}), enabled };
-          },
-          { render: false },
-        );
-        if (!saved) {
-          // Best-effort rollback of the runtime side effect. The persisted and
-          // LIVE config deliberately stayed unchanged on write failure.
-          if (enabled) await cliBridge?.shutdown?.();
-          else await cliBridge?.start?.();
-        }
-      } catch (err) {
-        log.fail('cli-bridge', err, { phase: enabled ? 'enable' : 'disable' });
-      }
-    });
-    cliEnabledTransition = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+    if (!dmAdmin(evt.operator?.openId)) return Promise.resolve();
+    const next = cardCliTransitions.then(async () => {
+      const result = await settings.act({ kind: 'setCliBridgeEnabled', botId: cfg.accounts.app.id, enabled, revision: settingsRevision([cfg.accounts.app.id, cfg.preferences?.cliBridge?.enabled]) });
+      if (result.kind !== 'saved') log.info('cli-bridge', 'settings-transition-failed', { result: result.kind });
+    }).catch(() => { log.info('cli-bridge', 'settings-transition-failed'); });
+    cardCliTransitions = next;
+    return next;
   }
 
   // 「☕ 咖啡一下」那组控件现在独立成二级卡（buildCoffeeSettingsCard），主设置卡只放入口。
@@ -2573,7 +2579,7 @@ export function createOrchestrator(
 
   /** ☕ 咖啡一下 二级卡：本机离开转发那组控件（总开关 / 通知范围 / 转发后端 / 离开保活 /
    *  hooks）独立渲染。进卡 / 修复 hooks 时刷新一次 hook 安装状态，其它轴的改动复用缓存。 */
-  async function renderCoffeeSettings(refreshHooks = false): Promise<object> {
+  async function renderCoffeeSettings(refreshHooks = false, notice?: string): Promise<object> {
     if (refreshHooks || !cliHookStatuses) cliHookStatuses = await inspectCliBridgeHooks();
     const cliPrefs = getCliBridgePreferences(cfg);
     const section = cliBridgeSettingsSection({
@@ -2584,6 +2590,7 @@ export function createOrchestrator(
       agents: cliPrefs.agents,
       keepAwake: cliPrefs.keepAwake.enabled,
     });
+    if (notice) section.splice(1, 0, { tag: 'markdown', content: notice });
     return buildCoffeeSettingsCard(section);
   }
 
@@ -2649,7 +2656,7 @@ export function createOrchestrator(
       const current = prefs.sessionTitles ?? {};
       prefs.sessionTitles = {
         ...current,
-        byBackend: { ...(current.byBackend ?? {}), [backendId]: config },
+        byBackend: { ...(current.byBackend ?? {}), [backendId]: { ...current.byBackend?.[backendId], ...config } },
       };
     }).then(
       () => true,
@@ -2666,6 +2673,18 @@ export function createOrchestrator(
       sendFreshSettingsResult(evt, renderSaved, 'session-title-submit-result');
     } else {
       void patch(evt, renderSaved);
+    }
+  }
+
+  async function saveCommentRulesFromCard(evt: CardActionEvent, content: { kind: 'custom'; text: string } | { kind: 'default' }): Promise<void> {
+    try {
+      const view = await settings.read({ kind: 'agent', botId: cfg.accounts.app.id });
+      if (!('commentInstructions' in view)) return;
+      const result = await settings.act({ kind: 'commentInstructions', botId: cfg.accounts.app.id, revision: view.commentInstructions.revision, content });
+      const notice = result.kind === 'saved' ? result.warnings.join('；') || '✅ 回复规则已保存并同步，下一条评论生效。' : '⚠️ 保存失败或规则已被修改，请刷新后重试。';
+      sendFreshSettingsResult(evt, () => buildCommentPromptCard(content.kind === 'custom' ? content.text : DEFAULT_COMMENT_INSTRUCTIONS, notice, paths.commentInstructionsFile), 'comment-prompt-result');
+    } catch {
+      sendFreshSettingsResult(evt, () => buildCommentPromptCard(content.kind === 'custom' ? content.text : DEFAULT_COMMENT_INSTRUCTIONS, '⚠️ 回复规则不能为空或过长，未保存。', paths.commentInstructionsFile), 'comment-prompt-validation');
     }
   }
 
@@ -2768,8 +2787,13 @@ export function createOrchestrator(
   // Back-to-menu: the settings card is button-only (never locks) and the
   // new-project form isn't locked until it's submitted, so 返回 always lands on
   // a card we can update in place — no recall, no fresh entity needed.
+  const renderDmMenuCard = async (): Promise<object> => buildDmMenuCard({
+      webConsoleUrl: webConsoleUrl(),
+      version: bridgeVersion(),
+      desktopRelease: await getDesktopRelease(),
+    });
   const freshMenu = (evt: CardActionEvent): void => {
-    patch(evt, buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() }));
+    patch(evt, renderDmMenuCard);
   };
 
   // 📊 Codex 用量：loading 卡先落地（取数走网络 1~3s），结果再原地覆盖。错误按
@@ -2976,32 +3000,20 @@ export function createOrchestrator(
     .on(DM.coffeeSettings, async ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) await patch(evt, () => renderCoffeeSettings(true));
     })
-    .on(CLI.toggleEnabled, ({ evt, value }) => {
+    .on(CLI.toggleEnabled, async ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const enabled = value.v === 'on';
       if (enabled && !canEnableCliBridge(cfg).ok) return;
-      const transition = setCliBridgeEnabled(evt, enabled);
-      void patch(evt, async () => {
-        await transition;
-        return renderCoffeeSettings();
-      });
+      await setCliBridgeEnabled(evt, enabled);
+      void patch(evt, () => renderCoffeeSettings());
     })
     .on(CLI.repairHooks, async ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      // installCliBridgeHooks does raw fs writes (~/.claude, ~/.codex) that can
-      // throw (EACCES/ENOSPC); keep it inside the awaited handler so the
-      // dispatcher's try/catch covers it — there is no global rejection net
-      // (see cli-bridge/ipc.ts). Still refresh the card on failure.
-      try {
-        await installCliBridgeHooks({
-          agents: { claude: true, codex: true },
-          command: resolveBridgeHookCommand(cfg.accounts.app.id),
-        });
-      } catch (err) {
-        log.fail('cli-bridge', err, { phase: 'repair-hooks' });
-      }
-      // Just wrote the hook files — force a fresh inspect so the status reflects it.
-      await patch(evt, () => renderCoffeeSettings(true));
+      const result = await settings.act({ kind: 'repairCliHooks', botId: cfg.accounts.app.id });
+      const notice = result.kind === 'saved'
+        ? result.warnings.join('；') || 'Hooks 已修复。'
+        : 'Hooks 修复未完成，请检查本机配置后重试。';
+      patch(evt, () => renderCoffeeSettings(true, notice));
     })
     // 这三个轴属于咖啡子卡：applyPref 落盘但不渲染（{render:false}），改由我们 patch 回
     // 咖啡子卡（renderSettings 现在只渲主卡入口，会把用户踢出子卡）。
@@ -3093,13 +3105,15 @@ export function createOrchestrator(
           () => undefined,
         );
         const current = currentVersion();
-        const latest = await latestVersion().catch(() => null);
+        const [latest, desktopRelease, distribution] = await Promise.all([
+          latestVersion().catch(() => null), getDesktopRelease(), runtimeDistribution(),
+        ]);
         const hasUpdate = !!latest && isNewer(latest, current);
         log.info('console', 'update-check', { current, latest, hasUpdate });
         await updateManagedCard(
           channel,
           evt.messageId,
-          buildUpdateCard({ phase: 'checked', current, latest, hasUpdate, dev: isDevSource() }),
+          buildUpdateCard({ phase: 'checked', current, latest, hasUpdate, dev: isDevSource(), desktopRelease, distribution: distribution.kind === 'bundled' ? 'bundled' : 'other' }),
         ).catch((e) => log.fail('console', e, { phase: 'update-check' }));
       })();
     })
@@ -3113,6 +3127,10 @@ export function createOrchestrator(
       void (async () => {
         await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
         const from = currentVersion();
+        if ((await runtimeDistribution()).kind === 'bundled') {
+          await updateManagedCard(channel, evt.messageId, buildUpdateCard({ phase: 'checked', current: from, distribution: 'bundled' })).catch(() => undefined);
+          return;
+        }
         // 跨进程更新锁（B）：与 Web「升级」共用一把锁，防止两个 `npm i -g` 并发装坏全局
         // 目录。拿不到＝已有更新在跑，直接提示「进行中」并退出，不叠跑第二个安装。
         const release = acquireUpdateLock();
@@ -3144,11 +3162,12 @@ export function createOrchestrator(
         }
         const to = currentVersion();
         const willRestart = daemonRunning();
+        const desktopRelease = await getDesktopRelease();
         log.info('console', 'update-done', { from, to, willRestart });
         await updateManagedCard(
           channel,
           evt.messageId,
-          buildUpdateCard({ phase: 'done', from, to, willRestart }),
+          buildUpdateCard({ phase: 'done', from, to, willRestart, desktopRelease }),
         ).catch((e) => log.fail('console', e, { phase: 'update-done' }));
         if (willRestart) {
           // 给完成卡一点渲染时间，再触发重启（mac：kill 自己靠 launchd 复活；Windows：
@@ -3469,85 +3488,11 @@ export function createOrchestrator(
     .on(DM.commentPromptSubmit, ({ evt, formValue }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const content = typeof formValue?.prompt === 'string' ? formValue.prompt : '';
-      void (async () => {
-        if (!content.trim()) {
-          const cur = await loadCommentInstructions(paths.commentInstructionsFile);
-          sendFreshSettingsResult(
-            evt,
-            () => buildCommentPromptCard(cur, '⚠️ 回复规则不能为空，未保存。', paths.commentInstructionsFile),
-            'comment-prompt-submit-validation',
-          );
-          return;
-        }
-        try {
-          await saveCommentInstructions(paths.commentInstructionsFile, content);
-        } catch (err) {
-          log.fail('console', err, { phase: 'save-comment-prompt' });
-          sendFreshSettingsResult(
-            evt,
-            () => buildCommentPromptCard(content, '⚠️ 回复规则保存失败，原规则未改变，请重试。', paths.commentInstructionsFile),
-            'comment-prompt-submit-result',
-          );
-          return;
-        }
-        const n = await syncAllCommentInstructions(paths.commentsRootDir, content, cfg.accounts.app.tenant).catch(
-          (err) => {
-            log.fail('console', err, { phase: 'sync-comment-prompt' });
-            return undefined;
-          },
-        );
-        sendFreshSettingsResult(
-          evt,
-          () => buildCommentPromptCard(
-            content,
-            n === undefined
-              ? '⚠️ 回复规则已保存，但同步到已有文档失败，请重试。'
-              : `✅ 回复规则已保存，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
-            paths.commentInstructionsFile,
-          ),
-          'comment-prompt-submit-result',
-        );
-      })();
+      void saveCommentRulesFromCard(evt, { kind: 'custom', text: content });
     })
-    // 重置为默认：忽略输入框内容，把内置默认模板写回 master + 同步进所有评论工作目录（含历史），
-    // 重渲编辑卡并预填默认（与「保存」一样即时生效、即时同步）。
     .on(DM.commentResetPrompt, ({ evt }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
-      void (async () => {
-        try {
-          await saveCommentInstructions(paths.commentInstructionsFile, DEFAULT_COMMENT_INSTRUCTIONS);
-        } catch (err) {
-          log.fail('console', err, { phase: 'reset-comment-prompt' });
-          const current = await loadCommentInstructions(paths.commentInstructionsFile).catch(
-            () => DEFAULT_COMMENT_INSTRUCTIONS,
-          );
-          sendFreshSettingsResult(
-            evt,
-            () => buildCommentPromptCard(current, '⚠️ 重置失败，原回复规则未改变，请重试。', paths.commentInstructionsFile),
-            'comment-prompt-reset-result',
-          );
-          return;
-        }
-        const n = await syncAllCommentInstructions(
-          paths.commentsRootDir,
-          DEFAULT_COMMENT_INSTRUCTIONS,
-          cfg.accounts.app.tenant,
-        ).catch((err) => {
-          log.fail('console', err, { phase: 'sync-comment-prompt' });
-          return undefined;
-        });
-        sendFreshSettingsResult(
-          evt,
-          () => buildCommentPromptCard(
-            DEFAULT_COMMENT_INSTRUCTIONS,
-            n === undefined
-              ? '⚠️ 已重置为默认回复规则，但同步到已有文档失败，请重试。'
-              : `↩️ 已重置为默认回复规则，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
-            paths.commentInstructionsFile,
-          ),
-          'comment-prompt-reset-result',
-        );
-      })();
+      void saveCommentRulesFromCard(evt, { kind: 'default' });
     })
     // In-group settings: toggle 免@ for the project bound to evt.chatId. Admin-gated.
     // 写路径走管理面共享层（admin/ops.ts）——与 DM 卡片 / Web 控制台同一套落盘逻辑。
@@ -3676,7 +3621,7 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : '';
       patch(evt, async () => {
         const p = await getProjectByName(name);
-        if (!p) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        if (!p) return renderDmMenuCard();
         return buildAllowlistCard(p, await namesWithOperator(evt, p.allowedUsers ?? []));
       });
     })
@@ -3712,7 +3657,7 @@ export function createOrchestrator(
       patch(evt, async () => {
         await updateProject(name, (p) => ({ allowedUsers: (p.allowedUsers ?? []).filter((x) => x !== id) }));
         const fresh = await getProjectByName(name); // 写后回读，与盘上一致
-        if (!fresh) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        if (!fresh) return renderDmMenuCard();
         return buildAllowlistCard(fresh, await namesWithOperator(evt, fresh.allowedUsers ?? []));
       });
     })
@@ -3722,7 +3667,7 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : '';
       patch(evt, async () => {
         const p = await getProjectByName(name);
-        return p ? buildProjectSettingsCard(p, backendDisplayName(p.backend)) : buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        return p ? buildProjectSettingsCard(p, backendDisplayName(p.backend)) : renderDmMenuCard();
       });
     })
     .on(DM.projectTopics, ({ evt, value }) => {
@@ -3730,7 +3675,7 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : '';
       patch(evt, async () => {
         const p = await getProjectByName(name);
-        if (!p) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        if (!p) return renderDmMenuCard();
         const sessions = (await listSessions()).filter((s) => s.chatId === p.chatId);
         return buildProjectTopicsCard(p, sessions);
       });
@@ -3742,7 +3687,7 @@ export function createOrchestrator(
       const on = value.v === 'on';
       patch(evt, async () => {
         const r = await performSetNoMention({ projectName: name, on });
-        if (!r.ok) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        if (!r.ok) return renderDmMenuCard();
         return buildProjectSettingsCard(r.project, backendDisplayName(r.project.backend));
       });
     })
@@ -3754,7 +3699,7 @@ export function createOrchestrator(
         // 共享层落盘 + 驱逐活跃会话（压缩上限在 thread/start 绑定，驱逐后下一条
         // 消息重绑生效——mirrors 群设置）。
         const r = await performSetAutoCompact({ projectName: name, on, evictLiveSessionsForChat });
-        if (!r.ok) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        if (!r.ok) return renderDmMenuCard();
         log.info('console', 'project-autocompact', { project: name, on });
         return buildProjectSettingsCard(r.project, backendDisplayName(r.project.backend));
       });
@@ -3765,7 +3710,7 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : '';
       patch(evt, async () => {
         const p = await getProjectByName(name);
-        return p ? buildPermissionCard(p) : buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        return p ? buildPermissionCard(p) : renderDmMenuCard();
       });
     })
     // 提交权限表单：落盘 管理员档 mode / 普通用户档 guestMode / 联网，再驱逐本项目活跃会话
@@ -3794,7 +3739,7 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : '';
       patch(evt, async () => {
         const p = await getProjectByName(name);
-        if (!p) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        if (!p) return renderDmMenuCard();
         const models = await listModels(backendFor(p.backend));
         return buildModelDefaultCard(p, models, 'dm');
       });
@@ -3973,6 +3918,201 @@ export function createOrchestrator(
       state.launching = false;
       log.fail('card', err, { phase: 'resume-launch' });
       settleUpdate(evt.messageId, buildResumeErrorCard(state, err instanceof Error ? err.message : String(err)));
+    }
+  }
+
+  const projectMutations = new Set<string>();
+  const runIds = new WeakMap<ActiveState, { run: AgentRun | undefined; id: string }>();
+  let createChain: Promise<unknown> = Promise.resolve();
+  const createRequests = new Map<string, { signature: string; result: Promise<unknown> }>();
+  const runId = (state: ActiveState): string => {
+    let identity = runIds.get(state);
+    if (!identity || identity.run !== state.run) { identity = { run: state.run, id: randomUUID() }; runIds.set(state, identity); }
+    return identity.id;
+  };
+  async function collaboration(request: CollaborationRequest): Promise<unknown> {
+    const owner = resolveOwner(cfg);
+    if (!owner) throw new AdminWriteError('请先配置此 Agent 的飞书管理员');
+    if (request.action === 'usage') return { data: await fetchUsageBundle(request.force) };
+    if (request.action === 'createProject') {
+      const signature = JSON.stringify(request);
+      const persisted = (await listProjects()).find(item => item.creationRequestId === request.requestId);
+      if (persisted) {
+        if (persisted.creationRequestSignature !== signature) throw new AdminWriteError('创建请求标识已用于其他参数');
+        return { ok: true, project: projectView(persisted) };
+      }
+      const prior = createRequests.get(request.requestId);
+      if (prior) {
+        if (prior.signature !== signature) throw new AdminWriteError('创建请求标识已用于其他参数');
+        return prior.result;
+      }
+      const result = createChain.then(async () => {
+        const directory = request.directory === undefined ? undefined : await realpath(request.directory);
+        if (directory !== undefined && !(await stat(directory)).isDirectory()) throw new AdminWriteError('所选文件夹不是目录');
+        const project = await createProject(channel, { requestId: request.requestId, requestSignature: signature, name: request.name, ownerOpenId: owner, existingPath: directory, projectsRootDir: cfg.preferences?.projectsRootDir, kind: request.kind, backend: request.backend, mode: bindModeFor(request.backend) });
+        return { ok: true, project: projectView(project) };
+      });
+      createChain = result.catch(() => undefined);
+      void result.then(() => createRequests.delete(request.requestId), () => createRequests.delete(request.requestId));
+      createRequests.set(request.requestId, { signature, result });
+      return result;
+    }
+    const project = await getProjectByName(request.projectName);
+    if (!project || project.chatId !== request.chatId) throw new AdminWriteError('项目已改变，请刷新后重试');
+    if (request.action === 'project') return { project: projectView(project) };
+    if (request.action === 'shareUsage') {
+      const sections = parseShareSections(request.sections);
+      const sent = await sendManagedCard(channel, project.chatId, buildUsageShareCard(await fetchUsageBundle(), { sections }));
+      return { messageId: sent.messageId };
+    }
+    const records = (await listSessions()).filter(record => record.chatId === project.chatId);
+    const currentProject = await getProjectByName(project.name);
+    if (!currentProject || projectRevision(currentProject) !== projectRevision(project)) throw new AdminWriteError('项目已改变，请刷新后重试');
+    const be = backendFor(project.backend);
+    if (request.action === 'history') {
+      try { return { sessions: records, threads: await be.listThreads(project.cwd), backend: be.id }; }
+      catch (error) { return { sessions: records, threads: [], backend: be.id, threadsError: error instanceof Error ? error.message : '无法读取后端历史' }; }
+    }
+    if (request.action === 'editProject' || request.action === 'removeProject') {
+      if (projectRevision(project) !== request.expectedRevision) throw new AdminWriteError('项目设置已改变，请刷新后重试');
+      if (projectMutations.has(project.chatId) || active.size > 0 || intakeChats.has(project.chatId) || pendingTopics.has(project.chatId)) throw new AdminWriteError('Agent 正在执行任务，请结束后修改项目');
+      projectMutations.add(project.chatId);
+      try {
+        const current = await getProjectByName(project.name);
+        if (!current || projectRevision(current) !== request.expectedRevision) throw new AdminWriteError('项目设置已改变，请刷新后重试');
+        if (request.action === 'removeProject') {
+          const removed = await removeProject(project.name, latest => {
+            if (projectRevision(latest) !== request.expectedRevision) throw new AdminWriteError('项目设置已改变，请刷新后重试');
+          });
+          if (!removed) throw new AdminWriteError('项目已移除，请刷新');
+          for (const rec of records) { const thread = sessions.get(rec.threadId); sessions.delete(rec.threadId); if (thread) await thread.close().catch(error => log.fail('desktop', error, { phase: 'project-session-close' })); }
+          let groupEffect: 'left' | 'transferred' | 'failed';
+          let warning: string | undefined;
+          try {
+            if (project.origin === 'joined') { await leaveChat(channel, project.chatId); groupEffect = 'left'; }
+            else { await transferOwnership(channel, project.chatId, owner); groupEffect = 'transferred'; }
+          } catch (error) { groupEffect = 'failed'; warning = error instanceof Error ? error.message : '飞书群操作失败'; }
+          return { ok: true, groupEffect, ...(warning ? { warning } : {}) };
+        }
+        const patch: Partial<Project> = {};
+        if (request.directory !== undefined) {
+          const cwd = await realpath(request.directory);
+          if (!(await stat(cwd)).isDirectory()) throw new AdminWriteError('所选文件夹不是目录');
+          patch.cwd = cwd;
+          if (cwd !== project.cwd) patch.blank = false;
+        }
+        if (request.kind !== undefined) patch.kind = request.kind;
+        if (request.enabled !== undefined) patch.enabled = request.enabled;
+        const commit = () => mutateProject(project.name, latest => {
+          if (projectRevision(latest) !== request.expectedRevision) throw new AdminWriteError('项目设置已改变，请刷新后重试');
+          Object.assign(latest, patch);
+        });
+        const archive = (patch.cwd !== undefined && patch.cwd !== project.cwd) || (patch.kind !== undefined && patch.kind !== (project.kind ?? 'multi'));
+        const updated = archive ? await detachSessionsForChat(project.chatId, commit) : await commit();
+        for (const rec of records) {
+          const thread = sessions.get(rec.threadId); sessions.delete(rec.threadId);
+          if (thread) await thread.close().catch(error => log.fail('desktop', error, { phase: 'project-session-close' }));
+        }
+        return { ok: true, project: projectView(updated) };
+      } finally { projectMutations.delete(project.chatId); }
+    }
+    if (projectMutations.has(project.chatId) || project.enabled === false) throw new AdminWriteError('项目已停用或正在修改');
+    const perm = turnSession(project.chatId, project, owner);
+    if (request.action === 'resume') {
+      if (request.backend !== be.id) throw new AdminWriteError('项目后端已改变');
+      const available = await be.listThreads(project.cwd);
+      if (!available.some(item => item.sessionId === request.sessionId)) throw new AdminWriteError('历史会话不属于当前项目');
+      const current = await getProjectByName(project.name);
+      if (!current || projectMutations.has(project.chatId) || projectRevision(current) !== projectRevision(project)) throw new AdminWriteError('项目已改变，请刷新后重试');
+      const key = project.kind === 'single' ? perm.sessionKey : `desktop-resume:${project.chatId}`;
+      if (active.has(key) || intakeChats.has(project.chatId) || pendingTopics.has(project.chatId)) throw new AdminWriteError('会话正在运行');
+      const reserved: ActiveState = { queue: [], requesterOpenId: owner };
+      active.set(key, reserved);
+      if (project.kind !== 'single') resumePublications.add(project.chatId);
+      let publishedKey: string | undefined;
+      try {
+        const history = await be.readHistory(project.cwd, request.sessionId);
+        let threadId = key;
+        if (project.kind === 'single') {
+          await sendManagedCard(channel, project.chatId, buildHistoryCard({ cwd: project.cwd, projectName: project.name, history }));
+        } else {
+          const root = await channel.send(project.chatId, { markdown: '从桌面端恢复历史会话' });
+          const sent = await sendManagedCard(channel, project.chatId, buildHistoryCard({ cwd: project.cwd, projectName: project.name, history }), root.messageId, true);
+          const tid = await getThreadId(channel, sent.messageId, 4);
+          if (!tid) throw new AdminWriteError('已创建话题，但飞书尚未返回话题标识；会话未绑定');
+          threadId = turnSession(tid, project, owner).sessionKey;
+          if (active.has(threadId)) throw new AdminWriteError('新话题已有任务，会话未切换');
+          active.set(threadId, reserved);
+          publishedKey = threadId;
+        }
+        const old = sessions.get(threadId); sessions.delete(threadId); if (old) await old.close();
+        lastUsage.delete(threadId);
+        const now = Date.now();
+        await upsertSession({ threadId, chatId: project.chatId, cwd: project.cwd, sessionId: request.sessionId, backend: be.id, summary: history.name || history.preview || '(恢复会话)', createdAt: now, updatedAt: now });
+        return { ok: true, threadId };
+      } finally {
+        resumePublications.delete(project.chatId);
+        if (publishedKey && active.get(publishedKey) === reserved) active.delete(publishedKey);
+        if (active.get(key) === reserved) active.delete(key);
+        if (reserved.queue.length) await channel.send(project.chatId, { markdown: `切回期间收到的 ${reserved.queue.length} 条消息未执行，请重发。` });
+      }
+    }
+    const record = records.find(item => item.threadId === request.threadId);
+    if (!record || record.detached) throw new AdminWriteError('此会话已归档或不属于当前项目，请开始新会话');
+    const key = record.threadId;
+    const state = active.get(key);
+    if (request.action === 'context') return { threadId: key, usage: lastUsage.get(key) ?? null, run: state ? { id: runId(state), goal: state.isGoal === true, canStop: Boolean(state.interrupt), canEndGoal: Boolean(state.endGoal), canRemind: state.requesterOpenId === owner && shouldShowCompletionReminderButton(cfg) && !state.isGoal, reminderRequested: state.completionReminderRequested === true } : null };
+    if (request.action === 'stop' || request.action === 'endGoal' || request.action === 'reminder') {
+      if (!state || runId(state) !== request.runId) throw new AdminWriteError('原任务已经结束，请刷新');
+      if (request.action === 'stop') { if (!state.interrupt) throw new AdminWriteError('任务正在准备，请稍后停止'); state.interrupt(); }
+      else if (request.action === 'endGoal') { if (!state.endGoal) throw new AdminWriteError('当前不是目标任务'); state.endGoal(); }
+      else {
+        if (state.requesterOpenId !== owner || !shouldShowCompletionReminderButton(cfg) || state.isGoal) throw new AdminWriteError('仅任务发起人可设置本次完成提醒，且需开启手动提醒模式');
+        state.completionReminderRequested = request.requested;
+        refreshCompletionReminderCards();
+      }
+      return { ok: true };
+    }
+    if (state) throw new AdminWriteError('会话正在运行，请完成后重试');
+    if (key.endsWith('#guest')) throw new AdminWriteError('请在管理员会话中操作，普通用户上下文保持独立');
+    if (record.cwd !== project.cwd) throw new AdminWriteError('此历史会话使用原项目目录，请选择新会话');
+    const sessionBackend = backendFor(record.backend);
+    if (request.action === 'startGoal' && sessionBackend.capabilities?.goal === false) throw new AdminWriteError('当前后端不支持自主目标');
+    if (request.action === 'compact' && sessionBackend.capabilities?.compact === false) throw new AdminWriteError('当前后端不支持手动压缩');
+    const reserved: ActiveState = { queue: [], requesterOpenId: owner };
+    active.set(key, reserved);
+    let launched = false;
+    try {
+      if (request.action === 'clear') {
+        if (project.kind !== 'single' || key !== perm.sessionKey) throw new AdminWriteError('只有单会话群可以清空当前上下文');
+        const fresh = await sessionBackend.startThread({ cwd: project.cwd, model: record.model, effort: record.effort, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
+        const now = Date.now();
+        try { await upsertSession({ ...record, sessionId: fresh.sessionId, summary: '(新会话)', createdAt: now, updatedAt: now }); }
+        catch (error) { await fresh.close(); throw error; }
+        const old = sessions.get(key); if (old) await old.close();
+        trackSession(key, fresh); lastUsage.delete(key);
+        return { ok: true, threadId: key };
+      }
+      const { thread } = await resolveThread(key, project.chatId, perm);
+      if (!thread) throw new AdminWriteError('会话尚未开始');
+      if (request.action === 'compact') {
+        const result = await thread.compact();
+        if (result.usage) lastUsage.set(key, { used: result.usage.usedTokens, window: result.usage.contextWindow }); else lastUsage.delete(key);
+        return { ok: true, threadId: key };
+      }
+      let replyTo: string | undefined;
+      if (project.kind !== 'single') {
+        const messages = await channel.rawClient.im.v1.message.list({ params: { container_id_type: 'thread', container_id: key.replace(/#(admin|guest)$/, ''), page_size: 1 } });
+        replyTo = messages.data?.items?.[0]?.message_id;
+        if (messages.code !== 0 || !replyTo) throw new AdminWriteError('无法定位原飞书话题，请在飞书确认话题仍然存在');
+      }
+      const root = await channel.send(project.chatId, { markdown: `桌面端启动目标：${request.objective}` }, replyTo ? { replyTo, replyInThread: true } : undefined);
+      launched = true;
+      void trackRun(launchGoalRun({ chatId: project.chatId, replyTo: root.messageId, thread, firstText: request.objective, knownThreadId: key, cwd: project.cwd, mode: perm.mode, model: record.model, effort: record.effort, flat: project.kind === 'single', roleSuffix: perm.roleSuffix, backendId: sessionBackend.id, requesterOpenId: owner, titleSource: { text: request.objective, rawContentType: 'text' } })).catch(error => log.fail('desktop', error));
+      return { ok: true, threadId: key };
+    } finally {
+      if (!launched && active.get(key) === reserved) active.delete(key);
+      if (!launched && reserved.queue.length) await channel.send(project.chatId, { markdown: `操作期间收到的 ${reserved.queue.length} 条消息未执行，请重发。` });
     }
   }
 
@@ -5288,43 +5428,28 @@ export function createOrchestrator(
     return run;
   }
 
-  /** Reuse the in-memory thread for a comment session, else resume the persisted
-   * one, else start a fresh thread in `cwd` (the per-doc comment dir, holding the
-   * synced AGENTS.md / CLAUDE.md). Fresh threads pick their backend + model/effort
-   * from the global comments config; resumed ones keep what they were created with.
-   * `instructions` is the prompt content just synced to the cwd: a live thread read
-   * those files only at start/resume, so if they changed since (user edited the
-   * master prompt) we recycle the live thread to force a re-read. */
   async function resolveDocThread(
     sessionKey: string,
     cwd: string,
     instructions: string,
     question: string,
   ): Promise<AgentThread> {
+    const comments = getCommentsConfig(cfg);
+    const be = backendFor(comments.backend);
+    const { model, effort } = pickDefault(await listModels(be), { model: comments.model, effort: comments.effort });
+    const rec = await getSession(sessionKey);
+    const selectionChanged = rec && (rec.backend !== be.id || rec.model !== model || rec.effort !== effort);
     const live = sessions.get(sessionKey);
     if (live) {
-      const alive = live.isAlive();
-      // Instructions unchanged + alive → reuse the warm thread (the common case).
-      if (alive && commentInstrUsed.get(sessionKey) === instructions) return live;
-      // Edited prompt (alive but stale) → close the in-memory thread we're discarding
-      // so the resume below re-reads the freshly-synced AGENTS.md/CLAUDE.md. Dead
-      // thread → just evict (与 resolveThread 同款守卫；app-server 死后死线程留在缓存，
-      // 每次 @ 评论都立即失败)，落进下面的 resume-or-fresh 兜底自愈。
-      if (alive && commentInstrUsed.get(sessionKey) !== instructions) void live.close().catch(() => undefined);
+      if (live.isAlive() && !selectionChanged && commentInstrUsed.get(sessionKey) === instructions) return live;
+      await live.close().catch(() => undefined);
       sessions.delete(sessionKey);
       commentInstrUsed.delete(sessionKey);
-      log.info('agent', alive ? 'comment-instr-changed-evict' : 'dead-thread-evict', { sessionKey });
     }
-    const rec = await getSession(sessionKey);
-    if (rec) {
+    if (rec && rec.backend === be.id) {
       try {
-        // Same record-backend routing as resolveThread (doc sessions persist too).
-        const resumed = await backendFor(rec.backend).resumeThread({
-          cwd: rec.cwd,
-          sessionId: rec.sessionId,
-          model: rec.model,
-          effort: rec.effort,
-        });
+        const resumed = await be.resumeThread({ cwd: rec.cwd, sessionId: rec.sessionId, model, effort });
+        await patchSession(sessionKey, { model, effort });
         trackSession(sessionKey, resumed);
         commentInstrUsed.set(sessionKey, instructions);
         return resumed;
@@ -5332,15 +5457,6 @@ export function createOrchestrator(
         log.fail('agent', err, { phase: 'comment-resume', sessionKey });
       }
     }
-    // Fresh thread: backend + model/effort from the global comments config.
-    // backendFor falls back to the default backend for an unset/unknown id;
-    // pickDefault carries the configured model/effort when the live list supports them.
-    const comments = getCommentsConfig(cfg);
-    const be = backendFor(comments.backend);
-    const { model, effort } = pickDefault(await listModels(be), {
-      model: comments.model,
-      effort: comments.effort,
-    });
     const fresh = await be.startThread({ cwd, model, effort });
     trackSession(sessionKey, fresh);
     commentInstrUsed.set(sessionKey, instructions);
@@ -5358,6 +5474,25 @@ export function createOrchestrator(
     });
     return fresh;
   }
+
+  const pendingGroups = createPendingGroups({
+    file: pendingGroupsFile(paths.projectsFile),
+    eligible: async ({ chatId, operator }) => isAdmin(cfg, operator) && !(await getProjectByChatId(chatId)),
+    verify: async chatId => {
+      const membership = await channel.rawClient.im.v1.chatMembers.isInChat({ path: { chat_id: chatId } });
+      if (membership.code !== 0 || typeof membership.data?.is_in_chat !== 'boolean') throw new Error('无法确认机器人群成员身份');
+      if (!membership.data.is_in_chat) return { state: 'retry' };
+      const info = await channel.getChatInfo(chatId);
+      if (info.chatType !== 'group' || (channel.botIdentity?.openId && info.ownerId === channel.botIdentity.openId)) return { state: 'ignore' };
+      const name = info?.name?.trim();
+      if (!name) throw new Error('无法读取飞书群名称');
+      return { state: 'ready', name };
+    },
+    onError: error => log.fail('intake', error, { phase: 'pending-groups' }),
+  });
+  void pendingGroups.refresh();
+  const pendingGroupTimer = setInterval(() => { void pendingGroups.refresh(); }, 15_000);
+  pendingGroupTimer.unref();
 
   /**
    * `botAdded` event: a human added the bot to a group. If the adder is an admin
@@ -5380,6 +5515,8 @@ export function createOrchestrator(
         log.info('intake', 'bot-added-nonadmin', { chatId: evt.chatId.slice(-6), op: op?.slice(-6) });
         return;
       }
+      await pendingGroups.add(evt.chatId, op).catch(error => log.fail('intake', error, { phase: 'pending-group-add' }));
+      void pendingGroups.refresh();
       // Best-effort group name (needs im:chat:readonly); the bind card's name is
       // editable, so an empty/failed lookup just means the admin types one.
       const info = await channel.getChatInfo(evt.chatId).catch((err) => {
@@ -5405,6 +5542,7 @@ export function createOrchestrator(
    * bound project: the bot is already out, so no me_leave. Notify the binder.
    */
   async function onBotRemovedFromChat(chatId: string): Promise<void> {
+    await pendingGroups.remove(chatId).catch(error => log.fail('intake', error, { phase: 'pending-group-remove' }));
     const project = await getProjectByChatId(chatId);
     if (!project) return;
     // Remove first, then notify only if THIS call removed it — Feishu delivers
@@ -5582,18 +5720,20 @@ export function createOrchestrator(
           // 二次确认。latestVersion 走异步 execFile（绝不能 spawnSync 冻住 event loop）。
           const { messageId } = await sendDm(buildUpdateCard({ phase: 'checking' }));
           const current = currentVersion();
-          const latest = await latestVersion().catch(() => null);
+          const [latest, desktopRelease, distribution] = await Promise.all([
+            latestVersion().catch(() => null), getDesktopRelease(), runtimeDistribution(),
+          ]);
           const hasUpdate = !!latest && isNewer(latest, current);
           log.info('console', 'update-check', { current, latest, hasUpdate, via: 'menu' });
           await updateManagedCard(
             channel,
             messageId,
-            buildUpdateCard({ phase: 'checked', current, latest, hasUpdate, dev: isDevSource() }),
+            buildUpdateCard({ phase: 'checked', current, latest, hasUpdate, dev: isDevSource(), desktopRelease, distribution: distribution.kind === 'bundled' ? 'bundled' : 'other' }),
           ).catch((e) => log.fail('console', e, { phase: 'update-check', via: 'menu' }));
           break;
         }
         default:
-          await sendDm(buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() }));
+          await sendDm(await renderDmMenuCard());
       }
     } catch (err) {
       log.fail('console', err, { cmd: 'menu-card', key: evt.eventKey });
@@ -5631,6 +5771,7 @@ export function createOrchestrator(
   reaper.unref(); // 不挡进程退出（CLI/测试里 orchestrator 可能不走 shutdown）
 
   async function shutdown(): Promise<void> {
+    clearInterval(pendingGroupTimer);
     shuttingDown = true;
     clearInterval(reaper);
     for (const state of active.values()) {
@@ -5660,16 +5801,17 @@ export function createOrchestrator(
   // 首次真实调用会自动重试，fallback 绝不被钉死（listModels 包装层也不缓存）。
   void backend.listModels().catch((err) => log.fail('agent', err, { phase: 'models-prewarm' }));
 
-  // 管理面写执行器（Web 控制台 / supervisor IPC 入口）：与上面 DM 回调共用
-  // admin/ops.ts 的 perform*，注入同一个 backendFor + evictLiveSessionsForChat
-  // —— 双端写行为同源（同校验、同落盘、同驱逐）。
-  const executeAdminWrite = createAdminWriteExecutor({ cfg, backendFor, evictLiveSessionsForChat, writePreferences, voiceAction: voice.action });
-  const adminExecute = async (op: AdminWriteOp): Promise<void> => {
-    await executeAdminWrite(op);
+  const settings = createSettingsOwner({ cfg, backendFor, evictLiveSessionsForChat, writePreferences, voiceAction: voice.action, refreshCompletionReminders: refreshCompletionReminderCards,
+    cliBridge: cliBridge?.start && cliBridge.shutdown ? { start: cliBridge.start, shutdown: cliBridge.shutdown, isRunning: cliBridge.isRunning } : undefined,
+  });
+  const executeAdminWrite = createAdminWriteExecutor({ cfg, backendFor, evictLiveSessionsForChat, writePreferences, voiceAction: voice.action, settings });
+  const adminExecute = async (op: AdminWriteOp): Promise<AdminWriteResult> => {
+    const result = await executeAdminWrite(op);
     if (op.kind === 'setCompletionReminder') refreshCompletionReminderCards();
+    return result;
   };
 
-  return { onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, shutdown };
+  return { collaboration, onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, settings, shutdown };
 }
 
 /** Resolve a message's thread_id via raw API (reply response omits it). The
