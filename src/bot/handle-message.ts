@@ -5467,12 +5467,12 @@ export function createOrchestrator(
     verify: async chatId => {
       const membership = await channel.rawClient.im.v1.chatMembers.isInChat({ path: { chat_id: chatId } });
       if (membership.code !== 0 || typeof membership.data?.is_in_chat !== 'boolean') throw new Error('无法确认机器人群成员身份');
-      if (!membership.data.is_in_chat) return null;
+      if (!membership.data.is_in_chat) return { state: 'retry' };
       const info = await channel.getChatInfo(chatId);
-      if (info.chatType !== 'group' || (channel.botIdentity?.openId && info.ownerId === channel.botIdentity.openId)) return null;
+      if (info.chatType !== 'group' || (channel.botIdentity?.openId && info.ownerId === channel.botIdentity.openId)) return { state: 'ignore' };
       const name = info?.name?.trim();
       if (!name) throw new Error('无法读取飞书群名称');
-      return name;
+      return { state: 'ready', name };
     },
     onError: error => log.fail('intake', error, { phase: 'pending-groups' }),
   });

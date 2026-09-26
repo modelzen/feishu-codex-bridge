@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 
 type Candidate = { chatId: string; operator: string; addedAt: number; generation: string } &
   ({ state: 'verifying' } | { state: 'ready'; name: string });
+export type PendingGroupVerification = { state: 'ready'; name: string } | { state: 'retry' } | { state: 'ignore' };
 export interface PendingGroup { chatId: string; name: string; addedAt: number }
 export const pendingGroupsFile = (projectsFile: string): string => join(dirname(projectsFile), 'pending-groups.json');
 const writers = new Map<string, Promise<unknown>>();
@@ -52,7 +53,7 @@ export async function retireBoundPendingGroup(file: string, chatId: string): Pro
 export function createPendingGroups(options: {
   file: string;
   eligible: (group: { chatId: string; operator: string }) => Promise<boolean>;
-  verify: (chatId: string) => Promise<string | null>;
+  verify: (chatId: string) => Promise<PendingGroupVerification>;
   onError: (error: unknown) => void;
 }) {
   let refreshing: Promise<void> | undefined;
@@ -60,13 +61,17 @@ export function createPendingGroups(options: {
     for (const candidate of await readPendingGroups(options.file)) {
       try {
         const eligible = await options.eligible(candidate);
-        const verifiedName = eligible ? await options.verify(candidate.chatId) : null;
-        const name = verifiedName !== null && await options.eligible(candidate) ? verifiedName : null;
+        const verified: PendingGroupVerification = eligible ? await options.verify(candidate.chatId) : { state: 'ignore' };
+        const result: PendingGroupVerification = verified.state !== 'ignore' && await options.eligible(candidate) ? verified : { state: 'ignore' };
         await update(options.file, groups => {
           const current = groups.find(group => group.chatId === candidate.chatId);
           if (current?.generation !== candidate.generation) return groups;
-          if (name === null) return groups.filter(group => group !== current);
-          return groups.map(group => group === current ? { ...group, state: 'ready', name } : group);
+          if (result.state === 'ignore') return groups.filter(group => group !== current);
+          return groups.map(group => {
+            if (group !== current) return group;
+            if (result.state === 'ready') return { ...group, state: 'ready', name: result.name };
+            return { chatId: group.chatId, operator: group.operator, addedAt: group.addedAt, generation: group.generation, state: 'verifying' };
+          });
         });
       } catch (error) { options.onError(error); }
     }

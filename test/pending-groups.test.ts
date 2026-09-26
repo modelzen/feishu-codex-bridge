@@ -2,13 +2,13 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
-import { createPendingGroups, readPendingGroups, retirePendingGroup } from '../src/project/pending-groups';
+import { createPendingGroups, readPendingGroups, retirePendingGroup, type PendingGroupVerification } from '../src/project/pending-groups';
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'pending-groups-')); roots.push(root);
   const file = join(root, 'pending-groups.json');
-  const verify = vi.fn(async (_chatId: string): Promise<string | null> => 'Research');
+  const verify = vi.fn(async (_chatId: string): Promise<PendingGroupVerification> => ({ state: 'ready', name: 'Research' }));
   const eligible = vi.fn(async () => true);
   const onError = vi.fn();
   const options = { file, verify, eligible, onError };
@@ -30,7 +30,7 @@ it('persists the event before lookup, deduplicates concurrent deliveries and res
 });
 it('does not revive removal or let an old lookup rename a re-added group', async () => {
   const f = await fixture();
-  let release = (_name: string): void => {};
+  let release = (_value: PendingGroupVerification): void => {};
   f.verify.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
   await f.queue.add('oc_a', 'ou_admin');
   const first = await readPendingGroups(f.file);
@@ -38,7 +38,7 @@ it('does not revive removal or let an old lookup rename a re-added group', async
   await vi.waitFor(() => expect(f.verify).toHaveBeenCalled());
   await f.queue.remove('oc_a');
   await f.queue.add('oc_a', 'ou_admin');
-  release('Stale name');
+  release({ state: 'ready', name: 'Stale name' });
   await refreshing;
   const current = await readPendingGroups(f.file);
   expect(current[0]?.generation).not.toBe(first[0]?.generation);
@@ -58,7 +58,7 @@ it('drops bound, no-longer-admin and departed groups, without enumerating histor
   expect(f.verify).not.toHaveBeenCalled();
   expect(await readPendingGroups(f.file)).toEqual([]);
   f.eligible.mockResolvedValue(true);
-  f.verify.mockResolvedValue(null);
+  f.verify.mockResolvedValue({ state: 'ignore' });
   await f.queue.add('oc_a', 'ou_admin');
   await f.queue.refresh();
   expect(await readPendingGroups(f.file)).toEqual([]);
@@ -73,4 +73,21 @@ it('keeps bots isolated and reports corrupt files instead of silently dropping r
   await expect(readPendingGroups(a.file)).rejects.toThrow();
   await expect(a.queue.add('oc_new', 'ou_a')).rejects.toThrow();
   expect(await readFile(a.file, 'utf8')).toBe('{');
+});
+
+it('retries temporarily missing membership and hides previously ready candidates until reverified', async () => {
+  const f = await fixture();
+  await f.queue.add('oc_a', 'ou_admin');
+  const original = (await readPendingGroups(f.file))[0];
+  f.verify.mockResolvedValue({ state: 'retry' });
+  await f.queue.refresh();
+  expect(await readPendingGroups(f.file)).toEqual([original]);
+  f.verify.mockResolvedValue({ state: 'ready', name: 'Available' });
+  await f.queue.refresh();
+  expect((await readPendingGroups(f.file))[0]).toMatchObject({ ...original, state: 'ready', name: 'Available' });
+  f.verify.mockResolvedValue({ state: 'retry' });
+  await f.queue.refresh();
+  expect(await readPendingGroups(f.file)).toEqual([original]);
+  await f.queue.remove('oc_a');
+  expect(await readPendingGroups(f.file)).toEqual([]);
 });

@@ -407,7 +407,7 @@ it('reads pending events directly and filters bound groups, changed admins and d
   const files = botPaths(id); mkdirSync(files.dir, { recursive: true });
   const config = { accounts: { app: { id, secret: 'fixture', tenant: 'feishu' } }, preferences: { access: { admins: ['ou_admin'] } } };
   writeFileSync(files.configFile, JSON.stringify(config));
-  const queue = createPendingGroups({ file: pendingGroupsFile(files.projectsFile), eligible: async () => true, verify: async () => 'Research', onError: error => { throw error; } });
+  const queue = createPendingGroups({ file: pendingGroupsFile(files.projectsFile), eligible: async () => true, verify: async () => ({ state: 'ready', name: 'Research' }), onError: error => { throw error; } });
   await queue.add('oc_pending', 'ou_admin'); await queue.add('oc_other', 'ou_removed'); await queue.refresh();
   const reader = createAdminService({ liveStatus: async () => ({ running: true }) });
   try {
