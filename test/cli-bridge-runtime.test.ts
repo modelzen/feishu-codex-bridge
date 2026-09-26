@@ -9,7 +9,7 @@ vi.mock('../src/config/store', () => ({
 vi.mock('../src/config/paths', async () => {
   const { mkdtempSync } = await import('node:fs'); const { tmpdir } = await import('node:os'); const { join } = await import('node:path');
   const appDir = mkdtempSync(join(tmpdir(), 'cli-settings-runtime-'));
-  return { paths: { appDir, commentInstructionsFile: join(appDir, 'comment-instructions.md'), commentsRootDir: join(appDir, 'comments'), projectsRootDir: join(appDir, 'projects') } };
+  return { paths: { appDir, projectsFile: join(appDir, 'projects.json'), commentInstructionsFile: join(appDir, 'comment-instructions.md'), commentsRootDir: join(appDir, 'comments'), projectsRootDir: join(appDir, 'projects') } };
 });
 vi.mock('../src/cli-bridge/hooks', () => ({
   inspectCliBridgeHooks: async () => ({ claude: { agent: 'claude', status: 'installed', details: [] }, codex: { agent: 'codex', status: 'installed', details: [] } }),

@@ -1,5 +1,6 @@
+import { pendingGroupsFile, readPendingGroups } from '../src/project/pending-groups';
 import { afterAll, beforeEach, expect, it, vi } from 'vitest';
-import { rm, mkdir, realpath } from 'node:fs/promises';
+import { rm, mkdir, realpath, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { AccountUsageBundle } from '../src/agent/types';
 import type { AppConfig } from '../src/config/schema';
@@ -37,6 +38,7 @@ function backend() {
 }
 function orchestrator(channel: unknown = { send: fixture.send }) { return createOrchestrator(channel as never, cfg, paths.appDir); }
 beforeEach(async () => {
+  await rm(pendingGroupsFile(paths.projectsFile), { force: true });
   await rm(paths.projectsFile, { force: true }); await rm(paths.sessionsFile, { force: true });
   fixture.failProjectsWrite = false;
   fixture.leave.mockReset(); fixture.send.mockClear();
@@ -243,5 +245,35 @@ it('recovers backend history after a kind change archives its old topic binding'
     expect(await app.collaboration({ action: 'history', ...target })).toMatchObject({ sessions: [{ detached: true }], threads: [{ sessionId: 'past' }] });
     await app.collaboration({ action: 'resume', ...target, backend: be.id, sessionId: 'past' });
     expect(await getSession('oc_demo')).toMatchObject({ sessionId: 'past' });
+  } finally { await app.shutdown(); }
+});
+
+it('captures real bot-added events for desktop while retaining DM binding and clearing unbound removals', async () => {
+  backend();
+  const membership = vi.fn(async () => ({ code: 0, data: { is_in_chat: true } }));
+  const chatInfo = vi.fn(async (chatId: string) => ({ chatId, name: 'New research group', chatType: 'group', ownerId: 'ou_owner' }));
+  const channel = { send: fixture.send, botIdentity: { openId: 'ou_bot' }, getChatInfo: chatInfo, rawClient: { im: { v1: { chatMembers: { isInChat: membership } } } } };
+  const app = orchestrator(channel);
+  const file = pendingGroupsFile(paths.projectsFile);
+  try {
+    await app.onBotAddedToChat({ chatId: 'oc_nonadmin', operator: { openId: 'ou_guest' } });
+    await app.onBotAddedToChat({ chatId: 'oc_demo', operator: { openId: 'ou_owner' } });
+    expect(await readPendingGroups(file)).toEqual([]);
+    expect(fixture.send).not.toHaveBeenCalled();
+    await app.onBotAddedToChat({ chatId: 'oc_new_event', operator: { openId: 'ou_owner' } });
+    await vi.waitFor(async () => expect(await readPendingGroups(file)).toEqual([
+      expect.objectContaining({ chatId: 'oc_new_event', operator: 'ou_owner', state: 'ready', name: 'New research group', addedAt: expect.any(Number) }),
+    ]));
+    expect(membership).toHaveBeenCalledWith({ path: { chat_id: 'oc_new_event' } });
+    expect(fixture.send).toHaveBeenCalledWith(channel, 'ou_owner', expect.any(Object), undefined, false, 'open_id');
+    expect(JSON.stringify(fixture.send.mock.calls)).toContain('oc_new_event');
+    expect(JSON.stringify(fixture.send.mock.calls)).toContain('New research group');
+    await app.onBotRemovedFromChat('oc_new_event');
+    expect(await readPendingGroups(file)).toEqual([]);
+    expect(fixture.send).toHaveBeenCalledTimes(1);
+    await writeFile(file, '{');
+    await app.onBotAddedToChat({ chatId: 'oc_queue_failure', operator: { openId: 'ou_owner' } });
+    expect(fixture.send).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(fixture.send.mock.calls.at(-1))).toContain('oc_queue_failure');
   } finally { await app.shutdown(); }
 });
