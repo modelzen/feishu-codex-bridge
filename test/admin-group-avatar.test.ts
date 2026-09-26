@@ -59,14 +59,37 @@ describe('group avatar metadata', () => {
     expect(provider.get('c', 'later')).toBeDefined();
   });
 
-  it('caps retained entries at 64 and allows new work after pruning', async () => {
+  it('loads group 65 by evicting a settled entry while keeping the 64-entry bound', async () => {
     const {provider, credentials} = fixture();
-    for (let i = 0; i < 80; i++) await provider.refresh('a', String(i));
-    expect(credentials).toHaveBeenCalledTimes(64);
-    expect(provider.get('a', '64')).toBeUndefined();
-    provider.retainChats('a', new Set(['0']));
-    await provider.refresh('a', '64');
+    for (let i = 0; i < 65; i++) await provider.refresh('a', String(i));
+    expect(credentials).toHaveBeenCalledTimes(65);
     expect(provider.get('a', '64')).toBeDefined();
+    expect(provider.get('a', '0')).toBeUndefined();
+    expect(Array.from({length: 65}, (_, i) => provider.get('a', String(i))).filter(Boolean)).toHaveLength(64);
+    await provider.refresh('a', '0');
+    expect(provider.get('a', '0')).toBeDefined();
+    expect(provider.get('a', '1')).toBeUndefined();
+  });
+
+  it('preserves a pending entry when evicting at capacity', async () => {
+    const {provider, credentials, advance} = fixture();
+    for (let i = 0; i < 64; i++) await provider.refresh('a', String(i));
+    advance();
+    let release = () => {};
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    credentials.mockImplementationOnce(async botId => {
+      await blocked;
+      return {appId: botId, appSecret: 'secret', tenant: 'feishu'};
+    });
+    const pending = provider.refresh('a', '0');
+    await provider.refresh('a', '64');
+    expect(provider.refresh('a', '0')).toBe(pending);
+    expect(provider.get('a', '1')).toBeUndefined();
+    expect(provider.get('a', '64')).toBeDefined();
+    release();
+    await pending;
+    expect(provider.get('a', '0')).toBeDefined();
+    expect(Array.from({length: 65}, (_, i) => provider.get('a', String(i))).filter(Boolean)).toHaveLength(64);
   });
 
   it.each([

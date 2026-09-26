@@ -114,7 +114,12 @@ function createAvatarCache(options: AvatarOptions, limits: { entries: number; ac
       const entry = cache.get(key);
       if (entry?.pending) return entry.pending;
       if (entry && entry.expiresAt > now()) return Promise.resolve();
-      if (active >= limits.active || (!entry && cache.size >= limits.entries)) return Promise.resolve();
+      if (active >= limits.active) return Promise.resolve();
+      if (!entry && cache.size >= limits.entries) {
+        const settled = [...cache].find(([, candidate]) => !candidate.pending);
+        if (!settled) return Promise.resolve();
+        cache.delete(settled[0]);
+      }
       active++;
       const pending = fetchAvatar(target).then(avatarDataUrl => {
         const current = cache.get(key);
