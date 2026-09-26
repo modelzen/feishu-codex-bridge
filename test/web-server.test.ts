@@ -324,6 +324,8 @@ describe('web server · 只读 API', () => {
     const [template] = await service.listBots();
     const bots = Array.from({length: 20}, (_, i) => ({...template!, appId: `cli_${i}`, avatarDataUrl: `data:image/png;base64,${'A'.repeat(349_000)}`}));
     service.listBots = async () => bots;
+    const projects = (await service.listProjects(bots[0]!.appId)).map(project => ({...project, avatarDataUrl: bots[0]!.avatarDataUrl}));
+    service.listProjects = async () => projects;
     const server = createWebServer({service, token: TOKEN, logDir});
     const {port} = await server.listen(0);
     try {
@@ -331,12 +333,17 @@ describe('web server · 只读 API', () => {
       const text = await response.text();
       expect(response.status).toBe(200);
       expect(text.length).toBeLessThan(4_000_000);
-      const body = JSON.parse(text) as {bots: {appId: string; avatarDataUrl?: string; projects: unknown[]}[]};
+      const body = JSON.parse(text) as {bots: {appId: string; avatarDataUrl?: string; projects: {avatarDataUrl?: string}[]}[]};
       expect(body.bots.map(bot => bot.appId)).toEqual(bots.map(bot => bot.appId));
       expect(body.bots.every(bot => bot.projects.length === 1)).toBe(true);
       expect(body.bots[0]?.avatarDataUrl).toBe(bots[0]?.avatarDataUrl);
       expect(body.bots.at(-1)?.avatarDataUrl).toBeUndefined();
       expect(bots.every(bot => Boolean(bot.avatarDataUrl))).toBe(true);
+      expect(projects.every(project => Boolean(project.avatarDataUrl))).toBe(true);
+      const portraitBytes = body.bots.flatMap(bot => [bot.avatarDataUrl, ...bot.projects.map(project => project.avatarDataUrl)]).reduce((sum, value) => sum + (value?.length ?? 0), 0);
+      expect(portraitBytes).toBeLessThanOrEqual(2_000_000);
+      expect(body.bots[0]?.projects[0]?.avatarDataUrl).toBe(projects[0]?.avatarDataUrl);
+      expect(body.bots.at(-1)?.projects[0]?.avatarDataUrl).toBeUndefined();
     } finally { await server.close(); }
   });
 

@@ -63,17 +63,29 @@ async function rasterDataUrl(response: Response): Promise<string | undefined> {
   return `data:${mime};base64,${bytes.toString('base64')}`;
 }
 
-export function createAgentAvatarProvider(options: {
+type AvatarOptions = {
   credentials: (botId: string) => Promise<Credentials>;
   fetchImpl?: typeof fetch;
   now?: () => number;
-}) {
+};
+type AvatarTarget = { botId: string; chatId?: string };
+
+function groupAvatarUrlFrom(value: unknown): URL | undefined {
+  if (typeof value !== 'object' || value === null || !('code' in value) || value.code !== 0 ||
+      !('data' in value) || typeof value.data !== 'object' || value.data === null ||
+      !('avatar' in value.data) || typeof value.data.avatar !== 'string') return undefined;
+  return imageUrl(value.data.avatar);
+}
+
+function createAvatarCache(options: AvatarOptions, limits: { entries: number; active: number }) {
   const request = options.fetchImpl ?? fetch;
   const now = options.now ?? Date.now;
-  const cache = new Map<string, CacheEntry>();
+  const cache = new Map<string, CacheEntry & { target: AvatarTarget }>();
+  let active = 0;
+  const keyOf = (target: AvatarTarget) => JSON.stringify([target.botId, target.chatId]);
 
-  async function fetchAvatar(botId: string): Promise<string | undefined> {
-    const credential = await options.credentials(botId);
+  async function fetchAvatar(target: AvatarTarget): Promise<string | undefined> {
+    const credential = await options.credentials(target.botId);
     const base = bases[credential.tenant];
     const signal = AbortSignal.timeout(4_000);
     const tokenResponse = await request(`${base}/open-apis/auth/v3/tenant_access_token/internal`, {
@@ -83,35 +95,59 @@ export function createAgentAvatarProvider(options: {
     if (!tokenResponse.ok) return undefined;
     const token = tokenFrom(await tokenResponse.json());
     if (!token) return undefined;
-    const infoResponse = await request(`${base}/open-apis/bot/v3/info`, {
+    const path = target.chatId === undefined ? '/open-apis/bot/v3/info' : `/open-apis/im/v1/chats/${encodeURIComponent(target.chatId)}`;
+    const infoResponse = await request(`${base}${path}`, {
       headers: { Authorization: `Bearer ${token}` }, signal, redirect: 'error',
     });
     if (!infoResponse.ok) return undefined;
-    const source = avatarUrlFrom(await infoResponse.json());
+    const info: unknown = await infoResponse.json();
+    const source = target.chatId === undefined ? avatarUrlFrom(info) : groupAvatarUrlFrom(info);
     if (!source) return undefined;
     const image = await request(source, { redirect: 'manual', signal });
     return rasterDataUrl(image);
   }
 
   return {
-    get(botId: string): string | undefined { return cache.get(botId)?.avatarDataUrl; },
-    refresh(botId: string): Promise<void> {
-      const entry = cache.get(botId);
+    get(target: AvatarTarget): string | undefined { return cache.get(keyOf(target))?.avatarDataUrl; },
+    refresh(target: AvatarTarget): Promise<void> {
+      const key = keyOf(target);
+      const entry = cache.get(key);
       if (entry?.pending) return entry.pending;
       if (entry && entry.expiresAt > now()) return Promise.resolve();
-      const pending = fetchAvatar(botId).then(avatarDataUrl => {
-        const current = cache.get(botId);
+      if (active >= limits.active || (!entry && cache.size >= limits.entries)) return Promise.resolve();
+      active++;
+      const pending = fetchAvatar(target).then(avatarDataUrl => {
+        const current = cache.get(key);
         if (!current || current.pending !== pending) return;
-        cache.set(botId, { avatarDataUrl: avatarDataUrl ?? current.avatarDataUrl, expiresAt: now() + 10 * 60_000 });
+        cache.set(key, { target, avatarDataUrl: avatarDataUrl ?? current.avatarDataUrl, expiresAt: now() + 10 * 60_000 });
       }).catch(() => {
-        const current = cache.get(botId);
-        if (current?.pending === pending) cache.set(botId, { avatarDataUrl: current.avatarDataUrl, expiresAt: now() + 60_000 });
-      });
-      cache.set(botId, { avatarDataUrl: entry?.avatarDataUrl, expiresAt: entry?.expiresAt ?? 0, pending });
+        const current = cache.get(key);
+        if (current?.pending === pending) cache.set(key, { target, avatarDataUrl: current.avatarDataUrl, expiresAt: now() + 60_000 });
+      }).finally(() => { active--; });
+      cache.set(key, { target, avatarDataUrl: entry?.avatarDataUrl, expiresAt: entry?.expiresAt ?? 0, pending });
       return pending;
     },
-    retain(botIds: ReadonlySet<string>): void {
-      for (const botId of cache.keys()) if (!botIds.has(botId)) cache.delete(botId);
+    retain(keep: (target: AvatarTarget) => boolean): void {
+      for (const [key, entry] of cache) if (!keep(entry.target)) cache.delete(key);
     },
+  };
+}
+
+export function createAgentAvatarProvider(options: AvatarOptions) {
+  const cache = createAvatarCache(options, { entries: Infinity, active: Infinity });
+  return {
+    get: (botId: string) => cache.get({ botId }),
+    refresh: (botId: string) => cache.refresh({ botId }),
+    retain: (botIds: ReadonlySet<string>) => cache.retain(target => botIds.has(target.botId)),
+  };
+}
+
+export function createGroupAvatarProvider(options: AvatarOptions) {
+  const cache = createAvatarCache(options, { entries: 64, active: 2 });
+  return {
+    get: (botId: string, chatId: string) => cache.get({ botId, chatId }),
+    refresh: (botId: string, chatId: string) => cache.refresh({ botId, chatId }),
+    retainBots: (botIds: ReadonlySet<string>) => cache.retain(target => botIds.has(target.botId)),
+    retainChats: (botId: string, chatIds: ReadonlySet<string>) => cache.retain(target => target.botId !== botId || (target.chatId !== undefined && chatIds.has(target.chatId))),
   };
 }

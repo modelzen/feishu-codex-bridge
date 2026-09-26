@@ -28,7 +28,7 @@ import {
 import { listSessionsIn } from '../bot/session-store';
 import { loadConfig } from '../config/store';
 import { resolveAppSecret } from '../config/secret-resolver';
-import { createAgentAvatarProvider } from './avatar';
+import { createAgentAvatarProvider, createGroupAvatarProvider } from './avatar';
 import { diagnoseEventSubscription, type EventDiagnosis } from '../utils/event-diagnosis';
 import { validateAppCredentials } from '../utils/feishu-auth';
 import { buildScopeGrantUrl, buildEventConfigUrl } from '../config/scopes';
@@ -301,6 +301,7 @@ export interface BotLiveStatus {
 
 /** 项目快照——effective 值（缺省已按 registry 的单一事实源解析），UI 直接渲染。 */
 export interface AdminProject {
+  avatarDataUrl?: string;
   name: string;
   chatId: string;
   cwd: string;
@@ -488,13 +489,13 @@ export interface AdminServiceDeps {
  */
 export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
   const codexTools = deps.codexTools ?? new CodexSetupService();
-  const avatars = createAgentAvatarProvider({
-    credentials: async (botId) => {
-      const cfg = await loadConfig(botPaths(botId).configFile);
-      if (!isComplete(cfg)) throw new Error('机器人配置不完整');
-      return { appId: botId, tenant: cfg.accounts.app.tenant, appSecret: await resolveAppSecret(cfg) };
-    },
-  });
+  const credentials = async (botId: string) => {
+    const cfg = await loadConfig(botPaths(botId).configFile);
+    if (!isComplete(cfg)) throw new Error('机器人配置不完整');
+    return { appId: botId, tenant: cfg.accounts.app.tenant, appSecret: await resolveAppSecret(cfg) };
+  };
+  const avatars = createAgentAvatarProvider({ credentials });
+  const groupAvatars = createGroupAvatarProvider({ credentials });
   async function projectsWithCounts(botId: string): Promise<AdminProject[]> {
     const files = botPaths(botId);
     const projects = await listProjectsIn(files.projectsFile);
@@ -506,7 +507,9 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     for (const s of sessions) {
       countByChat.set(s.chatId, (countByChat.get(s.chatId) ?? 0) + 1);
     }
-    return projects.map((p) => ({
+    groupAvatars.retainChats(botId, new Set(projects.map(p => p.chatId).filter(Boolean)));
+    const result = projects.map((p) => ({
+      avatarDataUrl: groupAvatars.get(botId, p.chatId),
       name: p.name,
       chatId: p.chatId,
       cwd: p.cwd,
@@ -524,6 +527,8 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       sessionCount: p.chatId ? (countByChat.get(p.chatId) ?? 0) : 0,
       createdAt: p.createdAt,
     }));
+    for (const project of projects) if (project.chatId) void groupAvatars.refresh(botId, project.chatId);
+    return result;
   }
 
   /** 单实例锁文件（processes.json）→「bridge 进程在跑吗」。损坏/缺失一律视为
@@ -596,7 +601,9 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     },
     async listBots(): Promise<AdminBot[]> {
       const reg = await loadBots();
-      avatars.retain(new Set(reg.bots.map(bot => bot.appId)));
+      const botIds = new Set(reg.bots.map(bot => bot.appId));
+      avatars.retain(botIds);
+      groupAvatars.retainBots(botIds);
       const configured = reg.bots.some((b) => b.active !== undefined);
       const out: AdminBot[] = [];
       for (const b of reg.bots) {

@@ -676,13 +676,17 @@ export function createWebServer(opts: WebServerOptions): WebServer {
     const bots = await opts.service.listBots();
     const out = [];
     let remainingAvatarBytes = 2_000_000;
-    for (const bot of bots) {
-      const b = { ...bot };
-      if (b.avatarDataUrl) {
-        if (b.avatarDataUrl.length > remainingAvatarBytes) delete b.avatarDataUrl;
-        else remainingAvatarBytes -= b.avatarDataUrl.length;
+    function withAvatarBudget<T extends { avatarDataUrl?: string }>(item: T): T {
+      const copy = { ...item };
+      if (copy.avatarDataUrl) {
+        if (copy.avatarDataUrl.length > remainingAvatarBytes) delete copy.avatarDataUrl;
+        else remainingAvatarBytes -= copy.avatarDataUrl.length;
       }
-      try { out.push({ ...b, projects: await opts.service.listProjects(b.appId) }); }
+      return copy;
+    }
+    for (const bot of bots) {
+      const b = withAvatarBudget(bot);
+      try { out.push({ ...b, projects: (await opts.service.listProjects(b.appId)).map(withAvatarBudget) }); }
       catch (error) { out.push({ ...b, projects: [], projectsError: error instanceof Error ? error.message : '项目读取失败' }); }
     }
     sendJson(res, 200, { version: bridgeVersion(), generatedAt: Date.now(), bots: out });
