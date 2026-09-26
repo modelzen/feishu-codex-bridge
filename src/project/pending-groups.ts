@@ -1,3 +1,4 @@
+import { log } from '../core/logger';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -42,6 +43,10 @@ function update(file: string, change: (groups: Candidate[]) => Candidate[]): Pro
 
 export function retirePendingGroup(file: string, chatId: string): Promise<void> {
   return update(file, groups => groups.some(group => group.chatId === chatId) ? groups.filter(group => group.chatId !== chatId) : groups);
+}
+
+export async function retireBoundPendingGroup(file: string, chatId: string): Promise<void> {
+  await retirePendingGroup(file, chatId).catch(error => log.fail('project', error, { phase: 'pending-group-retire', chatId }));
 }
 
 export function createPendingGroups(options: {

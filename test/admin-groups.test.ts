@@ -91,6 +91,24 @@ describe('desktop group commands in the owning bot', () => {
     expect(fixture.message).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps successful DM and desktop bindings when pending cleanup cannot read its file', async () => {
+    const pendingFile = pendingGroupsFile(paths.projectsFile);
+    await writeFile(pendingFile, '{');
+    const fixture = channelFixture();
+    try {
+      const dm = await joinExistingGroup(fixture.channel, { name: 'Corrupt queue DM', chatId: 'oc_corrupt_dm', existingPath: paths.appDir, addedBy: 'ou_admin' });
+      expect(dm.chatId).toBe('oc_corrupt_dm');
+      expect((await listProjects()).find(project => project.chatId === dm.chatId)).toEqual(dm);
+      const execute = createGroupExecutor(fixture.channel);
+      const value = { ...input(paths.appDir), projectName: 'Corrupt queue desktop', chatId: 'oc_corrupt_desktop' };
+      const desktop = await execute({ kind: 'bindGroup', input: value });
+      expect(desktop).toMatchObject({ chatId: value.chatId });
+      expect(await execute({ kind: 'bindGroup', input: value })).toEqual(desktop);
+      expect(fixture.message).toHaveBeenCalledTimes(2);
+      expect(await readFile(pendingFile, 'utf8')).toBe('{');
+    } finally { await rm(pendingFile); }
+  });
+
   it('registry rejects duplicate races while preserving unrelated existing projects', async () => {
     const values = await Promise.allSettled(['A', 'B'].map(name => addProject({ name, chatId: 'oc_race', cwd: paths.appDir, blank: false, createdAt: 1 })));
     expect(values.filter(value => value.status === 'fulfilled')).toHaveLength(1);

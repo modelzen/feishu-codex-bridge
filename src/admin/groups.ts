@@ -1,4 +1,4 @@
-import { pendingGroupsFile, retirePendingGroup } from '../project/pending-groups';
+import { pendingGroupsFile, retireBoundPendingGroup } from '../project/pending-groups';
 import { paths } from '../config/paths';
 import { DEFAULT_BACKEND_ID, effectiveDefaultBackend } from '../agent';
 import { realpath, stat } from 'node:fs/promises';
@@ -70,7 +70,7 @@ export function createGroupExecutor(channel: LarkChannel): (op: AdminGroupOp) =>
     const bound = await getProjectByChatId(input.chatId);
     if (bound) {
       if (await same(bound)) {
-        await retirePendingGroup(pendingGroupsFile(paths.projectsFile), bound.chatId);
+        await retireBoundPendingGroup(pendingGroupsFile(paths.projectsFile), bound.chatId);
         return bound;
       }
       throw new AdminWriteError(`该群已绑定为项目「${bound.name}」，现有文件夹、后端和群类型不可修改`);
@@ -81,7 +81,7 @@ export function createGroupExecutor(channel: LarkChannel): (op: AdminGroupOp) =>
     } catch (error) {
       const raced = await getProjectByChatId(input.chatId);
       if (raced && await same(raced)) {
-        await retirePendingGroup(pendingGroupsFile(paths.projectsFile), raced.chatId);
+        await retireBoundPendingGroup(pendingGroupsFile(paths.projectsFile), raced.chatId);
         return raced;
       }
       throw new AdminWriteError(error instanceof Error ? error.message : '群绑定失败');

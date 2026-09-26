@@ -1,4 +1,4 @@
-import { pendingGroupsFile, retirePendingGroup } from './pending-groups';
+import { pendingGroupsFile, retireBoundPendingGroup } from './pending-groups';
 import { mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -221,7 +221,7 @@ export async function joinExistingGroup(channel: LarkChannel, input: JoinGroupIn
     network: input.network ?? false,
   };
   await addProject(project);
-  await retirePendingGroup(pendingGroupsFile(paths.projectsFile), project.chatId);
+  await retireBoundPendingGroup(pendingGroupsFile(paths.projectsFile), project.chatId);
   log.info('project', 'join', { name, chatId: input.chatId, cwd, blank, kind: project.kind, mode: project.mode, backend: project.backend });
 
   // Onboarding only (no announcement / Pin / tab — see onboardGroup's joined
