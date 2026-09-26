@@ -319,6 +319,27 @@ describe('web server · 安全（loopback + token + Host 校验）', () => {
 });
 
 describe('web server · 只读 API', () => {
+  it('keeps all Agent and project data when portraits exceed the snapshot budget', async () => {
+    const service = stubService();
+    const [template] = await service.listBots();
+    const bots = Array.from({length: 20}, (_, i) => ({...template!, appId: `cli_${i}`, avatarDataUrl: `data:image/png;base64,${'A'.repeat(349_000)}`}));
+    service.listBots = async () => bots;
+    const server = createWebServer({service, token: TOKEN, logDir});
+    const {port} = await server.listen(0);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/api/state`, {headers: {Authorization: `Bearer ${TOKEN}`}});
+      const text = await response.text();
+      expect(response.status).toBe(200);
+      expect(text.length).toBeLessThan(4_000_000);
+      const body = JSON.parse(text) as {bots: {appId: string; avatarDataUrl?: string; projects: unknown[]}[]};
+      expect(body.bots.map(bot => bot.appId)).toEqual(bots.map(bot => bot.appId));
+      expect(body.bots.every(bot => bot.projects.length === 1)).toBe(true);
+      expect(body.bots[0]?.avatarDataUrl).toBe(bots[0]?.avatarDataUrl);
+      expect(body.bots.at(-1)?.avatarDataUrl).toBeUndefined();
+      expect(bots.every(bot => Boolean(bot.avatarDataUrl))).toBe(true);
+    } finally { await server.close(); }
+  });
+
   it('/api/state 快照形状：version/generatedAt + bots[].projects[]', async () => {
     const body = await jsonOf(await authed('/api/state'));
     expect(typeof body.version).toBe('string');

@@ -675,7 +675,13 @@ export function createWebServer(opts: WebServerOptions): WebServer {
   async function handleState(res: ServerResponse): Promise<void> {
     const bots = await opts.service.listBots();
     const out = [];
-    for (const b of bots) {
+    let remainingAvatarBytes = 2_000_000;
+    for (const bot of bots) {
+      const b = { ...bot };
+      if (b.avatarDataUrl) {
+        if (b.avatarDataUrl.length > remainingAvatarBytes) delete b.avatarDataUrl;
+        else remainingAvatarBytes -= b.avatarDataUrl.length;
+      }
       try { out.push({ ...b, projects: await opts.service.listProjects(b.appId) }); }
       catch (error) { out.push({ ...b, projects: [], projectsError: error instanceof Error ? error.message : '项目读取失败' }); }
     }
