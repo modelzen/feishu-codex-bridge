@@ -28,6 +28,7 @@ import {
 import { listSessionsIn } from '../bot/session-store';
 import { loadConfig } from '../config/store';
 import { resolveAppSecret } from '../config/secret-resolver';
+import { createAgentAvatarProvider } from './avatar';
 import { diagnoseEventSubscription, type EventDiagnosis } from '../utils/event-diagnosis';
 import { validateAppCredentials } from '../utils/feishu-auth';
 import { buildScopeGrantUrl, buildEventConfigUrl } from '../config/scopes';
@@ -273,6 +274,7 @@ export interface AdminBot {
   appId: string;
   tenant: 'feishu' | 'lark';
   botName?: string;
+  avatarDataUrl?: string;
   /** run/start 会带起它（bot use 的多选活跃集） */
   active: boolean;
   /** bots.json 的 current（单 bot 代码路径的主 bot） */
@@ -486,6 +488,13 @@ export interface AdminServiceDeps {
  */
 export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
   const codexTools = deps.codexTools ?? new CodexSetupService();
+  const avatars = createAgentAvatarProvider({
+    credentials: async (botId) => {
+      const cfg = await loadConfig(botPaths(botId).configFile);
+      if (!isComplete(cfg)) throw new Error('机器人配置不完整');
+      return { appId: botId, tenant: cfg.accounts.app.tenant, appSecret: await resolveAppSecret(cfg) };
+    },
+  });
   async function projectsWithCounts(botId: string): Promise<AdminProject[]> {
     const files = botPaths(botId);
     const projects = await listProjectsIn(files.projectsFile);
@@ -587,6 +596,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     },
     async listBots(): Promise<AdminBot[]> {
       const reg = await loadBots();
+      avatars.retain(new Set(reg.bots.map(bot => bot.appId)));
       const configured = reg.bots.some((b) => b.active !== undefined);
       const out: AdminBot[] = [];
       for (const b of reg.bots) {
@@ -596,6 +606,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
           appId: b.appId,
           tenant: b.tenant,
           botName: b.botName,
+          avatarDataUrl: avatars.get(b.appId),
           // 与 config/bots.activeBots 同语义：从未配置过活跃集 → 回退 current。
           active: configured ? b.active === true : reg.current === b.appId,
           current: reg.current === b.appId,
@@ -605,6 +616,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
           connection: run.connection,
           completionReminder,
         });
+        void avatars.refresh(b.appId);
       }
       return out;
     },
@@ -973,6 +985,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       await removeBot(appId);
       await removeSecret(secretKeyForApp(appId)).catch(() => undefined);
       await rm(botDir(appId), { recursive: true, force: true }).catch(() => undefined);
+      avatars.retain(new Set(reg.bots.filter(bot => bot.appId !== appId).map(bot => bot.appId)));
       return { ok: true };
     },
   };
