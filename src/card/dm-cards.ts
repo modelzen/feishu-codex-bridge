@@ -31,6 +31,7 @@ import { labelScope } from '../config/scopes';
 import { summarizeEventDiagnosis, type EventDiagnosis } from '../utils/event-diagnosis';
 import { actions, actionsFixed, button, card, form, hr, input, linkButton, md, note, selectMenu, splitRow, submitButton, type CardElement, type CardObject, type SelectOption } from './cards';
 import { reasoningEffortLabel, relativeTime } from './command-cards';
+import type { DesktopRelease } from '../service/desktop-release';
 
 /** applink to open a Feishu group chat by chat_id (oc_xxx). Feishu has no
  * deep link to a specific thread/topic, so this lands in the group and the
@@ -143,6 +144,20 @@ export function kindLabel(kind?: 'multi' | 'single'): string {
   return kind === 'single' ? '💬 单会话群' : '👥 多话题群';
 }
 
+function desktopReleaseElements(release?: DesktopRelease | null): CardElement[] {
+  if (!release) return [];
+  return [
+    md(`**Vonvon Bridge 桌面版 v${release.version} 已提供**`),
+    note('安装后可接续已有 Agent、飞书群和配置，无需重新配置。CLI 仍可单独使用。'),
+    actions(release.installers.map((installer) => linkButton(
+      installer.platform === 'macOS' ? '安装桌面版 · macOS Apple Silicon' : '安装桌面版 · Windows x64',
+      installer.url,
+      'primary',
+    ))),
+    hr(),
+  ];
+}
+
 /**
  * The top-level management menu.
  *
@@ -160,10 +175,11 @@ export function kindLabel(kind?: 'multi' | 'single'): string {
  * dm-cards stays a pure renderer — all IO (discovery file / version) lives in
  * the caller.
  */
-export function buildDmMenuCard(opts: { webConsoleUrl?: string; version?: string } = {}): CardObject {
-  const { webConsoleUrl, version } = opts;
+export function buildDmMenuCard(opts: { webConsoleUrl?: string; version?: string; desktopRelease?: DesktopRelease | null } = {}): CardObject {
+  const { webConsoleUrl, version, desktopRelease } = opts;
   return card(
     [
+      ...desktopReleaseElements(desktopRelease),
       md('私聊用于**建项目和管理**；具体任务请到项目群里 @我。'),
       hr(),
       // 两行按钮固定宽度、左对齐；两行宽度配平后总长相等、右边缘对齐（见 MENU_BTN_W_*）。
@@ -215,6 +231,8 @@ export interface UpdateCardState {
   hasUpdate?: boolean;
   /** checked phase: running from a git checkout — steer to git pull, not npm */
   dev?: boolean;
+  /** Bundled Core updates through its owning desktop app. */
+  distribution?: 'bundled' | 'other';
   /** done/updating/error phase: version we updated from */
   from?: string;
   /** done phase: version we updated to */
@@ -223,6 +241,7 @@ export interface UpdateCardState {
   willRestart?: boolean;
   /** error phase: tail of npm output */
   message?: string;
+  desktopRelease?: DesktopRelease | null;
 }
 
 const backToMenu = () => actions([button('⬅️ 菜单', { a: DM.menu })]);
@@ -241,11 +260,18 @@ export function buildUpdateCard(state: UpdateCardState): CardObject {
 
     case 'checked': {
       const cur = state.current ?? '?';
+      if (state.distribution === 'bundled') {
+        return card(
+          [md(`当前版本：**v${cur}**`), note('此 Bridge 随 Vonvon Bridge 桌面应用提供，请在桌面应用中更新。'), ...desktopReleaseElements(state.desktopRelease), backToMenu()],
+          { header: { title: '⬆️ 版本更新', template: 'blue' } },
+        );
+      }
       if (!state.latest) {
         return card(
           [
             md(`当前版本：**v${cur}**`),
             md('⚠️ 查不到最新版本（网络或 npm registry 问题）。'),
+            ...desktopReleaseElements(state.desktopRelease),
             actions([button('🔄 重试', { a: DM.update }), button('⬅️ 菜单', { a: DM.menu })]),
           ],
           { header: { title: '⬆️ 版本更新', template: 'red' } },
@@ -253,7 +279,7 @@ export function buildUpdateCard(state: UpdateCardState): CardObject {
       }
       if (!state.hasUpdate) {
         return card(
-          [md(`✅ 已是最新版本：**v${cur}**`), backToMenu()],
+          [md(`✅ 已是最新版本：**v${cur}**`), ...desktopReleaseElements(state.desktopRelease), backToMenu()],
           { header: { title: '⬆️ 版本更新', template: 'green' } },
         );
       }
@@ -266,6 +292,7 @@ export function buildUpdateCard(state: UpdateCardState): CardObject {
           [
             ...head,
             md('检测到**源码开发模式**（仓库内有 .git）。请在终端用 `git pull && npm i` 更新，而不是全局安装。'),
+            ...desktopReleaseElements(state.desktopRelease),
             backToMenu(),
           ],
           { header: { title: '⬆️ 版本更新', template: 'orange' } },
@@ -275,6 +302,7 @@ export function buildUpdateCard(state: UpdateCardState): CardObject {
         [
           ...head,
           note('点「立即更新」会执行 `npm i -g` 并自动重启后台服务（约数十秒）。'),
+          ...desktopReleaseElements(state.desktopRelease),
           actions([
             button('⬆️ 立即更新', { a: DM.updateDo }, 'primary'),
             button('⬅️ 菜单', { a: DM.menu }),
@@ -298,7 +326,7 @@ export function buildUpdateCard(state: UpdateCardState): CardObject {
         ? note('正在重启后台服务以生效 —— 重启期间本卡片停止更新；稍后发我任意消息可重开管理台。')
         : note('前台模式：请在终端手动重启 `run` 进程使新版本生效。');
       return card(
-        [md(`✅ 已更新 **v${state.from ?? '?'} → v${state.to ?? '?'}**`), tail],
+        [md(`✅ 已更新 **v${state.from ?? '?'} → v${state.to ?? '?'}**`), tail, ...desktopReleaseElements(state.desktopRelease)],
         { header: { title: '⬆️ 版本更新', template: 'green' } },
       );
     }

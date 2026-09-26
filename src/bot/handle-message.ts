@@ -185,6 +185,8 @@ import {
 import { serviceStdoutPath, serviceStderrPath } from '../service/common';
 import { bridgeVersion } from '../core/version';
 import { webConsoleUrl } from '../web/discovery';
+import { getDesktopRelease } from '../service/desktop-release';
+import { runtimeDistribution } from '../service/distribution';
 import { paths } from '../config/paths';
 import { OutboundFiles } from './outbound-files';
 import { getSecret } from '../config/keystore';
@@ -2785,8 +2787,13 @@ export function createOrchestrator(
   // Back-to-menu: the settings card is button-only (never locks) and the
   // new-project form isn't locked until it's submitted, so 返回 always lands on
   // a card we can update in place — no recall, no fresh entity needed.
+  const renderDmMenuCard = async (): Promise<object> => buildDmMenuCard({
+      webConsoleUrl: webConsoleUrl(),
+      version: bridgeVersion(),
+      desktopRelease: await getDesktopRelease(),
+    });
   const freshMenu = (evt: CardActionEvent): void => {
-    patch(evt, buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() }));
+    patch(evt, renderDmMenuCard);
   };
 
   // 📊 Codex 用量：loading 卡先落地（取数走网络 1~3s），结果再原地覆盖。错误按
@@ -3098,13 +3105,15 @@ export function createOrchestrator(
           () => undefined,
         );
         const current = currentVersion();
-        const latest = await latestVersion().catch(() => null);
+        const [latest, desktopRelease, distribution] = await Promise.all([
+          latestVersion().catch(() => null), getDesktopRelease(), runtimeDistribution(),
+        ]);
         const hasUpdate = !!latest && isNewer(latest, current);
         log.info('console', 'update-check', { current, latest, hasUpdate });
         await updateManagedCard(
           channel,
           evt.messageId,
-          buildUpdateCard({ phase: 'checked', current, latest, hasUpdate, dev: isDevSource() }),
+          buildUpdateCard({ phase: 'checked', current, latest, hasUpdate, dev: isDevSource(), desktopRelease, distribution: distribution.kind === 'bundled' ? 'bundled' : 'other' }),
         ).catch((e) => log.fail('console', e, { phase: 'update-check' }));
       })();
     })
@@ -3118,6 +3127,10 @@ export function createOrchestrator(
       void (async () => {
         await new Promise((r) => setTimeout(r, CARD_SETTLE_MS));
         const from = currentVersion();
+        if ((await runtimeDistribution()).kind === 'bundled') {
+          await updateManagedCard(channel, evt.messageId, buildUpdateCard({ phase: 'checked', current: from, distribution: 'bundled' })).catch(() => undefined);
+          return;
+        }
         // 跨进程更新锁（B）：与 Web「升级」共用一把锁，防止两个 `npm i -g` 并发装坏全局
         // 目录。拿不到＝已有更新在跑，直接提示「进行中」并退出，不叠跑第二个安装。
         const release = acquireUpdateLock();
@@ -3149,11 +3162,12 @@ export function createOrchestrator(
         }
         const to = currentVersion();
         const willRestart = daemonRunning();
+        const desktopRelease = await getDesktopRelease();
         log.info('console', 'update-done', { from, to, willRestart });
         await updateManagedCard(
           channel,
           evt.messageId,
-          buildUpdateCard({ phase: 'done', from, to, willRestart }),
+          buildUpdateCard({ phase: 'done', from, to, willRestart, desktopRelease }),
         ).catch((e) => log.fail('console', e, { phase: 'update-done' }));
         if (willRestart) {
           // 给完成卡一点渲染时间，再触发重启（mac：kill 自己靠 launchd 复活；Windows：
@@ -3607,7 +3621,7 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : '';
       patch(evt, async () => {
         const p = await getProjectByName(name);
-        if (!p) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        if (!p) return renderDmMenuCard();
         return buildAllowlistCard(p, await namesWithOperator(evt, p.allowedUsers ?? []));
       });
     })
@@ -3643,7 +3657,7 @@ export function createOrchestrator(
       patch(evt, async () => {
         await updateProject(name, (p) => ({ allowedUsers: (p.allowedUsers ?? []).filter((x) => x !== id) }));
         const fresh = await getProjectByName(name); // 写后回读，与盘上一致
-        if (!fresh) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        if (!fresh) return renderDmMenuCard();
         return buildAllowlistCard(fresh, await namesWithOperator(evt, fresh.allowedUsers ?? []));
       });
     })
@@ -3653,7 +3667,7 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : '';
       patch(evt, async () => {
         const p = await getProjectByName(name);
-        return p ? buildProjectSettingsCard(p, backendDisplayName(p.backend)) : buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        return p ? buildProjectSettingsCard(p, backendDisplayName(p.backend)) : renderDmMenuCard();
       });
     })
     .on(DM.projectTopics, ({ evt, value }) => {
@@ -3661,7 +3675,7 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : '';
       patch(evt, async () => {
         const p = await getProjectByName(name);
-        if (!p) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        if (!p) return renderDmMenuCard();
         const sessions = (await listSessions()).filter((s) => s.chatId === p.chatId);
         return buildProjectTopicsCard(p, sessions);
       });
@@ -3673,7 +3687,7 @@ export function createOrchestrator(
       const on = value.v === 'on';
       patch(evt, async () => {
         const r = await performSetNoMention({ projectName: name, on });
-        if (!r.ok) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        if (!r.ok) return renderDmMenuCard();
         return buildProjectSettingsCard(r.project, backendDisplayName(r.project.backend));
       });
     })
@@ -3685,7 +3699,7 @@ export function createOrchestrator(
         // 共享层落盘 + 驱逐活跃会话（压缩上限在 thread/start 绑定，驱逐后下一条
         // 消息重绑生效——mirrors 群设置）。
         const r = await performSetAutoCompact({ projectName: name, on, evictLiveSessionsForChat });
-        if (!r.ok) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        if (!r.ok) return renderDmMenuCard();
         log.info('console', 'project-autocompact', { project: name, on });
         return buildProjectSettingsCard(r.project, backendDisplayName(r.project.backend));
       });
@@ -3696,7 +3710,7 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : '';
       patch(evt, async () => {
         const p = await getProjectByName(name);
-        return p ? buildPermissionCard(p) : buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        return p ? buildPermissionCard(p) : renderDmMenuCard();
       });
     })
     // 提交权限表单：落盘 管理员档 mode / 普通用户档 guestMode / 联网，再驱逐本项目活跃会话
@@ -3725,7 +3739,7 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : '';
       patch(evt, async () => {
         const p = await getProjectByName(name);
-        if (!p) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        if (!p) return renderDmMenuCard();
         const models = await listModels(backendFor(p.backend));
         return buildModelDefaultCard(p, models, 'dm');
       });
@@ -5706,18 +5720,20 @@ export function createOrchestrator(
           // 二次确认。latestVersion 走异步 execFile（绝不能 spawnSync 冻住 event loop）。
           const { messageId } = await sendDm(buildUpdateCard({ phase: 'checking' }));
           const current = currentVersion();
-          const latest = await latestVersion().catch(() => null);
+          const [latest, desktopRelease, distribution] = await Promise.all([
+            latestVersion().catch(() => null), getDesktopRelease(), runtimeDistribution(),
+          ]);
           const hasUpdate = !!latest && isNewer(latest, current);
           log.info('console', 'update-check', { current, latest, hasUpdate, via: 'menu' });
           await updateManagedCard(
             channel,
             messageId,
-            buildUpdateCard({ phase: 'checked', current, latest, hasUpdate, dev: isDevSource() }),
+            buildUpdateCard({ phase: 'checked', current, latest, hasUpdate, dev: isDevSource(), desktopRelease, distribution: distribution.kind === 'bundled' ? 'bundled' : 'other' }),
           ).catch((e) => log.fail('console', e, { phase: 'update-check', via: 'menu' }));
           break;
         }
         default:
-          await sendDm(buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() }));
+          await sendDm(await renderDmMenuCard());
       }
     } catch (err) {
       log.fail('console', err, { cmd: 'menu-card', key: evt.eventKey });
