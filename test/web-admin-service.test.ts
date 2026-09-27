@@ -12,6 +12,8 @@ import {
   type AdminService,
 } from '../src/admin/service';
 import { AdminWriteError, type AdminWriteOp } from '../src/admin/ops';
+import type { CodexSetupService } from '../src/agent/codex-appserver/setup';
+import * as clientPool from '../src/agent/codex-appserver/client-pool';
 
 // 把整个 ~/.feishu-codex-bridge 指到临时目录，绝不碰真实用户数据。fixture 通过
 // bots/registry/session-store 模块的导出写入（useBotDir 切目录后写）——服务层读
@@ -218,6 +220,36 @@ it('Host 用量读取只依赖 Codex 账号，不查机器人或群配置', asyn
   expect(await account.accountUsage(true)).toEqual(usage);
   expect(calls).toEqual([false, true]);
   await account.close?.();
+});
+
+it('Host 退出等待在途用量读取，再清理 Codex 常驻客户端，并拒绝新的读取', async () => {
+  const usage = { profile: { topInvocations: [], dailyBuckets: [] }, usage: { main: {}, extras: [], fetchedAt: 456 } };
+  let releaseUsage!: (value: typeof usage) => void;
+  const pendingUsage = new Promise<typeof usage>(resolve => { releaseUsage = resolve; });
+  const events: string[] = [];
+  const codexTools = { close: async () => { events.push('setup closed'); } } as CodexSetupService;
+  const residentClose = vi.spyOn(clientPool, 'shutdownResidentClients').mockImplementation(async () => {
+    events.push('residents closed');
+  });
+  const account = createAdminService({ fetchAccountUsage: () => pendingUsage, codexTools });
+  try {
+    const read = account.accountUsage(false).then(result => { events.push('usage finished'); return result; });
+    let closed = false;
+    const closing = account.close?.().then(() => { closed = true; });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    expect(events).toEqual([]);
+    await expect(account.accountUsage(true)).rejects.toThrow('Host 正在退出');
+    releaseUsage(usage);
+    expect(await read).toEqual(usage);
+    await closing;
+    expect(events).toEqual(['usage finished', 'setup closed', 'residents closed']);
+    await account.close?.();
+    expect(residentClose).toHaveBeenCalledTimes(1);
+  } finally {
+    releaseUsage(usage);
+    residentClose.mockRestore();
+  }
 });
 
 describe('createReadonlyAdminService · 写方法（只读预览占位）', () => {
