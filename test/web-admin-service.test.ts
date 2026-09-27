@@ -206,6 +206,20 @@ describe('createReadonlyAdminService · 只读方法（显式路径，不碰全�
   });
 });
 
+it('Host 用量读取只依赖 Codex 账号，不查机器人或群配置', async () => {
+  const calls: boolean[] = [];
+  const usage = { profile: { topInvocations: [], dailyBuckets: [] }, usage: { main: {}, extras: [], fetchedAt: 456 } };
+  const account = createAdminService({ fetchAccountUsage: async force => {
+    calls.push(force);
+    return usage;
+  } });
+  account.listBots = async () => { throw new Error('account usage must not read bots'); };
+  expect(await account.accountUsage(false)).toEqual(usage);
+  expect(await account.accountUsage(true)).toEqual(usage);
+  expect(calls).toEqual([false, true]);
+  await account.close?.();
+});
+
 describe('createReadonlyAdminService · 写方法（只读预览占位）', () => {
   it('五个写方法一律抛 NotWiredYetError', async () => {
     await expect(service.switchBackend(BOT_A, 'proj-a', 'codex-appserver')).rejects.toBeInstanceOf(NotWiredYetError);

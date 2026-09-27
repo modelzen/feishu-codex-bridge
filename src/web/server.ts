@@ -2,6 +2,7 @@ import { parseCollaborationRequest } from '../admin/collaboration';
 import { handleSettingsRoute } from './settings-routes';
 import { GroupUpstreamError, InvalidGroupInput, parseBindGroupInput } from '../admin/groups';
 import { CodexSetupConflict } from '../agent/codex-appserver/setup';
+import { UsageError, type UsageErrorKind } from '../agent/types';
 import { validateVoiceAction } from '../voice/service';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
@@ -167,6 +168,26 @@ export function createWebServer(opts: WebServerOptions): WebServer {
     if (await handleSettingsRoute(req, res, url, opts.service.settings)) return;
 
     // ── 路由 ──────────────────────────────────────────────────────────────
+    if (pathName === '/api/account/codex/usage') {
+      if (req.method !== 'GET') { sendJson(res, 405, { error: 'method_not_allowed' }); return; }
+      const forceValues = url.searchParams.getAll('force');
+      if (forceValues.length > 1 || (forceValues.length === 1 && forceValues[0] !== '0' && forceValues[0] !== '1')) {
+        sendJson(res, 400, { error: 'invalid_request', message: 'force 必须是 0 或 1' });
+        return;
+      }
+      try {
+        sendJson(res, 200, { data: await opts.service.accountUsage(forceValues[0] === '1') });
+      } catch (error) {
+        if (error instanceof UsageError) {
+          const status = error.kind === 'transient' ? 502 : 409;
+          sendJson(res, status, { error: 'usage_unavailable', kind: error.kind, message: accountUsageErrorMessage(error.kind) });
+        } else {
+          sendJson(res, 500, { error: 'internal', message: '读取 Codex 用量失败' });
+        }
+      }
+      return;
+    }
+
     if (req.method === 'GET' && pathName === '/') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       res.end(html);
@@ -1028,6 +1049,15 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       return closing;
     },
   };
+}
+
+function accountUsageErrorMessage(kind: UsageErrorKind): string {
+  switch (kind) {
+    case 'no-auth': return '请先登录 Codex，再查看用量。';
+    case 'api-key-mode': return '当前 Codex 使用 API Key 登录，无法读取 ChatGPT 账号用量。';
+    case 'need-relogin': return 'Codex 登录已失效，请重新登录。';
+    case 'transient': return '暂时无法读取 Codex 用量，请稍后重试。';
+  }
 }
 
 function companionError(res: ServerResponse, error: unknown): void {

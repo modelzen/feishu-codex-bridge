@@ -6,10 +6,17 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createWebServer, type WebServer } from '../src/web/server';
 import { NotWiredYetError, type AdminService } from '../src/admin/service';
 import { AdminWriteError } from '../src/admin/ops';
+import { UsageError } from '../src/agent/types';
 
 // 内存 stub：server 层单测不碰真实文件/注册表（service 自有专门的集成测试）。
 function stubService(): AdminService {
   return {
+    async accountUsage() {
+      return {
+        profile: { displayName: 'Local Codex', topInvocations: [], dailyBuckets: [] },
+        usage: { main: {}, extras: [], fetchedAt: 123 },
+      };
+    },
     async getVoice() { return { enabled: false, feishu: { state: 'unchecked' as const, message: '尚未检测' }, result: '尚未测试', grantUrl: 'https://open.feishu.cn/' }; },
     async setVoice() {},
     async listBots() {
@@ -319,6 +326,54 @@ describe('web server · 安全（loopback + token + Host 校验）', () => {
 });
 
 describe('web server · 只读 API', () => {
+  it('Codex 用量按本机账号读取，零 Agent 也可用，强制刷新参数原样传递', async () => {
+    const service = stubService();
+    service.listBots = async () => { throw new Error('usage must not load bots'); };
+    const forces: boolean[] = [];
+    service.accountUsage = async force => {
+      forces.push(force);
+      return { profile: { topInvocations: [], dailyBuckets: [] }, usage: { main: {}, extras: [], fetchedAt: 123 } };
+    };
+    const server = createWebServer({ service, token: TOKEN, logDir });
+    const { port } = await server.listen(0);
+    const address = `http://127.0.0.1:${port}/api/account/codex/usage`;
+    try {
+      expect((await fetch(address)).status).toBe(401);
+      const headers = { Authorization: `Bearer ${TOKEN}` };
+      const normal = await fetch(address, { headers });
+      expect(normal.status).toBe(200);
+      expect((await jsonOf(normal)).data.usage.fetchedAt).toBe(123);
+      const refreshed = await fetch(`${address}?force=1`, { headers });
+      expect(refreshed.status).toBe(200);
+      expect(forces).toEqual([false, true]);
+      expect((await fetch(`${address}?force=yes`, { headers })).status).toBe(400);
+      expect((await fetch(`${address}?force=1&force=0`, { headers })).status).toBe(400);
+      expect((await fetch(address, { method: 'POST', headers })).status).toBe(405);
+      expect(forces).toEqual([false, true]);
+    } finally { await server.close(); }
+  });
+
+  it('Codex 用量错误只返回可显示的分类与安全提示', async () => {
+    const service = stubService();
+    service.accountUsage = async () => { throw new UsageError('no-auth', 'secret path /private/auth.json'); };
+    const server = createWebServer({ service, token: TOKEN, logDir });
+    const { port } = await server.listen(0);
+    try {
+      const headers = { Authorization: `Bearer ${TOKEN}` };
+      const address = `http://127.0.0.1:${port}/api/account/codex/usage`;
+      const missing = await fetch(address, { headers });
+      expect(missing.status).toBe(409);
+      const body = await jsonOf(missing);
+      expect(body.kind).toBe('no-auth');
+      expect(body.message).toContain('登录 Codex');
+      expect(JSON.stringify(body)).not.toContain('/private/auth.json');
+      service.accountUsage = async () => { throw new UsageError('transient', 'Bearer secret'); };
+      const temporary = await fetch(address, { headers });
+      expect(temporary.status).toBe(502);
+      expect((await jsonOf(temporary)).kind).toBe('transient');
+    } finally { await server.close(); }
+  });
+
   it('keeps all Agent and project data when portraits exceed the snapshot budget', async () => {
     const service = stubService();
     const [template] = await service.listBots();

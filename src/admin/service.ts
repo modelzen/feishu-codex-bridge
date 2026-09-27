@@ -6,6 +6,8 @@ import { createSettingsService } from './settings-service';
 import type { HostSettings } from './settings-types';
 import type { AdminSettingsReadOp } from './ipc';
 import { CodexSetupService, type CodexSetup, type CodexJob, type CodexJobType } from '../agent/codex-appserver/setup';
+import { shutdownResidentClients } from '../agent/codex-appserver/client-pool';
+import { fetchUsageBundle } from '../agent/usage';
 import { parseJoinedGroups, type AdminGroupOp, type BindGroupInput, type JoinedGroups } from './groups';
 import { voiceView } from '../voice/view';
 import type { VoiceAction, VoiceView } from '../voice/types';
@@ -59,7 +61,7 @@ import {
   type InstallResult,
   type InstallProgress,
 } from '../agent';
-import type { BackendDepState, BackendProbe, PermissionMode } from '../agent/types';
+import type { AccountUsageBundle, BackendDepState, BackendProbe, PermissionMode } from '../agent/types';
 import { readRecentLogs } from '../core/logger';
 import { getServiceAdapter } from '../service/adapter';
 import {
@@ -106,6 +108,7 @@ import type { AdminWriteOp } from './ops';
  */
 export interface AdminService {
   collaboration?(botId: string, request: CollaborationRequest): Promise<unknown>;
+  accountUsage(force: boolean): Promise<AccountUsageBundle>;
   settings?: HostSettings;
   codexSetup?(): Promise<CodexSetup>;
   startCodexJob?(type: CodexJobType): { id: string };
@@ -438,6 +441,7 @@ export interface AdminBackendCatalogEntry {
 
 /** daemon/预览两种进程形态的差异全部收进这几个注入点；读路径完全同源。 */
 export interface AdminServiceDeps {
+  fetchAccountUsage?: (force: boolean) => Promise<AccountUsageBundle>;
   applyBotActivation?: (appId: string, enabled: boolean) => Promise<void>;
   executeSettingsRead?: (botId: string, op: AdminSettingsReadOp) => Promise<unknown>;
   codexTools?: CodexSetupService;
@@ -569,6 +573,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
   }
 
   return {
+    accountUsage: force => (deps.fetchAccountUsage ?? fetchUsageBundle)(force),
     settings: createSettingsService(deps),
     codexSetup: () => codexTools.setup(),
     startCodexJob(type) {
@@ -577,7 +582,10 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     },
     codexJob: id => codexTools.get(id),
     cancelCodexJob: id => codexTools.cancel(id),
-    close: () => codexTools.close(),
+    close: async () => {
+      const results = await Promise.allSettled([codexTools.close(), shutdownResidentClients()]);
+      for (const result of results) if (result.status === 'rejected') throw result.reason;
+    },
     async collaboration(botId, request) {
       if (!deps.executeCollaboration) throw new NotWiredYetError('协作管理');
       return deps.executeCollaboration(botId, request);
