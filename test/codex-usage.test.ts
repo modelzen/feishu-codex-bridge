@@ -1,10 +1,11 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { UsageError } from '../src/agent/types';
 import {
   chatgptBaseUrl,
+  fetchUsageBundle,
   jwtExpMs,
   mapProfileResponse,
   mapUsageResponse,
@@ -204,5 +205,49 @@ describe('UsageError', () => {
     const e = new UsageError('need-relogin', 'x');
     expect(e.kind).toBe('need-relogin');
     expect(e).toBeInstanceOf(Error);
+  });
+});
+
+describe('fetchUsageBundle', () => {
+  const previousHome = process.env.CODEX_HOME;
+  let home: string | undefined;
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    if (home) rmSync(home, { recursive: true, force: true });
+    home = undefined;
+    if (previousHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousHome;
+  });
+
+  it('waits for the other account request to settle before reporting a failure', async () => {
+    home = mkdtempSync(join(tmpdir(), 'codex-usage-bundle-test-'));
+    process.env.CODEX_HOME = home;
+    writeFileSync(join(home, 'auth.json'), JSON.stringify({ tokens: { access_token: 'test-token' } }));
+
+    let finishUsage: (response: Response) => void = () => {};
+    const usageResponse = new Promise<Response>((resolve) => { finishUsage = resolve; });
+    let markUsageStarted: () => void = () => {};
+    const usageStarted = new Promise<void>((resolve) => { markUsageStarted = resolve; });
+    vi.stubGlobal('fetch', vi.fn((url: string) => {
+      if (url.endsWith('/wham/profiles/me')) return Promise.resolve(new Response(null, { status: 503 }));
+      if (url.endsWith('/wham/usage')) {
+        markUsageStarted();
+        return usageResponse;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+
+    let settled = false;
+    const result = fetchUsageBundle(true).then(
+      () => { settled = true; return undefined; },
+      (error: unknown) => { settled = true; return error; },
+    );
+    await usageStarted;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+
+    finishUsage(Response.json(USAGE_FIXTURE));
+    expect(await result).toMatchObject({ kind: 'transient', message: 'HTTP 503 (/wham/profiles/me)' });
   });
 });
