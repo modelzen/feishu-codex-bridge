@@ -30,7 +30,8 @@ export async function handleSettingsRoute(req: IncomingMessage, res: ServerRespo
   const session = /^\/api\/bots\/([^/]+)\/sessions\/([^/]+)\/settings$/.exec(url.pathname);
   const models = /^\/api\/bots\/([^/]+)\/models$/.exec(url.pathname);
   const host = url.pathname === '/api/settings/host';
-  if (!agent && !project && !session && !models && !host)
+  const hostActions = url.pathname === '/api/settings/host/actions';
+  if (!agent && !project && !session && !models && !host && !hostActions)
     return false;
   if (!settings) {
     send(res, 404, {
@@ -48,10 +49,14 @@ export async function handleSettingsRoute(req: IncomingMessage, res: ServerRespo
       })));
       return true;
     }
-    if (agent?.[2] === 'actions' && req.method === 'POST') {
+    if ((agent?.[2] === 'actions' || hostActions) && req.method === 'POST') {
       const action = parseSettingsAction(await body(req));
-      if (action.botId !== decodeURIComponent(agent[1]!))
+      if (agent && (!('botId' in action) || action.botId !== decodeURIComponent(agent[1]!)))
         throw new SettingsInputError('Agent 标识不一致');
+      if (agent && (action.kind === 'setHostCliRoute' || action.kind === 'repairHostCliHooks'))
+        throw new SettingsInputError('本机操作不能由 Agent 执行');
+      if (hostActions && action.kind !== 'setHostCliRoute' && action.kind !== 'repairHostCliHooks')
+        throw new SettingsInputError('本机操作类型无效');
       const result = await settings.act(action);
       send(res, result.kind === 'conflict' ? 409 : result.kind === 'unavailable' ? 503 : result.kind === 'rejected' ? 400 : 200, result);
       return true;

@@ -187,6 +187,8 @@ export function parseSettingsAction(input: unknown): SettingsAction {
   const revision = text;
   const membership = one('present', 'absent');
   const rules: Record<string, Rule> = {
+    setHostCliRoute: shape({ kind: one('setHostCliRoute'), botId: value => value === null || identifier('cli')(value), revision }),
+    repairHostCliHooks: shape({ kind: one('repairHostCliHooks'), agents: value => Array.isArray(value) && value.length > 0 && value.length <= 2 && new Set(value).size === value.length && value.every(agent => agent === 'claude' || agent === 'codex') }),
     setCliBridgeEnabled: shape({
       ...common,
       enabled: bool,

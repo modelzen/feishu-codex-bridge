@@ -177,6 +177,13 @@ export interface HostSettingsView {
     codexBin: string | null;
     fallbackCwd: string;
     platform: string;
+    coffee?: {
+      route: 'legacy' | 'none' | 'agent';
+      botId: string | null;
+      revision: string;
+      agents: { botId: string; name: string; enabled: boolean; hasOwner: boolean }[];
+      hooks: { claude: CliHookStatus; codex: CliHookStatus };
+    };
   };
 }
 export type SettingsView = AgentSettingsView | ProjectSettingsView | SessionSettingsView | HostSettingsView;
@@ -217,6 +224,13 @@ export type SettingsSave = {
   reason: SettingsAccess;
 };
 export type SettingsAction = {
+  kind: 'setHostCliRoute';
+  botId: string | null;
+  revision: string;
+} | {
+  kind: 'repairHostCliHooks';
+  agents: ('claude' | 'codex')[];
+} | {
   kind: 'setCliBridgeEnabled';
   botId: string;
   enabled: boolean;
@@ -258,15 +272,15 @@ export type SettingsAction = {
     kind: 'default';
   };
 };
-export type BotSettingsAction = SettingsAction;
+export type BotSettingsAction = Exclude<SettingsAction, { kind: 'setHostCliRoute' | 'repairHostCliHooks' }>;
 export type SettingsActionResult = {
   kind: 'saved';
-  view: AgentSettingsView | ProjectSettingsView;
+  view: AgentSettingsView | ProjectSettingsView | HostSettingsView;
   effects: ApplyEffect[];
   warnings: string[];
 } | {
   kind: 'conflict';
-  view: AgentSettingsView | ProjectSettingsView;
+  view: AgentSettingsView | ProjectSettingsView | HostSettingsView;
 } | {
   kind: 'rejected';
   fields: SettingsFieldError[];

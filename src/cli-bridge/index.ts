@@ -8,6 +8,7 @@ import { sendCliHookMessage } from './ipc';
 import { parseHookPayload } from './parser';
 import { buildHookStdout } from './protocol';
 import type { CliBridgeAgent, CliHookResponse } from './types';
+import { readCliBridgeRoute, type CliBridgeRoute } from './route';
 
 export { createCliBridgeService, shouldStartCliBridge } from './service';
 
@@ -15,8 +16,16 @@ type HookConfigLoader = (appId: string) => Promise<Partial<AppConfig>>;
 
 export async function selectCliBridgeHookBot(
   reg: BotsRegistry,
-  opts: { requested?: string; loadConfigForBot?: HookConfigLoader } = {},
+  opts: { requested?: string; loadConfigForBot?: HookConfigLoader; route?: CliBridgeRoute } = {},
 ): Promise<BotEntry | undefined> {
+  const route = opts.route ?? readCliBridgeRoute();
+  if (route.kind === 'none') return undefined;
+  if (route.kind === 'agent') {
+    const target = findBot(reg, route.botId);
+    if (!target || target.active === false) return undefined;
+    const cfg = await (opts.loadConfigForBot ?? ((appId: string) => loadConfig(join(botDir(appId), 'config.json'))))(target.appId).catch(() => undefined);
+    return cfg && isComplete(cfg) && getCliBridgePreferences(cfg).enabled ? target : undefined;
+  }
   const requested = opts.requested?.trim();
   if (requested) {
     return findBot(reg, requested) ?? { name: requested, appId: requested, tenant: 'feishu', createdAt: 0 };
@@ -47,11 +56,14 @@ export async function runHookCommand(agent: string, bot?: string): Promise<void>
   // Point paths at the selected bot so the hook hits the same per-bot socket the
   // running daemon listens on. Installed hooks include --bot when repaired from a
   // bot daemon; older hooks fall back to the current enabled active bot.
+  let unavailableRoute = false;
   try {
     const selected = await selectCliBridgeHookBot(await loadBots(), { requested: bot });
     if (selected) useBotDir(selected.appId);
+    else unavailableRoute = readCliBridgeRoute().kind !== 'legacy';
   } catch {
-    if (bot?.trim()) useBotDir(bot.trim());
+    if (readCliBridgeRoute().kind === 'legacy' && bot?.trim()) useBotDir(bot.trim());
+    else unavailableRoute = true;
     // ignore: fall through with the default path
   }
   const raw = await readStdin();
@@ -62,6 +74,7 @@ export async function runHookCommand(agent: string, bot?: string): Promise<void>
   }
   let response: CliHookResponse;
   try {
+    if (unavailableRoute) throw new Error('No enabled notification Agent');
     response = await sendCliHookMessage(paths.cliBridgeSocket, msg);
   } catch {
     response = { decision: 'fallback_local', reason: 'daemon_unavailable' };

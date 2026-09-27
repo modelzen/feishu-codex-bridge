@@ -609,7 +609,7 @@ export function createSettingsOwner(deps: SettingsOwnerDeps): T.HostSettings {
       return rejected(error);
     }
   }
-  async function performAction(action: T.SettingsAction): Promise<T.SettingsActionResult> {
+  async function performAction(action: T.BotSettingsAction): Promise<T.SettingsActionResult> {
     own({
       kind: 'agent',
       botId: action.botId
@@ -772,6 +772,7 @@ export function createSettingsOwner(deps: SettingsOwnerDeps): T.HostSettings {
     models,
     act(input) {
       const action = parseSettingsAction(input);
+      if (action.kind === 'setHostCliRoute' || action.kind === 'repairHostCliHooks') throw new SettingsInputError('本机操作不能由 Agent 执行');
       const result = actionChain.then(() => performAction(action));
       actionChain = result.then(() => undefined, () => undefined);
       return result;
