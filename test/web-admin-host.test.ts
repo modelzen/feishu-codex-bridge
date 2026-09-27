@@ -188,6 +188,26 @@ describe('AdminService · restartDaemon / applyUpdate（detached helper 注入�
 });
 
 describe('AdminService · setBotEnabled（活跃集 enabled 落盘）', () => {
+  it('reports application only after the running bot has stopped', async () => {
+    let finish!: () => void;
+    const stopped = new Promise<void>((resolve) => { finish = resolve; });
+    const applyBotActivation = vi.fn(async () => stopped);
+    const deps = { applyBotActivation, daemonStartedAt: 1 };
+    const svc = createAdminService(deps);
+    let settled = false;
+    const pending = svc.setBotEnabled(BOT_B, false).then((result) => { settled = true; return result; });
+    await vi.waitFor(() => expect(applyBotActivation).toHaveBeenCalledWith(BOT_B, false));
+    expect(settled).toBe(false);
+    finish();
+    expect(await pending).toMatchObject({ ok: true, activation: 'applied' });
+  });
+
+  it('does not claim an unsupported runtime applied the change', async () => {
+    expect(await createAdminService().setBotEnabled(BOT_B, false)).toMatchObject({
+      ok: true, activation: 'restartRequired',
+    });
+  });
+
   it('停用一个 bot → bots.json 的 active=false（其余不变）', async () => {
     const svc = createAdminService();
     const r = await svc.setBotEnabled(BOT_B, false);
