@@ -519,10 +519,7 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       }
       const r = await opts.service.setBotEnabled(appId, body.enabled);
       if (r.ok) {
-        sendJson(res, 200, {
-          ok: true,
-          message: '已保存。改活跃集需重启 Feishu Bridge 才生效（在「Feishu Bridge」卡点重启，或终端 `restart`）。',
-        });
+        sendJson(res, 200, r);
       } else {
         sendJson(res, 409, { error: 'rejected', message: r.reason });
       }

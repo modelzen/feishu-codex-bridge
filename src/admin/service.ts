@@ -239,12 +239,7 @@ export interface AdminService {
   applyUpdate(): Promise<void>;
   /** 宿主机体检：后端环境（复用 doctorBackends）+ Node/平台/配置目录/日志体量。绝不抛错。 */
   hostDoctor(): Promise<AdminHostDoctor>;
-  /**
-   * 切换某 bot 的 enabled（= 活跃集 active 字段，bots.json 落盘）。纯写宿主机级
-   * 注册表，不需 daemon 在跑。改活跃集需重启 daemon 才生效
-   * （提示由 UI 给），这里只落盘。绝不 throw——失败回 {@link BotMutationResult}。
-   */
-  setBotEnabled(appId: string, enabled: boolean): Promise<BotMutationResult>;
+  setBotEnabled(appId: string, enabled: boolean): Promise<BotActivationResult>;
   /**
    * 删除某 bot：注册表 + keystore 密钥 + 状态目录。**拒绝删除当前唯一 bot 或带
    * 运行中会话的 bot**——返回 { ok:false, reason } 让 UI 给清晰提示，绝不 throw。
@@ -253,6 +248,8 @@ export interface AdminService {
 }
 
 /** setBotEnabled / deleteBot 的统一返回：ok 或带中文拒因（HTTP 层映射 409）。 */
+export type BotActivationResult = { ok: true; activation: 'applied' | 'restartRequired'; message: string } | { ok: false; reason: string };
+
 export type BotMutationResult = { ok: true } | { ok: false; reason: string };
 
 /** 宿主机体检聚合：宿主机域（host.ts）+ 后端环境探测（doctorBackends 同源）。 */
@@ -441,6 +438,7 @@ export interface AdminBackendCatalogEntry {
 
 /** daemon/预览两种进程形态的差异全部收进这几个注入点；读路径完全同源。 */
 export interface AdminServiceDeps {
+  applyBotActivation?: (appId: string, enabled: boolean) => Promise<void>;
   executeSettingsRead?: (botId: string, op: AdminSettingsReadOp) => Promise<unknown>;
   codexTools?: CodexSetupService;
   executeCollaboration?: (botId: string, request: CollaborationRequest) => Promise<unknown>;
@@ -491,6 +489,7 @@ export interface AdminServiceDeps {
  * 不自己解析 JSON；不碰全局 currentBotDir）；写路径与实时状态由 deps 注入。
  */
 export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
+  let activationQueue: Promise<unknown> = Promise.resolve();
   const codexTools = deps.codexTools ?? new CodexSetupService();
   const credentials = async (botId: string) => {
     const cfg = await loadConfig(botPaths(botId).configFile);
@@ -973,24 +972,33 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       return { ...host, backends };
     },
 
-    async setBotEnabled(appId: string, enabled: boolean): Promise<BotMutationResult> {
-      const reg = await loadBots();
-      if (!reg.bots.some((b) => b.appId === appId)) {
-        return { ok: false, reason: `机器人「${appId}」不存在。` };
-      }
-      // 活跃集是多选 active 字段：基于当前激活集增/删该 bot 后整集重写（setActiveBots
-      // 会给每个 bot 盖 explicit active 布尔，从此「已配置」）。
-      const current = new Set(
-        reg.bots.some((b) => b.active !== undefined)
-          ? reg.bots.filter((b) => b.active === true).map((b) => b.appId)
-          : reg.current
-            ? [reg.current]
-            : [],
-      );
-      if (enabled) current.add(appId);
-      else current.delete(appId);
-      await setActiveBots([...current]);
-      return { ok: true };
+    setBotEnabled(appId: string, enabled: boolean): Promise<BotActivationResult> {
+      const operation = activationQueue.then(async (): Promise<BotActivationResult> => {
+        const reg = await loadBots();
+        if (!reg.bots.some((bot) => bot.appId === appId)) {
+          return { ok: false, reason: `机器人「${appId}」不存在。` };
+        }
+        const current = new Set(
+          reg.bots.some((bot) => bot.active !== undefined)
+            ? reg.bots.filter((bot) => bot.active === true).map((bot) => bot.appId)
+            : reg.current ? [reg.current] : [],
+        );
+        if (enabled) current.add(appId);
+        else current.delete(appId);
+        await setActiveBots([...current]);
+        if (!deps.applyBotActivation) {
+          return { ok: true, activation: 'restartRequired', message: '已保存。当前 Host 需重启后才能应用启停状态。' };
+        }
+        try {
+          await deps.applyBotActivation(appId, enabled);
+          return { ok: true, activation: 'applied', message: enabled ? 'Agent 已启用。' : 'Agent 已停止。' };
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          return { ok: false, reason: `已保存${enabled ? '启用' : '停用'}状态，但未能确认运行状态。${reason}` };
+        }
+      });
+      activationQueue = operation.catch(() => undefined);
+      return operation;
     },
 
     async deleteBot(appId: string): Promise<BotMutationResult> {

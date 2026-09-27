@@ -225,6 +225,24 @@ describe('AdminService · setBotEnabled（活跃集 enabled 落盘）', () => {
     expect((await loadBots()).bots.find((b) => b.appId === BOT_B)!.active).toBe(true);
   });
 
+  it('serializes concurrent activation writes and retains disabled state after stop failure', async () => {
+    let finish!: () => void;
+    const stopping = new Promise<void>((resolve) => { finish = resolve; });
+    const applied: string[] = [];
+    const svc = createAdminService({ applyBotActivation: async (appId) => {
+      applied.push(appId);
+      if (appId === BOT_A) await stopping;
+      else throw new Error('process still alive');
+    } });
+    const first = svc.setBotEnabled(BOT_A, false);
+    const second = svc.setBotEnabled(BOT_B, false);
+    await vi.waitFor(() => expect(applied).toEqual([BOT_A]));
+    finish();
+    expect((await first).ok).toBe(true);
+    expect(await second).toMatchObject({ ok: false, reason: expect.stringContaining('process still alive') });
+    expect((await loadBots()).bots.map((bot) => bot.active)).toEqual([false, false]);
+  });
+
   it('不存在的 bot → { ok:false, reason }', async () => {
     const svc = createAdminService();
     const r = await svc.setBotEnabled('cli_nope', true);

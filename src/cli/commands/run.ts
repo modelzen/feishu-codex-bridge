@@ -4,7 +4,7 @@ import { startBridge } from '../../bot/bridge';
 import { runSupervisor } from '../../bot/supervisor';
 import { acquireSingleInstanceLock, BridgeAlreadyRunningError } from '../../core/single-instance';
 import { clearServicePid, recordServicePid } from '../../service/win-startup';
-import { activeBots, loadBots } from '../../config/bots';
+import { activeBots, ensureRegistry } from '../../config/bots';
 import { log } from '../../core/logger';
 import { AdminWriteError } from '../../admin/ops';
 import { createAdminIpcResponder } from '../../admin/ipc';
@@ -13,21 +13,6 @@ import { installBackendDep, uninstallBackendDep } from '../../agent';
 import { spawnDaemonControl } from './daemon-control';
 import { mountWebConsole, type MountedWebConsole } from '../../web/mount';
 
-/**
- * `run` — foreground long-connection bot(s).
- *
- * Dispatch:
- *   - `run --bot <name>` (explicit selector) → run that ONE bot inline.
- *   - `run` with a single active bot (or a legacy single-bot install) → run it
- *     inline, exactly as before. This keeps the proven npx single-process path.
- *   - `run` with multiple active bots (`bot use` picked a set) → hand off to the
- *     multi-process supervisor, one child process per bot.
- *
- * Inline runs onboard first (scan-QR if no bot is configured yet — "init if not
- * initialized"), take the per-bot single-instance lock, then bring up the
- * bridge. SIGINT/SIGTERM trigger a graceful teardown that closes every codex
- * session (no orphan app-servers) and drops the WS before exiting.
- */
 export async function runRun(botName?: string, options: { control?: ShutdownControl; managed?: boolean } = {}): Promise<void> {
   const control = options.control ?? observeShutdown();
   const managed = Boolean(options.managed);
@@ -38,85 +23,13 @@ export async function runRun(botName?: string, options: { control?: ShutdownCont
     return;
   }
 
-  // No selector: bring up the active set. 0/1 → inline (preserve the simple
-  // single-process path, incl. first-run onboarding); ≥2 → supervisor.
-  const active = activeBots(await loadBots());
-  // 零 bot + 非交互（典型：用户把一句话发给 codex/claude，它非交互地 run，没 TTY 没法
-  // 终端扫码）→ 起「引导控制台」：不连任何 bot，只挂可写 Web 控制台让用户在浏览器里扫码
-  // 创建第一个机器人（registerBotByQr 自给自足，不需要在跑的 bot）。TTY 仍走终端扫码向导。
-  if (active.length === 0 && !process.stdout.isTTY) {
-    await runOnboardingConsole(control, managed);
-    return;
+  let registry = await ensureRegistry();
+  if (registry.bots.length === 0 && process.stdout.isTTY) {
+    const ready = await ensureOnboarded({ allowCreate: true });
+    if (!ready) { process.exitCode = 1; return; }
+    registry = await ensureRegistry();
   }
-  if (active.length > 1) {
-    await runSupervisor(active, { control, managed });
-    return;
-  }
-  await runSingle(active[0]?.name, control, managed);
-}
-
-/**
- * 零 bot 引导守护：还没有任何机器人时，不报错退出，而是只起一个**可写**的 Web 控制台，
- * 用户在浏览器里扫码创建第一个机器人即可（registerBotByQr 不依赖任何在跑的 bot）。创建后
- * 重启 daemon（空注册表→首 bot 自动成为 current/active）该 bot 即上线。这是「一句话安装」
- * 落地体验的关键：codex/claude 非交互地起好它 + 打印网址，用户全程在浏览器里点完。
- */
-async function runOnboardingConsole(control: ShutdownControl, managed: boolean): Promise<void> {
-  let releaseLock: () => void;
-  try {
-    releaseLock = acquireSingleInstanceLock('__onboarding__');
-  } catch (err) {
-    if (err instanceof BridgeAlreadyRunningError) {
-      // If we were spawned by startNow (Windows service), it eagerly wrote our
-      // pid to service.pid before we lost the lock — drop it so it doesn't stick
-      // as a dead pid (clearServicePid only unlinks if it still points at us).
-      clearServicePid();
-      console.error(`✗ ${err.message}`);
-      process.exitCode = 1;
-      return;
-    }
-    throw err;
-  }
-  recordServicePid();
-  const startedAt = Date.now();
-  const webConsole = await mountWebConsole(
-    createAdminService({
-      daemonStartedAt: startedAt,
-      // 引导态没有 bot → 不注入 executeWrite/liveStatus；但全局能力齐备：扫码建 bot
-      // （registerBotByQr 自给自足）、按需下载后端、重启/升级。
-      ...(managed ? {} : {
-        ...(managed ? {} : {
-          restartDaemon: () => spawnDaemonControl('restart'),
-          applyUpdate: () => spawnDaemonControl('update'),
-          stopDaemon: () => spawnDaemonControl('stop'),
-        }),
-      }),
-      installBackend: installBackendDep,
-      uninstallBackend: uninstallBackendDep,
-    }),
-  );
-  if (!webConsole) {
-    console.error('✗ Web 控制台未能启动，无法进入引导（端口被占用？）。');
-    releaseLock();
-    process.exitCode = 1;
-    return;
-  }
-  console.log('\n还没有配置任何飞书机器人 —— 已进入「引导控制台」，到浏览器里扫码创建第一个：');
-  if (process.stdout.isTTY) {
-    console.log(`\n🌐 ${webConsole.url}`);
-    console.log('   仅本机可访问（127.0.0.1）；URL 含 token 勿外传。\n');
-  } else {
-    console.log(
-      `\n🌐 Web 控制台已启动（127.0.0.1:${webConsole.port}）。运行 ` +
-        '`feishu-codex-bridge web` 获取带 token 的登录链接，在浏览器里扫码创建机器人；建完重启即上线。\n',
-    );
-  }
-  log.info('run', 'onboarding-console-up', { port: webConsole.port });
-
-  await control.waitForRequest();
-  try { await webConsole.close(); }
-  finally { releaseLock(); }
-
+  await runSupervisor(activeBots(registry), { control, managed });
 }
 
 /** Run a single bot inline in this process. `botName` undefined → the implicit

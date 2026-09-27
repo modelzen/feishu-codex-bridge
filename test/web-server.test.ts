@@ -194,7 +194,7 @@ function stubService(): AdminService {
     async setBotEnabled(appId, enabled) {
       if (appId === 'cli_missing') return { ok: false as const, reason: '机器人不存在。' };
       void enabled;
-      return { ok: true as const };
+      return { ok: true as const, activation: 'restartRequired' as const, message: '已保存。需重启后生效。' };
     },
     async deleteBot(appId) {
       if (appId === 'cli_only') return { ok: false as const, reason: '这是当前唯一的机器人，不能删除。' };

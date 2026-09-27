@@ -1,5 +1,3 @@
-import { isNewer } from './update';
-
 const API = 'https://api.github.com/repos/modelzen/vonvon-bridge/releases/latest';
 const POSITIVE_TTL_MS = 15 * 60_000;
 const NEGATIVE_TTL_MS = 3 * 60_000;
@@ -26,7 +24,8 @@ export function parseDesktopRelease(value: unknown): DesktopRelease | null {
   const tag = value.tag_name;
   if (typeof tag !== 'string') return null;
   const version = tag.replace(/^v/, '');
-  if (!/^\d+\.\d+\.\d+$/.test(version) || isNewer('0.7.0', version)) return null;
+  const parts = /^(\d+)\.(\d+)\.\d+$/.exec(version);
+  if (!parts || (Number(parts[1]) === 0 && Number(parts[2]) < 7)) return null;
 
   const installers: DesktopInstaller[] = [];
   for (const item of value.assets) {
