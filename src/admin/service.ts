@@ -495,6 +495,8 @@ export interface AdminServiceDeps {
 export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
   let activationQueue: Promise<unknown> = Promise.resolve();
   const codexTools = deps.codexTools ?? new CodexSetupService();
+  const inFlightUsage = new Set<Promise<AccountUsageBundle>>();
+  let closing: Promise<void> | undefined;
   const credentials = async (botId: string) => {
     const cfg = await loadConfig(botPaths(botId).configFile);
     if (!isComplete(cfg)) throw new Error('机器人配置不完整');
@@ -573,7 +575,16 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
   }
 
   return {
-    accountUsage: force => (deps.fetchAccountUsage ?? fetchUsageBundle)(force),
+    accountUsage(force) {
+      if (closing) return Promise.reject(new Error('Host 正在退出'));
+      const read = Promise.resolve().then(() => (deps.fetchAccountUsage ?? fetchUsageBundle)(force));
+      inFlightUsage.add(read);
+      void read.then(
+        () => { inFlightUsage.delete(read); },
+        () => { inFlightUsage.delete(read); },
+      );
+      return read;
+    },
     settings: createSettingsService(deps),
     codexSetup: () => codexTools.setup(),
     startCodexJob(type) {
@@ -582,9 +593,13 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     },
     codexJob: id => codexTools.get(id),
     cancelCodexJob: id => codexTools.cancel(id),
-    close: async () => {
-      const results = await Promise.allSettled([codexTools.close(), shutdownResidentClients()]);
-      for (const result of results) if (result.status === 'rejected') throw result.reason;
+    close: () => {
+      closing ??= (async () => {
+        await Promise.allSettled([...inFlightUsage]);
+        const results = await Promise.allSettled([codexTools.close(), shutdownResidentClients()]);
+        for (const result of results) if (result.status === 'rejected') throw result.reason;
+      })();
+      return closing;
     },
     async collaboration(botId, request) {
       if (!deps.executeCollaboration) throw new NotWiredYetError('协作管理');
