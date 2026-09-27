@@ -3,11 +3,11 @@ import { constants } from 'node:fs';
 import { access, stat } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { paths } from '../config/paths';
-import { activeBots, currentBot, loadBots } from '../config/bots';
+import { loadBots } from '../config/bots';
 import { loadConfig } from '../config/store';
 import { getCliBridgePreferences, isComplete, resolveOwner } from '../config/schema';
-import { cliBridgeRouteRevision, readCliBridgeRoute, saveCliBridgeRoute } from '../cli-bridge/route';
-import { inspectCliBridgeHooks, installCliBridgeHooks, resolveBridgeHookCommand } from '../cli-bridge/hooks';
+import { cliBridgeRouteRevision, readCliBridgeRoute, saveCliBridgeRoute, selectCliBridgeHookBot } from '../cli-bridge/route';
+import { inspectCliBridgeHooks, inspectCliBridgeHookTargets, installCliBridgeHooks, resolveBridgeHookCommand } from '../cli-bridge/hooks';
 import { readServiceCodexBin, saveServiceCodexBin } from '../service/codex-bin';
 import type { ApplyEffect, HostSettings, HostSettingsView, SettingsActionResult, SettingsSave, SettingsSectionView } from './settings-types';
 
@@ -53,11 +53,21 @@ export function createHostSettings(options: {
         hasOwner: !!cfg && isComplete(cfg) && Boolean(resolveOwner(cfg)),
       };
     }));
-    const candidates = activeBots(registry);
-    const preferred = currentBot(registry);
-    const legacy = candidates.find(bot => bot.appId === preferred?.appId && agents.find(agent => agent.botId === bot.appId)?.enabled)
-      ?? candidates.find(bot => agents.find(agent => agent.botId === bot.appId)?.enabled)
-      ?? preferred ?? candidates[0] ?? registry.bots[0];
+    const pins = await inspectCliBridgeHookTargets().catch(() => null);
+    const targets = {codex: [] as string[], claude: [] as string[]};
+    for (const tool of ['codex', 'claude'] as const) {
+      const requests = route.kind === 'agent' ? [route.botId] : route.kind === 'none' || pins === null ? [] : pins[tool].length ? pins[tool] : [null];
+      for (const requested of requests) {
+        const target = await selectCliBridgeHookBot(registry, {
+          requested: requested ?? undefined,
+          route: {kind: 'legacy'},
+          loadConfigForBot: appId => loadConfig(join(appDir, 'bots', appId, 'config.json')),
+        });
+        if (target && !targets[tool].includes(target.appId)) targets[tool].push(target.appId);
+      }
+    }
+    const dormant = route.kind === 'none' ? await selectCliBridgeHookBot(registry, {route: {kind: 'legacy'}, loadConfigForBot: appId => loadConfig(join(appDir, 'bots', appId, 'config.json'))}) : undefined;
+    const botId = targets.codex[0] ?? targets.claude[0] ?? null;
     const hooks = await inspectCliBridgeHooks().catch(() => ({
       claude: { agent: 'claude' as const, status: 'needs_repair' as const, details: ['读取 Hook 状态失败'] },
       codex: { agent: 'codex' as const, status: 'needs_repair' as const, details: ['读取 Hook 状态失败'] },
@@ -68,7 +78,10 @@ export function createHostSettings(options: {
         ...view().runtime,
         coffee: {
           route: route.kind,
-          botId: route.kind === 'agent' ? route.botId : route.kind === 'legacy' ? legacy?.appId ?? null : null,
+          botId,
+          editorBotId: botId ?? dormant?.appId ?? null,
+          targets,
+          targetsReadable: pins !== null,
           revision: cliBridgeRouteRevision(route),
           agents,
           hooks,
@@ -94,12 +107,16 @@ export function createHostSettings(options: {
           return { kind: 'conflict', view: await fullView() };
         return { kind: 'saved', view: await fullView(), effects: [{ fields: ['notificationBotId'], when: 'next-hook', detail: '通知目标已保存，下一次本机 CLI 活动使用新目标。请确保所选 Agent 已启用本机 CLI 转发。' }], warnings: [] };
       }
-      if (readCliBridgeRoute(appDir).kind === 'legacy' && (await loadBots()).bots.length > 0)
-        return { kind: 'rejected', fields: [{ field: 'notificationBotId', message: '请先确认通知 Agent，再修复本机 Hook。' }] };
+      const route = readCliBridgeRoute(appDir);
+      const pins = route.kind === 'legacy' ? await inspectCliBridgeHookTargets().catch(() => null) : {codex: [], claude: []};
       const warnings: string[] = [];
       for (const agent of action.agents) {
         try {
-          await installCliBridgeHooks({ command: resolveBridgeHookCommand(), agents: { claude: agent === 'claude', codex: agent === 'codex' } });
+          if (!pins || pins[agent].length > 1) {
+            warnings.push(`${agent} Hook 的通知目标不一致或无法读取，请选择通知 Agent 后再修复。`);
+            continue;
+          }
+          await installCliBridgeHooks({ command: resolveBridgeHookCommand(pins[agent][0] ?? undefined), agents: { claude: agent === 'claude', codex: agent === 'codex' } });
         } catch {
           warnings.push(`${agent} Hook 修复失败，请检查配置权限后重试。`);
         }

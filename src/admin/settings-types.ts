@@ -179,7 +179,10 @@ export interface HostSettingsView {
     platform: string;
     coffee?: {
       route: 'legacy' | 'none' | 'agent';
+      targets: {codex: string[]; claude: string[]};
+      targetsReadable: boolean;
       botId: string | null;
+      editorBotId: string | null;
       revision: string;
       agents: { botId: string; name: string; enabled: boolean; hasOwner: boolean }[];
       hooks: { claude: CliHookStatus; codex: CliHookStatus };

@@ -67,3 +67,29 @@ it('existing settings resolve immediately and repair preserves the installed tar
   expect((await settings.act({kind: 'repairHostCliHooks', agents: ['codex']})).kind).toBe('saved');
   expect(mocks.install).toHaveBeenCalledTimes(2);
 });
+
+it('stopping delivery keeps a readable dormant editor and does not silently select another target', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'host-coffee-'));
+  dirs.push(dir);
+  mocks.bots = ['a', 'b'].map(name => ({name, appId: `cli_${name}`, tenant: 'feishu', createdAt: 1, active: true}));
+  const settings = createHostSettings({appDir: dir});
+  const initial = await settings.read({kind: 'host'});
+  if (!('runtime' in initial) || !initial.runtime.coffee) throw new Error('Missing coffee');
+  await settings.act({kind: 'setHostCliRoute', botId: null, revision: initial.runtime.coffee.revision});
+  const stopped = await settings.read({kind: 'host'});
+  if (!('runtime' in stopped)) throw new Error('Wrong scope');
+  expect(stopped.runtime.coffee).toMatchObject({route: 'none', botId: null, editorBotId: 'cli_a', targets: {codex: [], claude: []}});
+});
+
+it('conflicting installed pins remain visible and are not overwritten by repair', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'host-coffee-'));
+  dirs.push(dir);
+  mocks.bots = ['a', 'b'].map(name => ({name, appId: `cli_${name}`, tenant: 'feishu', createdAt: 1, active: true}));
+  mocks.targets.codex = ['cli_a', 'cli_b'];
+  const settings = createHostSettings({appDir: dir});
+  const result = await settings.act({kind: 'repairHostCliHooks', agents: ['codex']});
+  expect(mocks.install).not.toHaveBeenCalled();
+  if (result.kind !== 'saved') throw new Error('Unexpected result');
+  expect(result.warnings).toHaveLength(1);
+  expect(result.view).toMatchObject({runtime: {coffee: {targets: {codex: ['cli_a', 'cli_b']}}}});
+});
