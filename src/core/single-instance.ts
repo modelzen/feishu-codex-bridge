@@ -90,6 +90,24 @@ function isLiveHolder(rec: Partial<LockRecord>, appId: string): boolean {
   return true;
 }
 
+export function readSingleInstanceHolder(appId: string, file: string = paths.processesFile): { pid: number; startedAt: number } | undefined {
+  let raw: string;
+  try { raw = readFileSync(file, 'utf8'); }
+  catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined;
+    throw error;
+  }
+  const record: unknown = JSON.parse(raw);
+  if (typeof record !== 'object' || record === null ||
+      !('pid' in record) || typeof record.pid !== 'number' || !Number.isInteger(record.pid) || record.pid <= 0 ||
+      !('appId' in record) || typeof record.appId !== 'string' ||
+      !('startedAt' in record) || typeof record.startedAt !== 'number') {
+    throw new Error('无法确认 Agent 进程状态，锁文件格式无效。');
+  }
+  const holder = { pid: record.pid, appId: record.appId, startedAt: record.startedAt };
+  return isLiveHolder(holder, appId) ? { pid: holder.pid, startedAt: holder.startedAt } : undefined;
+}
+
 /**
  * Claim the single-instance lock for `appId`. Throws {@link BridgeAlreadyRunningError}
  * if a live process already holds it. Returns a `release()` to drop the lock on

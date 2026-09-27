@@ -1,34 +1,17 @@
+import { readSingleInstanceHolder } from '../core/single-instance';
+import { botPaths } from '../config/paths';
 import { CHILD_SHUTDOWN_GRACE_MS, observeShutdown, stopChild, type ShutdownControl } from '../host/lifecycle';
 import type { ChildProcess } from 'node:child_process';
 import { spawnProcess } from '../platform/spawn';
 import { recordServicePid, SERVICE_ENV_FLAG } from '../service/win-startup';
 import { log } from '../core/logger';
-import type { BotEntry } from '../config/bots';
+import { loadBots, type BotEntry } from '../config/bots';
 import { createAdminIpcCaller, type AdminIpcCaller } from '../admin/ipc';
 import { AdminWriteError } from '../admin/ops';
 import { createAdminService } from '../admin/service';
 import { installBackendDep, uninstallBackendDep } from '../agent';
 import { spawnDaemonControl } from '../cli/commands/daemon-control';
 import { mountWebConsole } from '../web/mount';
-
-/**
- * Multi-bot supervisor. `run` delegates here when more than one bot is active
- * (`bot use` picked a set): each bot runs in its OWN child process
- * (`run --bot <appId>`), so one bot crashing, leaking, or wedging its codex
- * tree can't corrupt or take down the others — the design's "multi-process,
- * one bot per process" model. The supervisor restarts a crashed child with
- * exponential backoff (the OS service manager only restarts the supervisor, not
- * individual children, so child auto-recovery has to live here), and forwards
- * SIGINT/SIGTERM so a graceful stop tears the whole tree down.
- *
- * Children inherit the supervisor's CLI entry (`process.argv[1]`) so this works
- * identically for a global install, npx, and a local `./bin` checkout.
- *
- * Web 控制台（第二棒）：supervisor 是多 bot 聚合点，全局控制台挂在这里（子进程
- * 检测到 'ipc' stdio 就不再各自挂）。读路径直读各 bot 目录的文件快照；写操作与
- * 实时连接状态经 IPC 转发给对应子进程——registry 的 withLock 是进程内锁、LIVE
- * 会话驱逐只能在 bot 进程内做，supervisor 文件级直写既会丢更新也驱逐不了。
- */
 
 const BACKOFF_MIN_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
@@ -37,6 +20,7 @@ const HEALTHY_UPTIME_MS = 60_000;
 
 interface Child {
   bot: BotEntry;
+  enabled: boolean;
   proc?: ChildProcess;
   backoffMs: number;
   restartTimer?: NodeJS.Timeout;
@@ -74,7 +58,7 @@ export async function runSupervisor(bots: BotEntry[], options: { control?: Shutd
   delete childEnv[SERVICE_ENV_FLAG];
 
   let shuttingDown = false;
-  const children = bots.map<Child>((bot) => ({ bot, backoffMs: BACKOFF_MIN_MS, startedAt: 0 }));
+  const children = new Map<string, Child>(bots.map((bot) => [bot.appId, { bot, enabled: true, backoffMs: BACKOFF_MIN_MS, startedAt: 0 } satisfies Child]));
 
   console.log(`\n正在启动 ${bots.length} 个机器人（各自独立进程）：`);
   for (const b of bots) console.log(`  • ${b.name}  (${b.appId})  [${b.tenant}]`);
@@ -99,6 +83,8 @@ export async function runSupervisor(bots: BotEntry[], options: { control?: Shutd
   };
 
   const spawnChild = (c: Child): void => {
+    if (shuttingDown || !c.enabled || c.proc) return;
+    c.restartTimer = undefined;
     c.startedAt = Date.now();
     // 'ipc' 通道：子进程据此识别自己被 supervisor 托管（不自己挂 Web 控制台），
     // 并接收管理面写请求（admin/ipc.ts 协议）。
@@ -120,10 +106,11 @@ export async function runSupervisor(bots: BotEntry[], options: { control?: Shutd
     prefixPipe(c.bot.name, proc.stderr, process.stderr);
 
     proc.on('exit', (code, signal) => {
+      if (c.proc !== proc) return;
       c.proc = undefined;
       c.ipc = undefined;
       ipc.rejectAll(`机器人「${c.bot.name}」进程已退出（等待自动重启）`);
-      if (shuttingDown) return;
+      if (shuttingDown || !c.enabled) return;
       // Reset backoff if it had been healthy a while; otherwise grow it.
       const uptime = Date.now() - c.startedAt;
       if (uptime >= HEALTHY_UPTIME_MS) c.backoffMs = BACKOFF_MIN_MS;
@@ -142,29 +129,86 @@ export async function runSupervisor(bots: BotEntry[], options: { control?: Shutd
 
   let webConsole: Awaited<ReturnType<typeof mountWebConsole>>;
   try {
-    for (const c of children) spawnChild(c);
+    for (const c of children.values()) spawnChild(c);
 
     // ── 全局 Web 控制台（多 bot 聚合）─────────────────────────────────────────
     // 读 = 各 bot 目录文件快照（显式路径，不切全局目录）；写 + 实时连接状态 =
     // IPC 转发给对应子进程（崩溃重启窗口内明确拒绝，绝不静默丢写）。
-    const byAppId = (botId: string): Child | undefined => children.find((c) => c.bot.appId === botId);
+    const byAppId = (botId: string): Child | undefined => children.get(botId);
     webConsole = await mountWebConsole(
       createAdminService({
+        applyBotActivation: async (appId, enabled) => {
+          if (shuttingDown) throw new Error('Host 正在退出。');
+          let child = children.get(appId);
+          if (child) {
+            child.enabled = enabled;
+            if (child.restartTimer) clearTimeout(child.restartTimer);
+            child.restartTimer = undefined;
+          }
+          if (!child?.proc) {
+            const foreign = readSingleInstanceHolder(appId, botPaths(appId).processesFile);
+            if (foreign) throw new Error(`Agent 由其他进程运行（PID ${foreign.pid}），请先停止该独立进程。`);
+            if (!child && !enabled) return;
+          }
+          if (!child) {
+            const bot = (await loadBots()).bots.find((entry) => entry.appId === appId);
+            if (!bot) throw new Error('机器人不存在。');
+            child = { bot, enabled, backoffMs: BACKOFF_MIN_MS, startedAt: 0 };
+            children.set(appId, child);
+          }
+          if (!enabled) {
+            child.ipc?.rejectAll('Agent 已停用。');
+            if (child.proc) await stopChild(child.proc, CHILD_SHUTDOWN_GRACE_MS);
+            return;
+          }
+          spawnChild(child);
+          const deadline = Date.now() + 12_000;
+          let lastError: unknown;
+          while (!shuttingDown && child.enabled && Date.now() < deadline) {
+            const proc = child.proc;
+            const ipc = child.ipc;
+            if (proc && ipc) {
+              try {
+                await ipc.call({ kind: 'status' }, STATUS_IPC_TIMEOUT_MS);
+                if (child.proc === proc) return;
+              } catch (error) { lastError = error; }
+            }
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+          throw new Error(`Agent 启动后未能及时响应，请检查状态与诊断。${lastError instanceof Error ? lastError.message : ''}`, { cause: lastError });
+        },
+        executeCollaboration: async (botId, request) => {
+          const child = byAppId(botId);
+          if (!child?.enabled || !child.proc || !child.ipc) throw new AdminWriteError('机器人不在运行中的活跃集里');
+          return child.ipc.call({ kind: 'collaboration', request }, 180_000);
+        },
+        executeGroups: async (botId, op) => {
+          const child = byAppId(botId);
+          if (!child?.enabled || !child.proc || !child.ipc) throw new AdminWriteError('机器人不在运行中的活跃集里');
+          return child.ipc.call(op, 60_000);
+        },
+        executeSettingsRead: async (botId, op) => {
+          const child = byAppId(botId);
+          if (!child?.enabled || !child.proc || !child.ipc) throw new AdminWriteError('机器人不在运行中的活跃集里');
+          return child.ipc.call(op);
+        },
         executeWrite: async (botId, op) => {
           const c = byAppId(botId);
-          if (!c) throw new AdminWriteError(`机器人「${botId}」不在本次启动的活跃集里（先 \`bot use\` 勾选后重启）。`);
+          if (!c?.enabled) throw new AdminWriteError(`机器人「${botId}」已停用，请先启用。`);
           if (!c.proc || !c.ipc) throw new AdminWriteError(`机器人「${c.bot.name}」进程未在运行（崩溃重启中），稍后重试。`);
-          await c.ipc.call(op);
+          return c.ipc.call(op);
         },
         liveStatus: async (botId) => {
           const c = byAppId(botId);
-          if (!c?.proc || !c.ipc) return undefined; // 不归本 supervisor 管 → 锁文件探测兜底
+          if (!c?.proc || !c.ipc) return undefined;
+          const proc = c.proc;
           const r = (await c.ipc.call({ kind: 'status' }, STATUS_IPC_TIMEOUT_MS).catch(() => undefined)) as
             | { connection?: string }
             | undefined;
+          if (c.proc !== proc) return undefined;
           return {
             running: true,
-            pid: c.proc.pid,
+            pid: proc.pid,
             startedAt: c.startedAt,
             connection: r?.connection ?? 'unknown',
           };
@@ -180,6 +224,7 @@ export async function runSupervisor(bots: BotEntry[], options: { control?: Shutd
         uninstallBackend: uninstallBackendDep,
       }),
     );
+    if (!webConsole && bots.length === 0) throw new Error('Web 控制台未能启动，无法进入引导。');
     if (webConsole) {
       if (process.stdout.isTTY) {
         // 含 token 的 URL 只在前台 TTY 打印（后台 stdout 会落盘成日志，token 不进
@@ -193,8 +238,8 @@ export async function runSupervisor(bots: BotEntry[], options: { control?: Shutd
     await control.waitForRequest();
   } finally {
     shuttingDown = true;
-    for (const child of children) if (child.restartTimer) clearTimeout(child.restartTimer);
-    const live = children.flatMap((child) => child.proc ? [stopChild(child.proc, CHILD_SHUTDOWN_GRACE_MS)] : []);
+    for (const child of children.values()) if (child.restartTimer) clearTimeout(child.restartTimer);
+    const live = [...children.values()].flatMap((child) => child.proc ? [stopChild(child.proc, CHILD_SHUTDOWN_GRACE_MS)] : []);
     const cleanup = await Promise.allSettled([webConsole?.close(), ...live]);
     control.dispose();
     const failures = cleanup.filter((result) => result.status === 'rejected');

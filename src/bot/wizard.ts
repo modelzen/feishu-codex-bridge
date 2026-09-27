@@ -50,6 +50,7 @@ export interface StartRegistrationOptions {
   onStatus?: (info: RegistrationStatus) => void;
   /** 取消信号；abort → SDK reject `{code:'abort'}` → 本函数原样抛出（code='abort'）。 */
   signal?: AbortSignal;
+  appId?: string;
 }
 
 /** 扫码后的创建页预填（用户仍可改；`{user}` 由飞书替换为扫码人姓名）。
@@ -68,6 +69,7 @@ const APP_PRESET = {
 export async function startRegistration(opts: StartRegistrationOptions): Promise<RegistrationCredentials> {
   const result = await registerApp({
     appPreset: { ...APP_PRESET },
+    ...(opts.appId ? { appId: opts.appId, createOnly: false } : { createOnly: true }),
     signal: opts.signal,
     onQRCodeReady: (info) => opts.onQr({ url: info.url, expireIn: info.expireIn }),
     onStatusChange: (info) => opts.onStatus?.({ status: info.status, interval: info.interval }),

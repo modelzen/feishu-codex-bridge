@@ -8,6 +8,9 @@ import type { PermissionMode, ReasoningEffort } from '../agent/types';
 export interface Project {
   /** unique project name (also the group name) */
   name: string;
+  enabled?: boolean;
+  creationRequestId?: string;
+  creationRequestSignature?: string;
   /** the bound Feishu group chat_id (oc_xxx) */
   chatId: string;
   /** absolute working directory codex runs in for this project */
@@ -140,7 +143,8 @@ export async function listProjectsIn(file: string): Promise<Project[]> {
   try {
     const text = await readFile(file, 'utf8');
     const parsed = JSON.parse(text) as Partial<StoreFile>;
-    return Array.isArray(parsed.projects) ? parsed.projects : [];
+    if (!parsed || !Array.isArray(parsed.projects) || parsed.projects.some(p => !p || typeof p !== 'object' || typeof p.name !== 'string' || typeof p.cwd !== 'string')) throw new Error('项目注册表格式无效');
+    return parsed.projects;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw err;
@@ -163,7 +167,8 @@ function withLock<T>(fn: () => Promise<T>): Promise<T> {
 async function write(projects: Project[]): Promise<void> {
   await mkdir(dirname(paths.projectsFile), { recursive: true });
   const tmp = `${paths.projectsFile}.tmp-${process.pid}-${randomUUID()}`;
-  const body: StoreFile = { version: FILE_VERSION, projects };
+  const previous = await readFile(paths.projectsFile, 'utf8').then(text => JSON.parse(text)).catch(error => { if (error.code === 'ENOENT') return {}; throw error; });
+  const body: StoreFile = { ...previous, version: FILE_VERSION, projects };
   await writeFile(tmp, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
   await rename(tmp, paths.projectsFile);
 }
@@ -219,13 +224,25 @@ export async function updateProject(
 }
 
 /** Remove (unbind) a project by name. Returns the removed entry, if any. */
-export async function removeProject(name: string): Promise<Project | undefined> {
+export async function removeProject(name: string, beforeRemove?: (project: Project) => void): Promise<Project | undefined> {
   return withLock(async () => {
     const projects = await read();
     const idx = projects.findIndex((p) => p.name === name);
     if (idx === -1) return undefined;
+    beforeRemove?.(projects[idx]!);
     const [removed] = projects.splice(idx, 1);
     await write(projects);
     return removed;
+  });
+}
+
+export async function mutateProject(name: string, mutate: (project: Project) => void | Promise<void>): Promise<Project> {
+  return withLock(async () => {
+    const projects = await read();
+    const project = projects.find(item => item.name === name);
+    if (!project) throw new Error('项目不存在');
+    await mutate(project);
+    await write(projects);
+    return project;
   });
 }

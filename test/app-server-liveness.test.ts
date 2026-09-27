@@ -71,3 +71,28 @@ describe('app-server 进程死亡自愈（QW-6）', () => {
     }
   });
 });
+
+
+describe('app-server shutdown completion', { timeout: 20_000 }, () => {
+  it('settles shutdown after a spawn failure without waiting for a nonexistent child', async () => {
+    const client = new AppServerClient({ bin: join(dir, 'missing-app-server'), cwd: dir, initializeTimeoutMs: 10_000 });
+    await expect(client.connect()).rejects.toThrow();
+    await expect(client.close()).resolves.toBeUndefined();
+  });
+
+  it('awaits process death after escalating an ignored SIGTERM', async () => {
+    const fixture = writeNodeExecutable(dir, 'ignores-term', `
+      process.on('SIGTERM', () => {});
+      require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+        const msg=JSON.parse(line);
+        if(msg.id)process.stdout.write(JSON.stringify({id:msg.id,result:{}})+'\\n');
+      });
+    `);
+    const client = new AppServerClient({ bin: fixture.bin, cwd: dir, initializeTimeoutMs: 10_000 });
+    await client.connect();
+    const pid = client.pid;
+    await client.close(20);
+    expect(client.exited).toBe(true);
+    expect(() => process.kill(pid!, 0)).toThrow();
+  });
+});

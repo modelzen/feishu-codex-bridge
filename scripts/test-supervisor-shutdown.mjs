@@ -9,7 +9,7 @@ let stopChild;
 
 const directory = mkdtempSync(join(tmpdir(), 'vonvon-supervisor-test-'));
 const stubs = new Map([
-  ['../platform/spawn', `import {spawn} from 'node:child_process'; export function spawnProcess(_bin,_args,opts){return spawn(process.execPath,[process.env.VONVON_PROBE_CHILD],opts);}`],
+  ['../platform/spawn', `import {spawn,spawnSync} from 'node:child_process'; export const spawnProcessSync=spawnSync; export function spawnProcess(_bin,_args,opts){return spawn(process.execPath,[process.env.VONVON_PROBE_CHILD],opts);}`],
   ['../service/win-startup', `export const SERVICE_ENV_FLAG='FEISHU_CODEX_BRIDGE_SERVICE'; export function recordServicePid(){}`],
   ['../core/logger', `export const log={info(){},warn(){},fail(){}};`],
   ['../admin/ipc', `export function createAdminIpcCaller(){return {onMessage(){},rejectAll(){},async call(){return {};}};}`],

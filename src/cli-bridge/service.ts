@@ -17,6 +17,7 @@ import {
 import { resolveCliLocalActivity, resolveCliPresenceRoute, type CliPresenceRoute } from './presence';
 import { createKeepAwakeController, type KeepAwakeController } from './keep-awake';
 import type { CliHookMessage, CliHookResponse } from './types';
+import { readCliBridgeRoute } from './route';
 
 // Marks a task_completion resolved by the user clicking「收工」: resolveAction
 // already re-rendered that card, so handleMessage's post-wait close skips it to
@@ -33,6 +34,7 @@ const LOCAL_RETURN = 'local_return';
  *  the two shapes drift); structural so bridge.ts can pass the full service without
  *  a circular import. */
 export interface CliBridgeRuntimeHooks {
+  isRunning?: () => boolean;
   onMessage: (msg: { parentId?: string; rootId?: string; text?: string; messageId?: string }) => boolean;
   register: (dispatcher: CardDispatcher) => void;
   start?: () => Promise<void>;
@@ -239,6 +241,9 @@ export function createCliBridgeService(opts: {
   }
 
   async function handleMessage(msg: CliHookMessage): Promise<CliHookResponse> {
+    const coffeeRoute = readCliBridgeRoute();
+    if (coffeeRoute.kind === 'none' || coffeeRoute.kind === 'agent' && coffeeRoute.botId !== opts.cfg.accounts.app.id)
+      return { decision: 'fallback_local', reason: 'disabled' };
     const p = prefs();
     if (!p.enabled || !p.agents[msg.source]) return { decision: 'fallback_local', reason: 'disabled' };
     if (msg.bridgeOwned && !p.includeBridgeOwnedSessionsForDebugging) {
@@ -472,6 +477,7 @@ export function createCliBridgeService(opts: {
   }
 
   return {
+    isRunning: () => ipc !== undefined,
     start: async () => {
       if (ipc) return;
       ipc = await startCliBridgeIpcServer({ socketPath: opts.socketPath, handleMessage });

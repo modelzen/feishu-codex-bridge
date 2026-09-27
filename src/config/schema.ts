@@ -138,7 +138,7 @@ export interface SessionTitleAiConfig {
 }
 
 /** 某一 agent 后端的会话标题策略。开启 AI 时 model + effort 必须成对存在。 */
-export type SessionTitleBackendConfig = { enabled?: false; model?: never; effort?: never } | SessionTitleAiConfig;
+export type SessionTitleBackendConfig = { enabled?: false; model?: string; effort?: ReasoningEffort } | SessionTitleAiConfig;
 
 /** 后端 id → 该后端的标题策略。不设全局模型，也不设模型白名单。 */
 export interface SessionTitlesConfig {

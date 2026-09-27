@@ -15,7 +15,7 @@ vi.mock('../src/bot/register-bot', () => ({
 }));
 
 import { createAdminService } from '../src/admin/service';
-import { runRegistrationWizard } from '../src/bot/wizard';
+import { runRegistrationWizard, startRegistration } from '../src/bot/wizard';
 
 afterEach(() => {
   registerAppMock.mockReset();
@@ -23,6 +23,8 @@ afterEach(() => {
 });
 
 interface RegisterAppOpts {
+  createOnly?: boolean;
+  appId?: string;
   signal?: AbortSignal;
   onQRCodeReady: (info: { url: string; expireIn: number }) => void;
   onStatusChange?: (info: { status: string; interval?: number }) => void;
@@ -31,6 +33,8 @@ interface RegisterAppOpts {
 describe('registerBotByQr · 扫码编排', () => {
   it('成功：透传 onQr/onStatus，拿明文密钥后委托 registerBotFromCredentials（含 ownerOpenId），done 不含 secret', async () => {
     registerAppMock.mockImplementation((opts: RegisterAppOpts) => {
+      expect(opts.createOnly).toBe(true);
+      expect(opts.appId).toBeUndefined();
       opts.onQRCodeReady({ url: 'https://accounts.feishu.cn/scan?c=1', expireIn: 600 });
       opts.onStatusChange?.({ status: 'polling' });
       return Promise.resolve({
@@ -160,4 +164,11 @@ describe('runRegistrationWizard · owner 不变量', () => {
       log.mockRestore();
     }
   });
+});
+
+
+it('refresh passes the selected app to the SDK with creation disabled', async () => {
+  registerAppMock.mockResolvedValue({ client_id: 'cli_existing123', client_secret: 'ephemeral', user_info: { open_id: 'ou_owner', tenant_brand: 'feishu' } });
+  await startRegistration({ appId: 'cli_existing123', onQr: vi.fn() });
+  expect(registerAppMock).toHaveBeenCalledWith(expect.objectContaining({ appId: 'cli_existing123', createOnly: false }));
 });

@@ -399,9 +399,9 @@ describe('createAdminWriteExecutor / runAdminWriteOp（Web · IPC 入口）', ()
     expect((await getProjectByName('demo'))?.noMention).toBe(false);
   });
 
-  it('执行器：成功静默返回，拒绝抛 AdminWriteError（带 code，IPC/HTTP 可还原）', async () => {
+  it('执行器：成功返回 done，拒绝抛 AdminWriteError（带 code，IPC/HTTP 可还原）', async () => {
     const exec = createAdminWriteExecutor(deps);
-    await expect(exec({ kind: 'setAutoCompact', project: 'demo', on: true })).resolves.toBeUndefined();
+    await expect(exec({ kind: 'setAutoCompact', project: 'demo', on: true })).resolves.toEqual({ kind: 'done' });
     const err = await exec({ kind: 'switchBackend', project: 'demo', backend: 'gpt-9' }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(AdminWriteError);
     expect((err as AdminWriteError).code).toBe('ADMIN_WRITE_REJECTED');
@@ -415,7 +415,7 @@ describe('createAdminWriteExecutor / runAdminWriteOp（Web · IPC 入口）', ()
     const exec = createAdminWriteExecutor({ ...deps, cfg, persistConfig: persist });
     await expect(
       exec({ kind: 'setCompletionReminder', mode: 'manual', longTaskMinutes: 3 }),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ kind: 'done' });
     expect(cfg.preferences?.completionReminder).toEqual({ mode: 'manual', longTaskMinutes: 3 });
 
     const missingCfg = createAdminWriteExecutor(deps);

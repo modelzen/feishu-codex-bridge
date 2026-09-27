@@ -1,4 +1,5 @@
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, writeFile, rename, rm } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import type { CommentEvent, LarkChannel } from '@larksuiteoapi/node-sdk';
 import type { TenantBrand } from '../config/schema';
@@ -319,7 +320,9 @@ export async function syncCommentInstructions(cwd: string, instructions: string)
  * Creates the parent dir if needed. The caller then re-syncs all comment dirs. */
 export async function saveCommentInstructions(masterFile: string, content: string): Promise<void> {
   await mkdir(dirname(masterFile), { recursive: true });
-  await writeFile(masterFile, content, 'utf8');
+  const temporary = `${masterFile}.tmp-${randomUUID()}`;
+  try { await writeFile(temporary, content, { encoding: 'utf8', mode: 0o600 }); await rename(temporary, masterFile); }
+  finally { await rm(temporary, { force: true }).catch(() => undefined); }
 }
 
 /** Substitute the doc-level variables ({fileType}/{fileToken}/{docUrl}) in the
@@ -353,8 +356,9 @@ export async function syncAllCommentInstructions(
   rawTemplate: string,
   tenant: TenantBrand,
 ): Promise<number> {
-  const entries = await readdir(projectsRoot, { withFileTypes: true }).catch(() => []);
+  const entries = await readdir(projectsRoot, { withFileTypes: true }).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
   let synced = 0;
+  let failed = 0;
   for (const e of entries) {
     if (!e.isDirectory() || !e.name.startsWith('comment-')) continue;
     const m = /^comment-([a-z]+)-(.+)$/.exec(e.name);
@@ -362,9 +366,9 @@ export async function syncAllCommentInstructions(
     const fileToken = m?.[2];
     if (!fileType || !fileToken) continue;
     const rendered = renderCommentInstructions(rawTemplate, tenant, fileType, fileToken);
-    await syncCommentInstructions(join(projectsRoot, e.name), rendered).catch(() => undefined);
-    synced++;
+    try { await syncCommentInstructions(join(projectsRoot, e.name), rendered); synced++; } catch { failed++; }
   }
+  if (failed) throw new Error(`回复规则已保存，${failed} 个历史目录同步失败，${synced} 个已同步`);
   return synced;
 }
 

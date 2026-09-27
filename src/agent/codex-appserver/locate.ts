@@ -1,5 +1,8 @@
-import { existsSync } from 'node:fs';
-import { extname, join } from 'node:path';
+import { managedCodexBin } from './managed-install';
+import { managedToolSelection } from './managed-tools';
+import { existsSync, readdirSync, realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { extname, isAbsolute, join, relative, sep } from 'node:path';
 import { paths } from '../../config/paths';
 import { spawnProcess, spawnProcessSync } from '../../platform/spawn';
 
@@ -12,69 +15,82 @@ const IS_WIN = process.platform === 'win32';
 let binCache: string | null = null;
 const versionCache = new Map<string, string>();
 
-/**
- * Resolve the codex CLI binary, in priority order:
- *   1. $CODEX_BIN (explicit override)
- *   2. PATH (`codex`, via `where`/`which`)
- *   3. bridge private install (~/.feishu-codex-bridge/codex-cli/node_modules/.bin/codex)
- *   4. macOS Codex.app bundled binary
- * Returns null if none found.
- *
- * On Windows an npm-installed bin is a `codex.cmd`/`codex.exe` shim, never a
- * bare `codex`, so the private-install probe enumerates PATHEXT variants.
- */
-export function resolveCodexBin(opts?: { force?: boolean }): string | null {
-  // 命中后仍 existsSync 复验（零 spawn）：codex 被卸载/移动时自动失效重探。
-  if (!opts?.force && binCache && existsSync(binCache)) return binCache;
-  binCache = locateBin();
-  return binCache;
+export type CodexResolutionOptions = {
+  force?: boolean;
+  home?: string;
+  dataRoot?: string;
+  env?: NodeJS.ProcessEnv;
+};
+
+export function resolveCodexBin(opts: CodexResolutionOptions = {}): string | null {
+  const env = opts.env ?? process.env;
+  const root = opts.dataRoot ?? paths.appDir;
+  if (env.CODEX_BIN) return existsSync(env.CODEX_BIN) ? env.CODEX_BIN : null;
+  const selected = managedToolSelection(root, 'codex');
+  if (selected.kind === 'active') return selected.executable;
+  if (selected.kind === 'absent') {
+    for (const candidate of execCandidates(join(root, 'managed-tools', 'bin'), 'codex', env)) {
+      if (existsSync(candidate)) return candidate;
+    }
+    const managed = managedCodexBin(join(root, 'codex-cli'));
+    if (managed) return managed;
+  }
+  const customContext = opts.home !== undefined || opts.dataRoot !== undefined || opts.env !== undefined;
+  if (!customContext && !opts.force && binCache && existsSync(binCache) && (selected.kind === 'absent' || !inLegacyManagedRoot(binCache, root))) return binCache;
+  const result = locateBin(opts.home ?? homedir(), root, env, selected.kind !== 'absent');
+  if (!customContext) binCache = result;
+  return result;
 }
 
-function locateBin(): string | null {
-  const env = process.env.CODEX_BIN;
-  if (env && existsSync(env)) return env;
-
-  const onPath = which('codex');
+function locateBin(home: string, root: string, env: NodeJS.ProcessEnv, blockLegacyManaged: boolean): string | null {
+  const onPath = which('codex', env, blockLegacyManaged ? root : undefined);
   if (onPath) return onPath;
-
-  for (const cand of execCandidates(paths.codexCliBinDir, 'codex')) {
-    if (existsSync(cand)) return cand;
+  const directories = blockLegacyManaged ? [] : [join(root, 'codex-cli', 'node_modules', '.bin')];
+  if (process.platform === 'darwin') {
+    directories.push('/Applications/Codex.app/Contents/Resources', join(home, 'Applications/Codex.app/Contents/Resources'));
   }
-
-  const appBundle = '/Applications/Codex.app/Contents/Resources/codex';
-  if (process.platform === 'darwin' && existsSync(appBundle)) return appBundle;
-
+  try {
+    const nvm = join(home, '.nvm', 'versions', 'node');
+    const versions = readdirSync(nvm).filter(version => /^v\d+\.\d+\.\d+$/.test(version)).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    directories.push(...versions.map(version => join(nvm, version, 'bin')));
+  } catch {}
+  for (const directory of directories) {
+    for (const candidate of execCandidates(directory, 'codex', env)) {
+      if (existsSync(candidate)) return candidate;
+    }
+  }
   return null;
 }
 
-/**
- * Candidate file paths for a bare command in `dir`. On Windows a shim carries a
- * PATHEXT extension (`.cmd`/`.exe`/`.bat`), so probe `codex`, `codex.cmd`,
- * `codex.exe`, … On POSIX the bare name is the only candidate.
- */
-function execCandidates(dir: string, base: string): string[] {
-  const exact = join(dir, base);
-  if (!IS_WIN || extname(base)) return [exact];
-  const exts = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
-    .split(';')
-    .map((e) => e.trim())
-    .filter(Boolean);
-  return [exact, ...exts.map((e) => join(dir, base + e.toLowerCase()))];
+function inLegacyManagedRoot(candidate: string, root: string): boolean {
+  try {
+    const target = realpathSync.native(candidate);
+    return [join(root, 'managed-tools'), join(root, 'codex-cli')].some(managed => {
+      if (!existsSync(managed)) return false;
+      const path = relative(realpathSync.native(managed), target);
+      return path !== '..' && !path.startsWith('..' + sep) && !isAbsolute(path);
+    });
+  } catch {
+    return true;
+  }
 }
 
-function which(cmd: string): string | null {
+function execCandidates(dir: string, base: string, env: NodeJS.ProcessEnv): string[] {
+  const exact = join(dir, base);
+  if (!IS_WIN || extname(base)) return [exact];
+  const exts = (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map(e => e.trim()).filter(Boolean);
+  return [exact, ...exts.map(e => join(dir, base + e.toLowerCase()))];
+}
+
+function which(cmd: string, env: NodeJS.ProcessEnv, blockedDataRoot?: string): string | null {
   try {
-    // `where` (win) / `which` (posix) are real executables; cross-spawn runs
-    // them uniformly. `where` may return multiple lines — take the first.
-    const res = spawnProcessSync(IS_WIN ? 'where' : 'which', [cmd], {
+    const res = spawnProcessSync(IS_WIN ? 'where' : '/usr/bin/which', IS_WIN ? [cmd] : ['-a', cmd], {
+      env,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     });
     if (res.status !== 0 || typeof res.stdout !== 'string') return null;
-    const first = res.stdout
-      .split('\n')
-      .map((l) => l.trim())
-      .find(Boolean);
+    const first = res.stdout.split('\n').map(l => l.trim()).find(candidate => candidate && existsSync(candidate) && (!blockedDataRoot || !inLegacyManagedRoot(candidate, blockedDataRoot)));
     return first && existsSync(first) ? first : null;
   } catch {
     return null;

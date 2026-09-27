@@ -16,17 +16,21 @@ let control: ShutdownControl | undefined;
 program.hook('preAction', async (_command, action) => {
   const name = action.name();
   if (name === 'host' || name === 'run') control = observeShutdown(name === 'host');
-  if (action.parent?.name() === 'data' || name === 'status' || name === 'stop') return;
+  if (action.parent?.name() === 'data' || name === 'status' || name === 'desktop' || name === 'stop' || name === '__desktop-service') return;
   lease = await enterDataAccess(homedir());
 });
 program.hook('postAction', () => { lease?.release(); control?.dispose(); });
 
 program.command('host', { hidden: true })
   .option('--parent-control', 'Owned Host controlled by parent stdin')
-  .action(async (options: { parentControl?: boolean }) => {
+  .option('--bot <appId>', 'Run only this Agent without changing the default selection')
+  .action(async (options: { parentControl?: boolean; bot?: string }) => {
     if (!options.parentControl) throw new Error('The Host entry requires --parent-control.');
-    await (await import('../host/bootstrap')).runHostRuntime({ managed: true, control });
+    await (await import('../host/bootstrap')).runHostRuntime({ managed: true, control, bot: options.bot });
   });
+program.command('__desktop-service <action>', { hidden: true }).action(async (action: string) => {
+  console.log(JSON.stringify(await (await import('../host/service')).controlDesktopService(action)));
+});
 const data = program.command('data').description('Inspect or migrate local Bridge data while offline');
 data.command('status').action(async () => {
   console.log(JSON.stringify(await (await import('../host/client')).inspectHost(homedir()), null, 2));
@@ -73,10 +77,28 @@ program
   .command('status')
   .description('后台 daemon 状态（pid / 日志路径 / 上次退出码）')
   .action(async () => {
+    const desktopRelease = await (await import('../service/desktop-release')).getDesktopRelease();
     console.log(JSON.stringify({
       installation: (await import('../service/control')).inspectInstallation(homedir()),
       host: await (await import('../host/client')).inspectHost(homedir()),
+      ...(desktopRelease ? { desktopRelease } : {}),
     }, null, 2));
+  });
+
+program
+  .command('desktop')
+  .description('查看已发布的 Vonvon Bridge 桌面版安装包')
+  .action(async () => {
+    const { getDesktopRelease, desktopInstallerForHost } = await import('../service/desktop-release');
+    const release = await getDesktopRelease();
+    if (!release) {
+      console.log('Vonvon Bridge 桌面版安装包尚未发布，或暂时无法查询。');
+      return;
+    }
+    const installer = desktopInstallerForHost(release);
+    console.log(`Vonvon Bridge 桌面版 v${release.version} 已提供。安装后可接续已有 Agent、飞书群和配置，无需重新配置；CLI 仍可单独使用。`);
+    if (installer) console.log(`${installer.platform} 安装包：${installer.url}`);
+    else for (const option of release.installers) console.log(`${option.platform} 安装包：${option.url}`);
   });
 
 program

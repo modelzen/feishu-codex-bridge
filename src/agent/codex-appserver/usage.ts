@@ -367,6 +367,15 @@ export async function fetchUsageSnapshot(force = false): Promise<AccountUsageSna
 
 /** 一次拉齐两端点（并行）。任一失败抛 UsageError，调用方按 kind 渲染错误卡。 */
 export async function fetchUsageBundle(force = false): Promise<AccountUsageBundle> {
-  const [profile, usage] = await Promise.all([fetchProfileStats(force), fetchUsageSnapshot(force)]);
-  return { profile, usage };
+  let firstFailure: { reason: unknown } | undefined;
+  const trackFailure = <T>(pending: Promise<T>): Promise<T> => pending.catch((reason: unknown) => {
+    firstFailure ??= { reason };
+    throw reason;
+  });
+  const [profile, usage] = await Promise.allSettled([
+    trackFailure(fetchProfileStats(force)),
+    trackFailure(fetchUsageSnapshot(force)),
+  ]);
+  if (profile.status === 'rejected' || usage.status === 'rejected') throw firstFailure?.reason;
+  return { profile: profile.value, usage: usage.value };
 }

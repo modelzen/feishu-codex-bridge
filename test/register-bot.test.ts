@@ -1,4 +1,4 @@
-import { rmSync, readFileSync, existsSync } from 'node:fs';
+import { rmSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // 把整个 ~/.feishu-codex-bridge 指到临时目录——keystore(secrets.enc/.salt) +
@@ -41,9 +41,10 @@ vi.mock('../src/config/paths', async () => {
   };
 });
 
+import { refreshBotCredentials } from '../src/bot/refresh-bot';
 import { registerBotFromCredentials } from '../src/bot/register-bot';
 import { getSecret } from '../src/config/keystore';
-import { loadBots } from '../src/config/bots';
+import { loadBots, saveBots } from '../src/config/bots';
 import { botPaths, paths } from '../src/config/paths';
 import { secretKeyForApp } from '../src/config/schema';
 
@@ -134,18 +135,23 @@ describe('registerBotFromCredentials · 注册落盘', () => {
     expect(reg.current).toBe('cli_alpha12345'); // 首个注册成为 current
   });
 
-  it('幂等：同 appId 重复扫码覆盖 keystore 密钥，不产生重复 entry', async () => {
+  it('重复添加拒绝覆盖密钥与已有 Agent', async () => {
     await registerBotFromCredentials(
       { appId: 'cli_dup1234567', appSecret: 'secret-1', tenant: 'feishu', ownerOpenId: 'ou_dup' },
       okValidate,
     );
-    await registerBotFromCredentials(
+    const before = await loadBots();
+    const original = before.bots.find(b => b.appId === 'cli_dup1234567')!;
+    original.active = true;
+    await saveBots(before);
+    const duplicate = await registerBotFromCredentials(
       { appId: 'cli_dup1234567', appSecret: 'secret-2', tenant: 'feishu', ownerOpenId: 'ou_dup' },
       okValidate,
     );
-    expect(await getSecret(secretKeyForApp('cli_dup1234567'))).toBe('secret-2');
+    expect(duplicate).toMatchObject({ ok: false, code: 'already_registered' });
+    expect(await getSecret(secretKeyForApp('cli_dup1234567'))).toBe('secret-1');
     const reg = await loadBots();
-    expect(reg.bots.filter((b) => b.appId === 'cli_dup1234567')).toHaveLength(1);
+    expect(reg.bots.filter((b) => b.appId === 'cli_dup1234567')).toEqual([original]);
   });
 
   it('lark 租户透传给探活与注册', async () => {
@@ -200,5 +206,71 @@ describe('registerBotFromCredentials · ownerOpenId（扫码人 = owner+admin）
     );
     const cfg = JSON.parse(readFileSync(botPaths('cli_dupowner99').configFile, 'utf8'));
     expect(cfg.preferences.access.admins.filter((a: string) => a === 'ou_o')).toHaveLength(1);
+  });
+});
+
+
+describe('targeted credential refresh', () => {
+  let serial = 0;
+  async function fixture() {
+    const appId = `cli_refresh${++serial}`;
+    await registerBotFromCredentials({ appId, appSecret: 'original', tenant: 'feishu', ownerOpenId: 'ou_owner' }, okValidate);
+    const files = botPaths(appId);
+    const config = JSON.parse(readFileSync(files.configFile, 'utf8'));
+    config.preferences.access.admins.push('ou_admin');
+    config.preferences.tools = { display: false };
+    writeFileSync(files.configFile, JSON.stringify(config));
+    writeFileSync(files.projectsFile, '{"project":"unchanged"}');
+    writeFileSync(files.sessionsFile, '{"session":"unchanged"}');
+    const preserved = [files.configFile, files.projectsFile, files.sessionsFile, paths.botsFile];
+    const before = preserved.map(file => readFileSync(file, 'utf8'));
+    const abort = new AbortController();
+    const creds = { clientId: appId, clientSecret: 'replacement', tenant: 'feishu' as const, operatorOpenId: 'ou_admin' };
+    return { appId, files, preserved, before, abort, creds, options: { signal: abort.signal, onQr: vi.fn() } };
+  }
+
+  it('rotates only target encrypted secret, preserving owner and all data bytes', async () => {
+    const f = await fixture();
+    const register = vi.fn(async () => f.creds);
+    const other = await fixture();
+    const registryBefore = readFileSync(paths.botsFile, 'utf8');
+    const result = await refreshBotCredentials(f.appId, f.options, register, okValidate);
+    expect(result).toMatchObject({ ok: true, appId: f.appId, adminOpenId: 'ou_owner' });
+    expect(register).toHaveBeenCalledWith({ ...f.options, appId: f.appId });
+    expect(await getSecret(secretKeyForApp(f.appId))).toBe('replacement');
+    expect(await getSecret(secretKeyForApp(other.appId))).toBe('original');
+    expect(readFileSync(paths.botsFile, 'utf8')).toBe(registryBefore);
+    expect(f.preserved.slice(0, 3).map(file => readFileSync(file, 'utf8'))).toEqual(f.before.slice(0, 3));
+    expect(readFileSync(paths.secretsFile, 'utf8')).not.toContain('replacement');
+    expect(JSON.stringify(result)).not.toContain('replacement');
+  });
+
+  it.each(['wrong-app', 'wrong-tenant', 'wrong-scanner', 'abort', 'stale', 'rejected'] as const)('refuses %s without writing any encrypted data', async failure => {
+    const f = await fixture();
+    const beforeSecret = readFileSync(paths.secretsFile, 'utf8');
+    const register = vi.fn(async () => {
+      if (failure === 'wrong-app') f.creds.clientId = 'cli_unrelated';
+      if (failure === 'wrong-scanner') f.creds.operatorOpenId = 'ou_stranger';
+      if (failure === 'abort') f.abort.abort();
+      if (failure === 'stale') writeFileSync(f.files.configFile, `${f.before[0]} `);
+      return failure === 'wrong-tenant' ? { ...f.creds, tenant: 'lark' as const } : f.creds;
+    });
+    const validate = failure === 'rejected' ? vi.fn(async () => ({ ok: false as const, reason: 'replacement' })) : okValidate;
+    const result = await refreshBotCredentials(f.appId, f.options, register, validate);
+    expect(result.ok).toBe(false);
+    expect(readFileSync(paths.secretsFile, 'utf8')).toBe(beforeSecret);
+    expect(JSON.stringify(result)).not.toContain('replacement');
+    expect(await getSecret(secretKeyForApp(f.appId))).toBe('original');
+  });
+
+  it('honors cancellation during validation before encrypted commit', async () => {
+    const f = await fixture();
+    const before = readFileSync(paths.secretsFile, 'utf8');
+    const result = await refreshBotCredentials(f.appId, f.options, async () => f.creds, async () => {
+      f.abort.abort();
+      return { ok: true };
+    });
+    expect(result).toMatchObject({ ok: false, code: 'abort' });
+    expect(readFileSync(paths.secretsFile, 'utf8')).toBe(before);
   });
 });

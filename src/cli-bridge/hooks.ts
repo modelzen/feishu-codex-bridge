@@ -114,8 +114,11 @@ function resolveHome(homeDir?: string): string {
   return homeDir ?? homedir();
 }
 
-async function readJson(path: string): Promise<HookRoot> {
-  const text = await readFile(path, 'utf8').catch(() => '{}');
+async function readJson(path: string, strict = false): Promise<HookRoot> {
+  const text = await readFile(path, 'utf8').catch((error: unknown) => {
+    if (strict && (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT')) throw error;
+    return '{}';
+  });
   const parsed = JSON.parse(text || '{}') as HookRoot;
   return typeof parsed === 'object' && parsed ? parsed : {};
 }
@@ -293,4 +296,25 @@ function withoutCodexHooksFeature(text: string): string {
   }
   closeFeatures();
   return out.join('\n');
+}
+
+export async function inspectCliBridgeHookTargets(opts: InspectCliBridgeHooksOptions = {}): Promise<Record<CliBridgeAgent, (string | null)[]>> {
+  const home = resolveHome(opts.homeDir);
+  const result: Record<CliBridgeAgent, (string | null)[]> = {codex: [], claude: []};
+  for (const agent of ['codex', 'claude'] as const) {
+    const file = join(home, agent === 'codex' ? '.codex/hooks.json' : '.claude/settings.json');
+    const root = await readJson(file, true);
+    for (const group of Object.values(root.hooks ?? {}).flat()) {
+      for (const hook of group.hooks ?? []) {
+        if (!isBridgeAgentCommand(hook.command, agent)) continue;
+        if (!/(?:feishu-codex-bridge|vonvon-bridge|[\\/]runtime[\\/]core[\\/])/.test(hook.command ?? '')) continue;
+        const command = hook.command ?? '';
+        const match = command.match(/--bot\s+(?:"([^"]+)"|'([^']+)'|([^\s]+))/);
+        if (/--bot(?:\s|=|$)/.test(command) && !match) throw new Error('Cannot read Hook recipient');
+        result[agent].push(match?.[1] ?? match?.[2] ?? match?.[3] ?? null);
+      }
+    }
+    result[agent] = [...new Set(result[agent])];
+  }
+  return result;
 }

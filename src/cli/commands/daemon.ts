@@ -2,6 +2,14 @@ import { ensureOnboarded } from '../../bot/onboarding';
 import { activeBots, loadBots } from '../../config/bots';
 import { getServiceAdapter, type ServiceStatus } from '../../service/adapter';
 import { readWebConsole, type WebConsoleRecord } from '../../web/discovery';
+import { desktopReleaseNoticeForHost, getDesktopRelease } from '../../service/desktop-release';
+
+async function printDesktopNotice(): Promise<void> {
+  const release = await getDesktopRelease();
+  if (!release) return;
+  const notice = desktopReleaseNoticeForHost(release);
+  if (notice) console.log(`\n${notice}`);
+}
 
 /**
  * Daemon lifecycle. `start` installs ONE launchd/systemd/login service whose
@@ -28,6 +36,7 @@ export async function runStart(): Promise<void> {
       console.log('  下一步：运行 `feishu-codex-bridge web` 获取控制台登录链接，在浏览器里扫码创建第一个机器人。');
       console.log('  （建完机器人后它会自动成为活跃 bot，重启服务即上线。）');
       printStatus(status);
+      await printDesktopNotice();
       return;
     }
     // Fresh / legacy single-bot install (TTY)：onboard (maybe scan-create) the
@@ -56,6 +65,7 @@ export async function runStart(): Promise<void> {
   const status = await getServiceAdapter().install();
   console.log(installedNote());
   printStatus(status);
+  await printDesktopNotice();
 }
 
 export async function runStop(): Promise<void> {

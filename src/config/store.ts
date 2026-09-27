@@ -70,8 +70,9 @@ export async function ensureSecretsGetterWrapper(): Promise<string> {
 // 同进程内并发 saveConfig 串行化 + tmp 唯一名：避免两次写共用 tmp 文件交错（rename
 // 命中被对方写一半的 tmp → JSON 损坏，或丢写）。
 let saveChain: Promise<unknown> = Promise.resolve();
-export function saveConfig(cfg: AppConfig, path: string = paths.configFile): Promise<void> {
+export function saveConfig(cfg: AppConfig, path: string = paths.configFile, expected?: AppConfig): Promise<void> {
   const run = saveChain.then(async () => {
+    if (expected && JSON.stringify(await loadConfig(path)) !== JSON.stringify(expected)) throw new Error('配置已被其他进程修改，请重启 Host 后重新加载');
     await mkdir(dirname(path), { recursive: true });
     const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`;
     await writeFile(tmp, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');

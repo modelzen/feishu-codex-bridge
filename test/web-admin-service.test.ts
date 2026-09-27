@@ -1,3 +1,4 @@
+import { createPendingGroups, pendingGroupsFile } from '../src/project/pending-groups';
 import { rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { paths, botPaths, useBotDir } from '../src/config/paths';
@@ -11,6 +12,8 @@ import {
   type AdminService,
 } from '../src/admin/service';
 import { AdminWriteError, type AdminWriteOp } from '../src/admin/ops';
+import type { CodexSetupService } from '../src/agent/codex-appserver/setup';
+import * as clientPool from '../src/agent/codex-appserver/client-pool';
 
 // 把整个 ~/.feishu-codex-bridge 指到临时目录，绝不碰真实用户数据。fixture 通过
 // bots/registry/session-store 模块的导出写入（useBotDir 切目录后写）——服务层读
@@ -205,6 +208,50 @@ describe('createReadonlyAdminService · 只读方法（显式路径，不碰全�
   });
 });
 
+it('Host 用量读取只依赖 Codex 账号，不查机器人或群配置', async () => {
+  const calls: boolean[] = [];
+  const usage = { profile: { topInvocations: [], dailyBuckets: [] }, usage: { main: {}, extras: [], fetchedAt: 456 } };
+  const account = createAdminService({ fetchAccountUsage: async force => {
+    calls.push(force);
+    return usage;
+  } });
+  account.listBots = async () => { throw new Error('account usage must not read bots'); };
+  expect(await account.accountUsage(false)).toEqual(usage);
+  expect(await account.accountUsage(true)).toEqual(usage);
+  expect(calls).toEqual([false, true]);
+  await account.close?.();
+});
+
+it('Host 退出等待在途用量读取，再清理 Codex 常驻客户端，并拒绝新的读取', async () => {
+  const usage = { profile: { topInvocations: [], dailyBuckets: [] }, usage: { main: {}, extras: [], fetchedAt: 456 } };
+  let releaseUsage!: (value: typeof usage) => void;
+  const pendingUsage = new Promise<typeof usage>(resolve => { releaseUsage = resolve; });
+  const events: string[] = [];
+  const codexTools = { close: async () => { events.push('setup closed'); } } as CodexSetupService;
+  const residentClose = vi.spyOn(clientPool, 'shutdownResidentClients').mockImplementation(async () => {
+    events.push('residents closed');
+  });
+  const account = createAdminService({ fetchAccountUsage: () => pendingUsage, codexTools });
+  try {
+    const read = account.accountUsage(false).then(result => { events.push('usage finished'); return result; });
+    let closed = false;
+    const closing = account.close?.().then(() => { closed = true; });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    expect(events).toEqual([]);
+    await expect(account.accountUsage(true)).rejects.toThrow('Host 正在退出');
+    releaseUsage(usage);
+    expect(await read).toEqual(usage);
+    await closing;
+    expect(events).toEqual(['usage finished', 'setup closed', 'residents closed']);
+    await account.close?.();
+    expect(residentClose).toHaveBeenCalledTimes(1);
+  } finally {
+    releaseUsage(usage);
+    residentClose.mockRestore();
+  }
+});
+
 describe('createReadonlyAdminService · 写方法（只读预览占位）', () => {
   it('五个写方法一律抛 NotWiredYetError', async () => {
     await expect(service.switchBackend(BOT_A, 'proj-a', 'codex-appserver')).rejects.toBeInstanceOf(NotWiredYetError);
@@ -397,4 +444,26 @@ describe('createAdminService · getSetupStatus（初始化 checklist 聚合）',
     expect(s.event.state).toBe('unchecked');
     expect(s.scopes.grantUrl).toContain('/auth?q='); // 深链总归得给
   });
+});
+
+it('reads pending events directly and filters bound groups, changed admins and disabled bots', async () => {
+  const id = 'cli_pending';
+  const prior = await import('../src/config/bots').then(module => module.loadBots());
+  await saveBots({ ...prior, bots: [...prior.bots, { appId: id, name: 'Pending', tenant: 'feishu', createdAt: 1, active: true }] });
+  const files = botPaths(id); mkdirSync(files.dir, { recursive: true });
+  const config = { accounts: { app: { id, secret: 'fixture', tenant: 'feishu' } }, preferences: { access: { admins: ['ou_admin'] } } };
+  writeFileSync(files.configFile, JSON.stringify(config));
+  const queue = createPendingGroups({ file: pendingGroupsFile(files.projectsFile), eligible: async () => true, verify: async () => ({ state: 'ready', name: 'Research' }), onError: error => { throw error; } });
+  await queue.add('oc_pending', 'ou_admin'); await queue.add('oc_other', 'ou_removed'); await queue.refresh();
+  const reader = createAdminService({ liveStatus: async () => ({ running: true }) });
+  try {
+    expect(await reader.pendingGroups?.(id)).toEqual({ groups: [{ chatId: 'oc_pending', name: 'Research', addedAt: expect.any(Number) }] });
+    useBotDir(id);
+    await addProject({ name: 'Bound', chatId: 'oc_pending', cwd: '/tmp', blank: false, createdAt: 1 });
+    expect(await reader.pendingGroups?.(id)).toEqual({ groups: [] });
+    expect(await reader.pendingGroups?.(BOT_B)).toEqual({ groups: [] });
+    expect(await reader.pendingGroups?.('cli_missing')).toEqual({ groups: [] });
+    writeFileSync(pendingGroupsFile(files.projectsFile), '{');
+    await expect(reader.pendingGroups?.(id)).rejects.toThrow();
+  } finally { await reader.close?.(); await saveBots(prior); }
 });

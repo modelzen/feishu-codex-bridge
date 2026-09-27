@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { acquireSingleInstanceLock, BridgeAlreadyRunningError } from '../src/core/single-instance';
+import { acquireSingleInstanceLock, BridgeAlreadyRunningError, readSingleInstanceHolder } from '../src/core/single-instance';
 
 // ── helpers ─────────────────────────────────────────────────────────
 
@@ -32,6 +32,32 @@ describe('acquireSingleInstanceLock 协议逻辑', () => {
     file = join(dir, 'processes.json');
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('reads a live foreign holder without altering its lock or process', async () => {
+    const child = spawnSleeper();
+    try {
+      if (!child.pid) throw new Error('Fixture process failed to start');
+      const content = rec(child.pid);
+      writeFileSync(file, content);
+      expect(readSingleInstanceHolder('app_a', file)?.pid).toBe(child.pid);
+      expect(readSingleInstanceHolder('different-app', file)).toBeUndefined();
+      expect(readFileSync(file, 'utf8')).toBe(content);
+      expect(() => process.kill(child.pid ?? 0, 0)).not.toThrow();
+    } finally {
+      const exited = waitExit(child);
+      child.kill('SIGKILL');
+      await exited;
+    }
+  });
+
+  it('does not equate an unreadable lock with an absent process', () => {
+    expect(readSingleInstanceHolder('app_a', file)).toBeUndefined();
+    for (const invalid of ['{', '{}', '{"pid":-1,"appId":"app_a","startedAt":0}']) {
+      writeFileSync(file, invalid);
+      expect(() => readSingleInstanceHolder('app_a', file)).toThrow();
+      expect(readFileSync(file, 'utf8')).toBe(invalid);
+    }
+  });
 
   it('抢锁 → 写入本进程记录；release 后文件移除、可再抢', () => {
     const release = acquireSingleInstanceLock('app_a', file);
@@ -185,7 +211,7 @@ describe('并发多进程抢锁', () => {
       await Promise.all(children.map((c) => waitExit(c)));
       const lines = outputs.map((f) => f().trim());
       expect(lines.filter((l) => l === 'ACQUIRED')).toHaveLength(1);
-      expect(lines.filter((l) => l === 'REJECTED:BridgeAlreadyRunningError')).toHaveLength(3);
+      expect(lines.filter((l) => l === 'REJECTED:BridgeAlreadyRunningError'), JSON.stringify(lines)).toHaveLength(3);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

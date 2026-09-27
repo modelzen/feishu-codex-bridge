@@ -29,6 +29,7 @@ function loader(enabled: Record<string, boolean>) {
 describe('cli bridge hook bot routing', () => {
   it('honors an explicit bot selector from the installed hook command', async () => {
     const selected = await selectCliBridgeHookBot(registry(), {
+      route: { kind: 'legacy' },
       requested: 'beta',
       loadConfigForBot: loader({ app_alpha: true, app_beta: false }),
     });
@@ -37,6 +38,7 @@ describe('cli bridge hook bot routing', () => {
 
   it('can route an explicit appId even when the registry cannot resolve it', async () => {
     const selected = await selectCliBridgeHookBot(registry(), {
+      route: { kind: 'legacy' },
       requested: 'app_unknown',
       loadConfigForBot: loader({ app_alpha: true, app_beta: true }),
     });
@@ -45,6 +47,7 @@ describe('cli bridge hook bot routing', () => {
 
   it('keeps the current bot when it has cli bridge enabled', async () => {
     const selected = await selectCliBridgeHookBot(registry(), {
+      route: { kind: 'legacy' },
       loadConfigForBot: loader({ app_alpha: true, app_beta: true }),
     });
     expect(selected?.appId).toBe('app_alpha');
@@ -52,8 +55,23 @@ describe('cli bridge hook bot routing', () => {
 
   it('routes to another active bot when the current bot has cli bridge disabled', async () => {
     const selected = await selectCliBridgeHookBot(registry(), {
+      route: { kind: 'legacy' },
       loadConfigForBot: loader({ app_alpha: false, app_beta: true }),
     });
     expect(selected?.appId).toBe('app_beta');
+  });
+
+  it('explicit route overrides a stale hook pin and never changes recipient on disable', async () => {
+    const selected = await selectCliBridgeHookBot(registry(), {
+      route: { kind: 'agent', botId: 'app_beta' }, requested: 'app_alpha',
+      loadConfigForBot: loader({ app_alpha: true, app_beta: true }),
+    });
+    expect(selected?.appId).toBe('app_beta');
+    const disabled = await selectCliBridgeHookBot(registry(), {
+      route: { kind: 'agent', botId: 'app_beta' }, requested: 'app_alpha',
+      loadConfigForBot: loader({ app_alpha: true, app_beta: false }),
+    });
+    expect(disabled).toBeUndefined();
+    expect(await selectCliBridgeHookBot(registry(), { route: { kind: 'none' }, requested: 'app_alpha' })).toBeUndefined();
   });
 });

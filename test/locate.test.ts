@@ -43,19 +43,19 @@ afterAll(() => {
 });
 
 describe('resolveCodexBin 缓存', () => {
-  it('命中后不重探；force 重探；缓存路径消失则自动失效', () => {
+  it('显式覆盖立即生效；路径消失时不得回退到其它 Codex', () => {
     const a = join(dir, 'codex-a');
     const b = join(dir, 'codex-b');
     writeFileSync(a, '');
     writeFileSync(b, '');
 
     expect(withCodexBinEnv(a, () => resolveCodexBin({ force: true }))).toBe(a);
-    // 环境换了但缓存仍有效（路径还存在）→ 不重探
-    expect(withCodexBinEnv(b, () => resolveCodexBin())).toBe(a);
+    expect(withCodexBinEnv(b, () => resolveCodexBin())).toBe(b);
     // force 绕过缓存 → 看到新 CODEX_BIN
     expect(withCodexBinEnv(b, () => resolveCodexBin({ force: true }))).toBe(b);
     // 缓存的 bin 被删 → existsSync 复验失败，自动重探
     rmSync(b);
+    expect(withCodexBinEnv(b, () => resolveCodexBin())).toBeNull();
     expect(withCodexBinEnv(a, () => resolveCodexBin())).toBe(a);
   });
 });
@@ -96,5 +96,41 @@ describe('codexVersion / codexVersionAsync 缓存', () => {
 describe('codexVersionAsync 真实子进程', () => {
   it('对 node 自身返回 --version 输出（跨平台冒烟）', async () => {
     expect(await codexVersionAsync(process.execPath, { force: true })).toBe(process.version);
+  });
+});
+
+describe('desktop and Agent executable selection', () => {
+  it('uses the legacy physical root, managed copy and generation pointer with explicit override priority', async () => {
+    const { mkdirSync, existsSync } = await import('node:fs');
+    const { resolveDataRoot } = await import('../src/config/data-root');
+    const home = join(dir, 'legacy-home');
+    const root = join(home, '.feishu-codex-bridge');
+    const generation = '12345678-1234-1234-1234-123456789012';
+    const generationDir = join(root, 'codex-cli', 'releases', generation, 'node_modules', '.bin');
+    mkdirSync(generationDir, { recursive: true });
+    const legacy = writeNodeExecutable(generationDir, 'codex', 'console.log("codex-cli 1.0.0")').bin;
+    writeFileSync(join(root, 'codex-cli', 'current.json'), JSON.stringify({ generation }));
+    const context = { home, dataRoot: resolveDataRoot(home).path, env: { PATH: '' } };
+    expect(resolveCodexBin(context)).toBe(legacy);
+    const managedDir = join(root, 'managed-tools', 'bin');
+    mkdirSync(managedDir, { recursive: true });
+    const managed = writeNodeExecutable(managedDir, 'codex', 'console.log("codex-cli 2.0.0")').bin;
+    expect(resolveCodexBin(context)).toBe(managed);
+    expect(await codexVersionAsync(managed, { force: true })).toBe('codex-cli 2.0.0');
+    expect(resolveCodexBin({ ...context, env: { PATH: '', CODEX_BIN: legacy } })).toBe(legacy);
+    expect(resolveCodexBin({ ...context, env: { PATH: '', CODEX_BIN: join(home, 'missing') } })).toBeNull();
+    rmSync(managed);
+    expect(resolveCodexBin(context)).toBe(legacy);
+    expect(existsSync(join(home, '.vonvon-bridge'))).toBe(false);
+  });
+
+  it.skipIf(process.platform !== 'darwin')('still detects the Codex application bundle without shell PATH', async () => {
+    const { mkdirSync, existsSync } = await import('node:fs');
+    const home = join(dir, 'bundle-home');
+    const resourceDir = join(home, 'Applications', 'Codex.app', 'Contents', 'Resources');
+    mkdirSync(resourceDir, { recursive: true });
+    const local = writeNodeExecutable(resourceDir, 'codex', 'console.log("codex-cli 3.0.0")').bin;
+    const global = '/Applications/Codex.app/Contents/Resources/codex';
+    expect(resolveCodexBin({ home, dataRoot: join(home, '.vonvon-bridge'), env: { PATH: '' } })).toBe(existsSync(global) ? global : local);
   });
 });

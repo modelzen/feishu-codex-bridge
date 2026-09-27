@@ -1,3 +1,4 @@
+import {runtimeDistribution} from './distribution';
 import { closeSync, existsSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -111,6 +112,7 @@ export interface InstallResult {
  * it, output is captured and the tail returned for surfacing in a card.
  */
 export async function installLatest(opts: { inherit?: boolean } = {}): Promise<InstallResult> {
+  if ((await runtimeDistribution()).kind !== 'global-npm') return {ok:false,message:'当前 Core 不属于全局 npm 安装，请更新所属桌面应用或源码。'};
   const target = `${packageName()}@latest`;
   return await new Promise<InstallResult>((resolveP) => {
     const child = spawnProcess(NPM, ['install', '-g', target], {

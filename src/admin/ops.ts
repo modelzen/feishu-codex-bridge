@@ -1,3 +1,4 @@
+import type { BotSettingsEdit, BotSettingsAction, SettingsSave, SettingsActionResult, HostSettings } from './settings-types';
 import { backendIds } from '../agent';
 import { catalogById } from '../agent/catalog';
 import type { AgentBackend, BackendProbe, PermissionMode, ReasoningEffort } from '../agent/types';
@@ -11,7 +12,7 @@ import {
   type CompletionReminderMode,
   type ResolvedCompletionReminderConfig,
 } from '../config/schema';
-import { saveConfig } from '../config/store';
+import { loadConfig, saveConfig } from '../config/store';
 import {
   effectiveGuestMode,
   effectiveMode,
@@ -36,7 +37,11 @@ import {
  */
 
 /** Web/IPC 写操作的序列化形态（supervisor → bot 子进程经 process.send 转发）。 */
+export type AdminWriteResult = { kind: 'done' } | SettingsSave | SettingsActionResult;
+
 export type AdminWriteOp =
+  | { kind: 'settingsPatch'; edit: BotSettingsEdit }
+  | { kind: 'settingsAction'; action: BotSettingsAction }
   | { kind: 'voice'; value: import('../voice/types').VoiceAction }
   | { kind: 'switchBackend'; project: string; backend: string }
   | {
@@ -80,7 +85,7 @@ export type AdminPreferencesWriteOutcome =
  * snapshot has reached disk. A failed write leaves LIVE untouched and does not
  * poison later writes in the queue.
  */
-export type AppPreferencesWriter = (mutate: (preferences: AppPreferences) => void) => Promise<AppPreferences>;
+export type AppPreferencesWriter = (mutate: (preferences: AppPreferences) => void | Promise<void>) => Promise<AppPreferences>;
 
 export function createAppPreferencesWriter(opts: {
   cfg: AppConfig;
@@ -88,12 +93,16 @@ export function createAppPreferencesWriter(opts: {
   persistConfig?: (cfg: AppConfig) => Promise<void>;
 }): AppPreferencesWriter {
   let chain: Promise<unknown> = Promise.resolve();
-  const persist = opts.persistConfig ?? saveConfig;
+  const persist = opts.persistConfig ?? ((next: AppConfig) => saveConfig(next, undefined, opts.cfg));
 
   return (mutate) => {
     const run = chain.then(async () => {
-      const preferences: AppPreferences = { ...(opts.cfg.preferences ?? {}) };
-      mutate(preferences);
+      if (!opts.persistConfig) {
+        const disk = await loadConfig();
+        if (JSON.stringify(disk) !== JSON.stringify(opts.cfg)) throw new AdminWriteError('配置已被其他进程修改，请重启 Host 后重新加载设置');
+      }
+      const preferences = structuredClone(opts.cfg.preferences ?? {});
+      await mutate(preferences);
       await persist({ ...opts.cfg, preferences });
       opts.cfg.preferences = preferences;
       return preferences;
@@ -348,6 +357,7 @@ export async function performSetCompletionReminder(opts: {
 }
 
 export interface AdminWriteExecutorDeps {
+  settings?: HostSettings;
   voiceAction?: (action: import('../voice/types').VoiceAction) => Promise<void>;
   backendFor: (id?: string) => AgentBackend;
   evictLiveSessionsForChat: (chatId: string) => Promise<void>;
@@ -359,22 +369,24 @@ export interface AdminWriteExecutorDeps {
   writePreferences?: AppPreferencesWriter;
 }
 
-/** Orchestrator.adminExecute 的实现体：AdminWriteOp → 对应 perform*；拒绝抛
- * {@link AdminWriteError}（HTTP 409 / IPC code 还原）。Web/IPC 专用入口——DM
- * 回调直接调 perform* 拿 outcome 渲染卡片，不走这里。 */
-export function createAdminWriteExecutor(deps: AdminWriteExecutorDeps): (op: AdminWriteOp) => Promise<void> {
+export function createAdminWriteExecutor(deps: AdminWriteExecutorDeps): (op: AdminWriteOp) => Promise<AdminWriteResult> {
   const writePreferences =
     deps.writePreferences ??
     (deps.cfg ? createAppPreferencesWriter({ cfg: deps.cfg, persistConfig: deps.persistConfig }) : undefined);
   return async (op) => {
+    if (op.kind === 'settingsPatch' || op.kind === 'settingsAction') {
+      if (!deps.settings) return { kind: 'unavailable', reason: { kind: 'readonly', reason: 'owner-offline', message: 'Agent 设置服务未就绪' } };
+      return op.kind === 'settingsPatch' ? deps.settings.save(op.edit) : deps.settings.act(op.action);
+    }
     const outcome = await runAdminWriteOp(op, { ...deps, writePreferences });
     if (!outcome.ok) throw new AdminWriteError(outcome.reason);
+    return { kind: 'done' };
   };
 }
 
 /** AdminWriteOp 分发（exported for tests）。 */
 export async function runAdminWriteOp(
-  op: AdminWriteOp,
+  op: Exclude<AdminWriteOp, { kind: 'settingsPatch' | 'settingsAction' }>,
   deps: AdminWriteExecutorDeps,
 ): Promise<AdminWriteOutcome | AdminPreferencesWriteOutcome | { ok: true }> {
   switch (op.kind) {

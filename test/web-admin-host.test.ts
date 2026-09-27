@@ -1,3 +1,4 @@
+import {runtimeDistribution} from '../src/service/distribution';
 import { rmSync, existsSync } from 'node:fs';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { paths, botDir, useBotDir } from '../src/config/paths';
@@ -7,6 +8,8 @@ import { upsertSession } from '../src/bot/session-store';
 import { setSecret, listSecretIds } from '../src/config/keystore';
 import { secretKeyForApp } from '../src/config/schema';
 import { createAdminService, createReadonlyAdminService, NotWiredYetError } from '../src/admin/service';
+
+vi.mock('../src/service/distribution',()=>({runtimeDistribution:vi.fn(async()=>({kind:'global-npm',cliPath:'/fixture/bin/bridge'}))}));
 
 // 临时目录隔离 ~/.feishu-codex-bridge（同 web-admin-service.test 的做法）。
 vi.mock('../src/config/paths', async () => {
@@ -135,6 +138,13 @@ describe('AdminService · restartDaemon / applyUpdate（detached helper 注入�
     await expect(svc.applyUpdate()).rejects.toBeInstanceOf(NotWiredYetError);
   });
 
+  it('bundled service refuses global npm update before invoking its helper',async()=>{
+    vi.mocked(runtimeDistribution).mockResolvedValueOnce({kind:'bundled',cliPath:'/App/runtime/core/bin/bridge'});
+    const update=vi.fn();
+    await expect(createAdminService({applyUpdate:update}).applyUpdate()).rejects.toThrow('not owned');
+    expect(update).not.toHaveBeenCalled();
+  });
+
   it('daemon 内：调用注入的 helper 触发器（不真跑，只验证被调一次）', async () => {
     const restart = vi.fn();
     const update = vi.fn();
@@ -178,6 +188,26 @@ describe('AdminService · restartDaemon / applyUpdate（detached helper 注入�
 });
 
 describe('AdminService · setBotEnabled（活跃集 enabled 落盘）', () => {
+  it('reports application only after the running bot has stopped', async () => {
+    let finish!: () => void;
+    const stopped = new Promise<void>((resolve) => { finish = resolve; });
+    const applyBotActivation = vi.fn(async () => stopped);
+    const deps = { applyBotActivation, daemonStartedAt: 1 };
+    const svc = createAdminService(deps);
+    let settled = false;
+    const pending = svc.setBotEnabled(BOT_B, false).then((result) => { settled = true; return result; });
+    await vi.waitFor(() => expect(applyBotActivation).toHaveBeenCalledWith(BOT_B, false));
+    expect(settled).toBe(false);
+    finish();
+    expect(await pending).toMatchObject({ ok: true, activation: 'applied' });
+  });
+
+  it('does not claim an unsupported runtime applied the change', async () => {
+    expect(await createAdminService().setBotEnabled(BOT_B, false)).toMatchObject({
+      ok: true, activation: 'restartRequired',
+    });
+  });
+
   it('停用一个 bot → bots.json 的 active=false（其余不变）', async () => {
     const svc = createAdminService();
     const r = await svc.setBotEnabled(BOT_B, false);
@@ -195,6 +225,24 @@ describe('AdminService · setBotEnabled（活跃集 enabled 落盘）', () => {
     expect((await loadBots()).bots.find((b) => b.appId === BOT_B)!.active).toBe(true);
   });
 
+  it('serializes concurrent activation writes and retains disabled state after stop failure', async () => {
+    let finish!: () => void;
+    const stopping = new Promise<void>((resolve) => { finish = resolve; });
+    const applied: string[] = [];
+    const svc = createAdminService({ applyBotActivation: async (appId) => {
+      applied.push(appId);
+      if (appId === BOT_A) await stopping;
+      else throw new Error('process still alive');
+    } });
+    const first = svc.setBotEnabled(BOT_A, false);
+    const second = svc.setBotEnabled(BOT_B, false);
+    await vi.waitFor(() => expect(applied).toEqual([BOT_A]));
+    finish();
+    expect((await first).ok).toBe(true);
+    expect(await second).toMatchObject({ ok: false, reason: expect.stringContaining('process still alive') });
+    expect((await loadBots()).bots.map((bot) => bot.active)).toEqual([false, false]);
+  });
+
   it('不存在的 bot → { ok:false, reason }', async () => {
     const svc = createAdminService();
     const r = await svc.setBotEnabled('cli_nope', true);
@@ -204,15 +252,33 @@ describe('AdminService · setBotEnabled（活跃集 enabled 落盘）', () => {
 });
 
 describe('AdminService · deleteBot（删除 + 保护分支）', () => {
-  it('唯一 bot 拒删（给清晰提示），注册表/密钥/目录都不动', async () => {
+  it('启用中的唯一 bot 拒删，注册表/密钥/目录都不动', async () => {
     await saveBots({ version: 1, current: BOT_A, bots: [{ name: 'alpha', appId: BOT_A, tenant: 'feishu', createdAt: 1, active: true }] });
     await setSecret(secretKeyForApp(BOT_A), 'secret-A');
     const svc = createAdminService();
     const r = await svc.deleteBot(BOT_A);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.reason).toContain('唯一');
+    if (!r.ok) expect(r.reason).toContain('启用');
     expect((await loadBots()).bots).toHaveLength(1);
     expect(await listSecretIds()).toContain(secretKeyForApp(BOT_A));
+  });
+
+  it('已停用且停止的唯一 bot 可删除，空注册表可读并能再次注册', async () => {
+    await saveBots({ version: 1, current: BOT_A, bots: [{ name: 'alpha', appId: BOT_A, tenant: 'feishu', createdAt: 1, active: false }] });
+    const service = createAdminService();
+    expect((await service.deleteBot(BOT_A)).ok).toBe(true);
+    expect((await loadBots()).bots).toEqual([]);
+    expect(await service.listBots()).toEqual([]);
+    await saveBots({ version: 1, current: BOT_A, bots: [{ name: 'alpha', appId: BOT_A, tenant: 'feishu', createdAt: 2, active: false }] });
+    expect((await service.listBots()).map(bot => bot.appId)).toEqual([BOT_A]);
+  });
+
+  it('运行中即使零会话也拒绝删除，保留注册表和凭据', async () => {
+    const svc = createAdminService({ liveStatus: async () => ({ running: true }) });
+    const result = await svc.deleteBot(BOT_B);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain('仍在运行');
+    expect((await loadBots()).bots.some(bot => bot.appId === BOT_B)).toBe(true);
   });
 
   it('运行中且有活跃会话的 bot 拒删（liveStatus 注入 running + 写 session 记录）', async () => {
@@ -227,7 +293,7 @@ describe('AdminService · deleteBot（删除 + 保护分支）', () => {
     });
     const r = await svc.deleteBot(BOT_B);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.reason).toContain('活跃会话');
+    if (!r.ok) expect(r.reason).toContain('仍在运行');
     expect((await loadBots()).bots.some((b) => b.appId === BOT_B)).toBe(true);
   });
 
@@ -239,6 +305,7 @@ describe('AdminService · deleteBot（删除 + 保护分支）', () => {
 
     // 未运行（无 liveStatus、无锁文件）→ 保护②不触发，可删。
     const svc = createAdminService();
+    await svc.setBotEnabled(BOT_B, false);
     const r = await svc.deleteBot(BOT_B);
     expect(r.ok).toBe(true);
     const reg = await loadBots();
