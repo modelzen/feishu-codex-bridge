@@ -49,6 +49,7 @@ import {
   getSessionTitleEfforts,
   getShowToolCalls,
   getCommentsConfig,
+  canTriggerComment,
   getCompletionReminderConfig,
   shouldShowCompletionReminderButton,
   isAdmin,
@@ -3392,6 +3393,12 @@ export function createOrchestrator(
       if (!dmAdmin(evt.operator?.openId)) return;
       void patch(evt, () => renderCommentSettingsFor(evt.messageId));
     })
+    .on(DM.commentTriggerPolicy, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      const policy = value.v;
+      if (policy !== 'admin_mention' && policy !== 'any_mention') return;
+      applyCommentsPref(evt, c => { c.triggerPolicy = policy; }, { notice: '✅ 文档评论触发策略已保存，下一条新评论起生效。' });
+    })
     .on(DM.commentSetBackend, ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const v = typeof value.v === 'string' ? value.v : undefined;
@@ -5157,17 +5164,15 @@ export function createOrchestrator(
         commentId: evt.commentId,
         replyId: evt.replyId ?? null,
         mentionedBot: evt.mentionedBot,
-        sender: evt.operator.openId,
+        sender: evt.operator?.openId,
       });
       if (!evt.mentionedBot) return log.info('comment', 'skip', { reason: 'not-mentioned' });
       if (!SUPPORTED_FILE_TYPES.has(evt.fileType))
         return log.info('comment', 'skip', { reason: 'unsupported-fileType', fileType: evt.fileType });
-      // 评论 @bot 仅响应管理员（owner / admins）——评论流可改文档，破坏性，不放给任何人。
-      // operator.openId 可能缺失（事件归一化边角）：?? '' 让 isAdmin 安全返回 false，
-      // 且 slice 不会在 undefined 上抛 TypeError。
+      // Global comment policy never changes bridge administrator privileges.
       const operatorId = evt.operator?.openId ?? '';
-      if (!isAdmin(cfg, operatorId))
-        return log.info('comment', 'skip', { reason: 'not-admin', sender: operatorId.slice(-6) || '(unknown)' });
+      if (!canTriggerComment(cfg, operatorId, evt.mentionedBot))
+        return log.info('comment', 'skip', { reason: operatorId ? 'not-admin' : 'missing-operator', sender: operatorId.slice(-6) || '(unknown)' });
 
       const resolved = await resolveComment(channel, evt);
       if (!resolved) return log.info('comment', 'skip', { reason: 'no-target-or-empty' });

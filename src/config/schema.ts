@@ -163,7 +163,19 @@ export type ResolvedSessionTitleBackendConfig =
  * 空即回落后端默认。提示词刻意不放这里（多行长文本不适合塞 config.json），而是
  * 用磁盘上的 `comment-instructions.md`，让用户像编辑 AGENTS.md 一样直接改。
  */
+export type CommentTriggerPolicy = 'admin_mention' | 'any_mention';
+
+export function getCommentTriggerPolicy(cfg: AppConfig): CommentTriggerPolicy {
+  return cfg.preferences?.comments?.triggerPolicy === 'any_mention' ? 'any_mention' : 'admin_mention';
+}
+
+export function canTriggerComment(cfg: AppConfig, operatorId: string, mentionedBot: boolean): boolean {
+  return Boolean(operatorId && mentionedBot && (getCommentTriggerPolicy(cfg) === 'any_mention' || isAdmin(cfg, operatorId)));
+}
+
 export interface CommentsConfig {
+  /** Global document-comment access policy. A real bot mention is always required. */
+  triggerPolicy?: CommentTriggerPolicy;
   /** 评论流新会话用的后端 id（如 'codex-appserver' / 'claude-agent'）。缺省 → DEFAULT_BACKEND_ID。 */
   backend?: string;
   /** 评论流新会话的默认模型 id。缺省 → 后端默认模型。 */

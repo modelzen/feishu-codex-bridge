@@ -3,6 +3,7 @@ import {
   COMPLETION_REMINDER_LONG_TASK_MAX_MINUTES,
   COMPLETION_REMINDER_LONG_TASK_MIN_MINUTES,
   getCompletionReminderConfig,
+  getCommentTriggerPolicy,
   getMaxConcurrentRuns,
   getModelDisplay,
   getPendingPolicy,
@@ -117,6 +118,7 @@ export const DM = {
   // 📝 云文档评论 @bot 全局设置：后端按钮(级联)→模型/强度下拉表单提交；提示词在卡内编辑。
   commentSettings: 'dm.comment.settings',
   commentSetBackend: 'dm.comment.setBackend',
+  commentTriggerPolicy: 'dm.comment.triggerPolicy',
   commentSubmit: 'dm.comment.submit',
   commentEditPrompt: 'dm.comment.editPrompt',
   commentPromptSubmit: 'dm.comment.promptSubmit',
@@ -1302,6 +1304,12 @@ export function buildCommentSettingsCard(
   const els: CardElement[] = [
     ...(notice ? [md(notice)] : []),
     note('在云文档评论里 @我后，使用这里的配置运行 Agent 并回复。回复规则可控制怎么回答、是否直接修改文档；下一条新评论起生效，不影响普通聊天。'),
+    md('**文档评论触发策略（全局）**'),
+    actions([
+      button('仅管理员 @', { a: DM.commentTriggerPolicy, v: 'admin_mention' }, getCommentTriggerPolicy(cfg) === 'admin_mention' ? 'primary' : 'default'),
+      button('任何评论者 @', { a: DM.commentTriggerPolicy, v: 'any_mention' }, getCommentTriggerPolicy(cfg) === 'any_mention' ? 'primary' : 'default'),
+    ]),
+    note('立即保存，适用于本机器人可访问的所有文档。允许任何评论者后，外部协作者也可通过真实 @ 触发现有评论 Agent（包括其文档修改能力）；不会赋予桥接管理员权限。'),
     hr(),
   ];
 
