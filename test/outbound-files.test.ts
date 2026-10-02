@@ -79,6 +79,75 @@ describe('click-to-get local files', () => {
   const prepare = async (): Promise<InlineFiles> =>
     service.prepare('已生成 [报告](<测试 报告.xlsx>)', context);
 
+  it('automatically sends only final referenced deliverables and deduplicates aliases and repeated completion', async () => {
+    await mkdir(join(cwd, 'outputs'));
+    await writeFile(join(cwd, 'outputs', '报告.txt'), 'deliverable bytes');
+    await writeFile(join(cwd, 'outputs', '未引用.txt'), 'do not scan');
+    await service.prepare('[报告](outputs/报告.txt) 以及 `outputs/报告.txt`', context);
+    expect(upload).not.toHaveBeenCalled();
+    const auto = async () => ({ mode: 'write' as const, directories: ['outputs'] });
+    await service.sendCompleted(channel, context, 'done', auto);
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(upload.mock.calls[0]![0].data.file).toEqual(Buffer.from('deliverable bytes'));
+    expect(reply.mock.calls[0]![0]).toMatchObject({ path: { message_id: 'om_card' }, data: { msg_type: 'file', reply_in_thread: true } });
+    await service.sendCompleted(channel, context, 'done', auto);
+    expect(reply).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not auto send failed, interrupted or unfinished turns, disabled projects, forged bindings, or old cards after restart', async () => {
+    await prepare();
+    const auto = async () => ({ mode: 'full' as const, directories: ['outputs'] });
+    for (const outcome of ['running', 'error', 'interrupted', 'timeout']) {
+      await service.sendCompleted(channel, context, outcome, auto);
+    }
+    await service.sendCompleted(channel, context, 'done', async () => undefined);
+    await service.sendCompleted(channel, { ...context, chatId: 'wrong' }, 'done', auto);
+    await service.sendCompleted(channel, { ...context, cwd: root }, 'done', auto);
+    await service.sendCompleted(channel, { ...context, requesterOpenId: 'wrong' }, 'done', auto);
+    await new OutboundFiles(dir, 0).sendCompleted(channel, context, 'done', auto);
+    expect(upload).not.toHaveBeenCalled();
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it('keeps full-mode publication within configured output subdirectories, including directory junctions', async () => {
+    await mkdir(join(cwd, 'outputs'));
+    await mkdir(join(root, 'private'));
+    await writeFile(join(root, 'private', 'secret.txt'), 'private bytes');
+    await symlink(join(root, 'private'), join(cwd, 'outputs', 'escape'), 'junction');
+    context.mode = 'full';
+    await service.prepare('[input](<测试 报告.xlsx>) [escape](outputs/escape/secret.txt)', context);
+    for (const directories of [['outputs'], ['.'], ['../private'], [join(root, 'private')], []]) {
+      await service.sendCompleted(channel, context, 'done', async () => ({ mode: 'full', directories }));
+    }
+    expect(upload).not.toHaveBeenCalled();
+    expect(reply).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled(); // Other references retain ordinary manual entries.
+  });
+
+  it('rechecks publication policy after upload so disabling the project cannot send a pending file', async () => {
+    await mkdir(join(cwd, 'outputs'));
+    await writeFile(join(cwd, 'outputs', '报告.txt'), 'report');
+    await service.prepare('[报告](outputs/报告.txt)', context);
+    let enabled = true;
+    upload.mockImplementationOnce(async () => { enabled = false; return { file_key: 'file_key' }; });
+    await service.sendCompleted(channel, context, 'done', async () =>
+      enabled ? { mode: 'write', directories: ['outputs'] } : undefined);
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it('leaves a visible manual retry after auto upload fails and sends exactly once when retried', async () => {
+    await mkdir(join(cwd, 'outputs'));
+    await writeFile(join(cwd, 'outputs', '报告.txt'), 'report');
+    const prepared = await service.prepare('[报告](outputs/报告.txt)', context);
+    upload.mockRejectedValueOnce(new Error('network down'));
+    await service.sendCompleted(channel, context, 'done', async () => ({ mode: 'write', directories: ['outputs'] }));
+    expect(reply).not.toHaveBeenCalled();
+    expect(JSON.stringify(prepared.links)).toContain('点击重试');
+    await service.deliver(channel, evt, values(prepared.links)[0]!, allow);
+    expect(reply).toHaveBeenCalledTimes(1);
+  });
+
   it('prepares metadata and renders a link without uploading; click works after restart', async () => {
     const prepared = await prepare();
     expect(upload).not.toHaveBeenCalled();
@@ -209,10 +278,11 @@ describe('click-to-get local files', () => {
   });
 
   it('does not follow a symlink outside the workspace; full mode still allows an explicit outside file', async () => {
-    const outside = join(root, 'private.txt');
+    await mkdir(join(root, 'private'));
+    const outside = join(root, 'private', 'private.txt');
     await writeFile(outside, 'private');
-    await symlink(outside, join(cwd, 'link.txt'));
-    expect(values((await service.prepare('[file](link.txt)', context)).links)).toHaveLength(0);
+    await symlink(join(root, 'private'), join(cwd, 'link'), 'junction');
+    expect(values((await service.prepare('[file](link/private.txt)', context)).links)).toHaveLength(0);
     expect(values((await service.prepare(`[file](${outside})`, { ...context, mode: 'full' })).links)).toHaveLength(1);
     const payload = values((await service.prepare(`[file](${outside})`, { ...context, mode: 'full' })).links)[0]!;
     await service.deliver(channel, evt, payload, allow); // permissions narrowed since creation
@@ -230,12 +300,15 @@ describe('click-to-get local files', () => {
     expect(upload).not.toHaveBeenCalled();
   });
 
-  it('rejects a file swapped to a symlink after the card was created', async () => {
-    const payload = values((await prepare()).links)[0]!;
-    const outside = join(root, 'secret.xlsx');
+  it('rejects a file directory swapped to a junction after the card was created', async () => {
+    await mkdir(join(cwd, 'output'));
+    await writeFile(join(cwd, 'output', '报告.xlsx'), 'report');
+    const payload = values((await service.prepare('[file](output/报告.xlsx)', context)).links)[0]!;
+    await mkdir(join(root, 'private'));
+    const outside = join(root, 'private', '报告.xlsx');
     await writeFile(outside, 'secret');
-    await unlink(join(cwd, '测试 报告.xlsx'));
-    await symlink(outside, join(cwd, '测试 报告.xlsx'));
+    await rm(join(cwd, 'output'), { recursive: true });
+    await symlink(join(root, 'private'), join(cwd, 'output'), 'junction');
     await service.deliver(channel, evt, payload, allow);
     expect(upload).not.toHaveBeenCalled();
   });
