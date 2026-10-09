@@ -1,0 +1,2962 @@
+diff --git a/src/admin/host-settings.ts b/src/admin/host-settings.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..0baa69f00141d1d807d0345c23512f5989e7b335
+--- /dev/null
++++ b/src/admin/host-settings.ts
+@@ -0,0 +1,71 @@
++import { createHash } from 'node:crypto';
++import { constants } from 'node:fs';
++import { access, stat } from 'node:fs/promises';
++import { isAbsolute } from 'node:path';
++import { paths } from '../config/paths';
++import { readServiceCodexBin, saveServiceCodexBin } from '../service/codex-bin';
++import type { ApplyEffect, HostSettings, HostSettingsView, SettingsSave, SettingsSectionView } from './settings-types';
++
++export function createHostSettings(options: {
++  appDir?: string;
++  readonly?: boolean;
++  runningCodexBin?: string | null;
++} = {}): Pick<HostSettings, 'read' | 'save'> {
++  const appDir = options.appDir ?? paths.appDir;
++  const runningCodexBin = options.runningCodexBin === undefined
++    ? process.env.CODEX_BIN || null
++    : options.runningCodexBin;
++  let writes: Promise<unknown> = Promise.resolve();
++  const effect: ApplyEffect = { fields: ['codexBin'], when: 'restart', detail: '已保存，下次启动 Bridge 时使用；当前会话保持原来的执行程序。' };
++  function view(): HostSettingsView {
++    const stored = readServiceCodexBin(appDir);
++    return {
++      scope: { kind: 'host' },
++      sections: {
++        execution: {
++          stored: { codexBin: stored ?? null },
++          effective: { codexBin: runningCodexBin },
++          revision: createHash('sha256').update(JSON.stringify({ configured: stored !== undefined, codexBin: stored ?? null })).digest('hex'),
++          access: options.readonly
++            ? { kind: 'readonly', reason: 'preview', message: '只读预览不能更改执行程序，请先启动 Bridge。' }
++            : { kind: 'writable' },
++          apply: [effect],
++        },
++      },
++      runtime: { codexBin: runningCodexBin, fallbackCwd: process.env.FEISHU_CODEX_CWD || process.cwd(), platform: process.platform },
++    };
++  }
++  const section = (current: HostSettingsView): SettingsSectionView => ({ scope: { kind: 'host' }, section: 'execution', value: current.sections.execution });
++  return {
++    async read(scope) {
++      if (scope.kind !== 'host') throw new Error('Host settings require the host scope');
++      return view();
++    },
++    save(edit) {
++      const run = writes.then(async (): Promise<SettingsSave> => {
++        if (edit.scope.kind !== 'host' || edit.section !== 'execution') throw new Error('Host settings require the execution section');
++        let current = view();
++        if (current.sections.execution.access.kind === 'readonly') return { kind: 'unavailable', reason: current.sections.execution.access };
++        const value = edit.patch.codexBin;
++        if (value === undefined) return { kind: 'rejected', fields: [{ field: 'codexBin', message: '请选择执行程序或恢复自动查找。' }] };
++        if (readServiceCodexBin(appDir) === value) return { kind: 'saved', section: section(current), effects: [] };
++        if (current.sections.execution.revision !== edit.revision) return { kind: 'conflict', current: section(current) };
++        if (value !== null) {
++          if (!isAbsolute(value) || /[\r\n\0]/.test(value)) return { kind: 'rejected', fields: [{ field: 'codexBin', message: '执行程序必须是有效的绝对文件路径。' }] };
++          try {
++            if (!(await stat(value)).isFile()) throw new Error('not a file');
++            await access(value, process.platform === 'win32' ? constants.F_OK : constants.X_OK);
++          } catch {
++            return { kind: 'rejected', fields: [{ field: 'codexBin', message: '所选执行程序不存在或不可执行，请重新选择。' }] };
++          }
++        }
++        current = view();
++        if (current.sections.execution.revision !== edit.revision) return { kind: 'conflict', current: section(current) };
++        saveServiceCodexBin(value, appDir);
++        return { kind: 'saved', section: section(view()), effects: [effect] };
++      });
++      writes = run.catch(() => undefined);
++      return run;
++    },
++  };
++}
+diff --git a/src/admin/ipc.ts b/src/admin/ipc.ts
+index bb2f3e1349f7bcbc6244e09d13388a7b21789bf2..28140365a452cedcdae5c4ccf3bd8469b78cb318 100644
+--- a/src/admin/ipc.ts
++++ b/src/admin/ipc.ts
+@@ -1,3 +1,4 @@
++import type { BotSettingsScope, ModelQuery } from './settings-types';
+ import { GroupUpstreamError, InvalidGroupInput, type AdminGroupOp } from './groups';
+ import { AdminWriteError, type AdminWriteOp } from './ops';
+ 
+@@ -21,7 +22,8 @@ export const ADMIN_IPC_REQ = 'fcb.admin.req' as const;
+ export const ADMIN_IPC_RES = 'fcb.admin.res' as const;
+ 
+ /** 转发给子进程的结构化写 op + 实时连接状态查询（替代锁文件探测）。 */
+-export type AdminIpcOp = AdminWriteOp | AdminGroupOp | { kind: 'status' };
++export type AdminSettingsReadOp = { kind: 'settingsRead'; scope: BotSettingsScope } | { kind: 'settingsModels'; query: ModelQuery };
++export type AdminIpcOp = AdminWriteOp | AdminGroupOp | AdminSettingsReadOp | { kind: 'status' };
+ 
+ export interface AdminIpcRequest {
+   fcb: typeof ADMIN_IPC_REQ;
+diff --git a/src/admin/ops.ts b/src/admin/ops.ts
+index 63b68dfe516a5328573b48c82a4e58a61442677a..ff3b40a12c8549cadef85ccf63077d4aaf952f4b 100644
+--- a/src/admin/ops.ts
++++ b/src/admin/ops.ts
+@@ -1,3 +1,4 @@
++import type { BotSettingsEdit, BotSettingsAction, SettingsSave, SettingsActionResult, HostSettings } from './settings-types';
+ import { backendIds } from '../agent';
+ import { catalogById } from '../agent/catalog';
+ import type { AgentBackend, BackendProbe, PermissionMode, ReasoningEffort } from '../agent/types';
+@@ -11,7 +12,7 @@ import {
+   type CompletionReminderMode,
+   type ResolvedCompletionReminderConfig,
+ } from '../config/schema';
+-import { saveConfig } from '../config/store';
++import { loadConfig, saveConfig } from '../config/store';
+ import {
+   effectiveGuestMode,
+   effectiveMode,
+@@ -36,7 +37,11 @@ import {
+  */
+ 
+ /** Web/IPC 写操作的序列化形态（supervisor → bot 子进程经 process.send 转发）。 */
++export type AdminWriteResult = { kind: 'done' } | SettingsSave | SettingsActionResult;
++
+ export type AdminWriteOp =
++  | { kind: 'settingsPatch'; edit: BotSettingsEdit }
++  | { kind: 'settingsAction'; action: BotSettingsAction }
+   | { kind: 'voice'; value: import('../voice/types').VoiceAction }
+   | { kind: 'switchBackend'; project: string; backend: string }
+   | {
+@@ -80,7 +85,7 @@ export type AdminPreferencesWriteOutcome =
+  * snapshot has reached disk. A failed write leaves LIVE untouched and does not
+  * poison later writes in the queue.
+  */
+-export type AppPreferencesWriter = (mutate: (preferences: AppPreferences) => void) => Promise<AppPreferences>;
++export type AppPreferencesWriter = (mutate: (preferences: AppPreferences) => void | Promise<void>) => Promise<AppPreferences>;
+ 
+ export function createAppPreferencesWriter(opts: {
+   cfg: AppConfig;
+@@ -88,12 +93,16 @@ export function createAppPreferencesWriter(opts: {
+   persistConfig?: (cfg: AppConfig) => Promise<void>;
+ }): AppPreferencesWriter {
+   let chain: Promise<unknown> = Promise.resolve();
+-  const persist = opts.persistConfig ?? saveConfig;
++  const persist = opts.persistConfig ?? ((next: AppConfig) => saveConfig(next, undefined, opts.cfg));
+ 
+   return (mutate) => {
+     const run = chain.then(async () => {
+-      const preferences: AppPreferences = { ...(opts.cfg.preferences ?? {}) };
+-      mutate(preferences);
++      if (!opts.persistConfig) {
++        const disk = await loadConfig();
++        if (JSON.stringify(disk) !== JSON.stringify(opts.cfg)) throw new AdminWriteError('配置已被其他进程修改，请重启 Host 后重新加载设置');
++      }
++      const preferences = structuredClone(opts.cfg.preferences ?? {});
++      await mutate(preferences);
+       await persist({ ...opts.cfg, preferences });
+       opts.cfg.preferences = preferences;
+       return preferences;
+@@ -348,6 +357,7 @@ export async function performSetCompletionReminder(opts: {
+ }
+ 
+ export interface AdminWriteExecutorDeps {
++  settings?: HostSettings;
+   voiceAction?: (action: import('../voice/types').VoiceAction) => Promise<void>;
+   backendFor: (id?: string) => AgentBackend;
+   evictLiveSessionsForChat: (chatId: string) => Promise<void>;
+@@ -362,19 +372,24 @@ export interface AdminWriteExecutorDeps {
+ /** Orchestrator.adminExecute 的实现体：AdminWriteOp → 对应 perform*；拒绝抛
+  * {@link AdminWriteError}（HTTP 409 / IPC code 还原）。Web/IPC 专用入口——DM
+  * 回调直接调 perform* 拿 outcome 渲染卡片，不走这里。 */
+-export function createAdminWriteExecutor(deps: AdminWriteExecutorDeps): (op: AdminWriteOp) => Promise<void> {
++export function createAdminWriteExecutor(deps: AdminWriteExecutorDeps): (op: AdminWriteOp) => Promise<AdminWriteResult> {
+   const writePreferences =
+     deps.writePreferences ??
+     (deps.cfg ? createAppPreferencesWriter({ cfg: deps.cfg, persistConfig: deps.persistConfig }) : undefined);
+   return async (op) => {
++    if (op.kind === 'settingsPatch' || op.kind === 'settingsAction') {
++      if (!deps.settings) return { kind: 'unavailable', reason: { kind: 'readonly', reason: 'owner-offline', message: 'Agent 设置服务未就绪' } };
++      return op.kind === 'settingsPatch' ? deps.settings.save(op.edit) : deps.settings.act(op.action);
++    }
+     const outcome = await runAdminWriteOp(op, { ...deps, writePreferences });
+     if (!outcome.ok) throw new AdminWriteError(outcome.reason);
++    return { kind: 'done' };
+   };
+ }
+ 
+ /** AdminWriteOp 分发（exported for tests）。 */
+ export async function runAdminWriteOp(
+-  op: AdminWriteOp,
++  op: Exclude<AdminWriteOp, { kind: 'settingsPatch' | 'settingsAction' }>,
+   deps: AdminWriteExecutorDeps,
+ ): Promise<AdminWriteOutcome | AdminPreferencesWriteOutcome | { ok: true }> {
+   switch (op.kind) {
+diff --git a/src/admin/service.ts b/src/admin/service.ts
+index 603cceaae056b787d5234ab6c224559700ce495f..44e02f9898ada3270edf0d807454b8e7b4f87dd5 100644
+--- a/src/admin/service.ts
++++ b/src/admin/service.ts
+@@ -1,3 +1,6 @@
++import { createSettingsService } from './settings-service';
++import type { HostSettings } from './settings-types';
++import type { AdminSettingsReadOp } from './ipc';
+ import { CodexSetupService, type CodexSetup, type CodexJob, type CodexJobType } from '../agent/codex-appserver/setup';
+ import { parseJoinedGroups, type AdminGroupOp, type BindGroupInput, type JoinedGroups } from './groups';
+ import { voiceView } from '../voice/view';
+@@ -96,6 +99,7 @@ import type { AdminWriteOp } from './ops';
+  * 切目录会把在跑 bot 的 paths 指到别的 bot（第一棒遗留的坑，本棒修掉）。
+  */
+ export interface AdminService {
++  settings?: HostSettings;
+   codexSetup?(): Promise<CodexSetup>;
+   startCodexJob?(type: CodexJobType): { id: string };
+   codexJob?(id: string): CodexJob | undefined;
+@@ -423,11 +427,12 @@ export interface AdminBackendCatalogEntry {
+ 
+ /** daemon/预览两种进程形态的差异全部收进这几个注入点；读路径完全同源。 */
+ export interface AdminServiceDeps {
++  executeSettingsRead?: (botId: string, op: AdminSettingsReadOp) => Promise<unknown>;
+   codexTools?: CodexSetupService;
+   executeGroups?: (botId: string, op: AdminGroupOp) => Promise<unknown>;
+   /** 写执行器：botId + op → 完成或抛 AdminWriteError（校验拒绝）。
+    * 缺省 = 只读预览，写方法抛 {@link NotWiredYetError}（HTTP 501）。 */
+-  executeWrite?: (botId: string, op: AdminWriteOp) => Promise<void>;
++  executeWrite?: (botId: string, op: AdminWriteOp) => Promise<unknown>;
+   /** 实时运行状态（daemon 进程内：本进程 channel / 子进程 IPC）。返回 undefined
+    * 或缺省 → 回退锁文件探测（该 bot 不归本 daemon 管，如未激活的 bot）。 */
+   liveStatus?: (botId: string) => Promise<BotLiveStatus | undefined>;
+@@ -537,10 +542,11 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
+ 
+   function executeWrite(botId: string, action: string, op: AdminWriteOp): Promise<void> {
+     if (!deps.executeWrite) throw new NotWiredYetError(action);
+-    return deps.executeWrite(botId, op);
++    return deps.executeWrite(botId, op).then(() => undefined);
+   }
+ 
+   return {
++    settings: createSettingsService(deps),
+     codexSetup: () => codexTools.setup(),
+     startCodexJob(type) {
+       if (deps.readonlyPreview || deps.daemonStartedAt === undefined) throw new NotWiredYetError('Codex 设置');
+@@ -938,21 +944,13 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
+       const reg = await loadBots();
+       const target = reg.bots.find((b) => b.appId === appId);
+       if (!target) return { ok: false, reason: `机器人「${appId}」不存在。` };
+-      // 保护①：唯一 bot 不许删（删完控制台空了、无从恢复，得引导重新 init）。
+-      if (reg.bots.length <= 1) {
+-        return { ok: false, reason: '这是当前唯一的机器人，不能删除——删完控制台就空了。先用 `bot init` 添加另一个再删。' };
+-      }
+-      // 保护②：带运行中会话（bridge 在跑 + 有话题记录）的 bot 不许删——会打断正在跑的
+-      // codex 会话、留下孤儿 app-server。先 `bot use` 退活跃集 + 重启让进程退出再删。
+       const run = await runState(appId);
+       if (run.running) {
+-        const sessions = await listSessionsIn(botPaths(appId).sessionsFile).catch(() => []);
+-        if (sessions.length > 0) {
+-          return {
+-            ok: false,
+-            reason: `机器人「${target.name}」正在运行且有 ${sessions.length} 个活跃会话，不能删除（会打断进行中的对话）。先在「多机器人」里关掉它并重启 daemon，等进程退出后再删。`,
+-          };
+-        }
++        return { ok: false, reason: `机器人「${target.name}」仍在运行。请先关闭启用状态并重启 Host，确认已停止后再删除。` };
++      }
++      const enabled = reg.bots.some(bot => bot.active !== undefined) ? target.active === true : reg.current === appId;
++      if (enabled) {
++        return { ok: false, reason: '请先关闭此机器人的启用状态并确认已经停止，再删除。' };
+       }
+       // 注册表 + keystore 密钥 + 状态目录（projects/sessions/config），与 `bot rm` 同语义。
+       await removeBot(appId);
+diff --git a/src/admin/settings-parse.ts b/src/admin/settings-parse.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c074c7c85b4d2a52a682e9240dd5273e33fa1c0d
+--- /dev/null
++++ b/src/admin/settings-parse.ts
+@@ -0,0 +1,235 @@
++import { isAbsolute } from 'node:path';
++import { REASONING_EFFORTS } from '../agent/types';
++import type { SettingsAction, SettingsEdit, SettingsScope, ModelQuery } from './settings-types';
++export class SettingsInputError extends Error {
++}
++type Rule = (value: unknown) => boolean;
++const bool: Rule = value => typeof value === 'boolean';
++const text: Rule = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 1000;
++const one = (...values: readonly unknown[]): Rule => value => values.includes(value);
++const integer = (min: number, max: number): Rule => value => typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max;
++const identifier = (prefix: string): Rule => value => typeof value === 'string' && new RegExp(`^${prefix}_[A-Za-z0-9_-]{1,200}$`).test(value);
++const array = (rule: Rule): Rule => value => Array.isArray(value) && value.length <= 1000 && value.every(rule);
++const path: Rule = value => value === null || typeof value === 'string' && value.length <= 4096 && !/[\r\n\0]/.test(value) && (isAbsolute(value) || value === '~' || value.startsWith('~/'));
++export function settingsObject(value: unknown): Record<string, unknown> {
++  if (!value || typeof value !== 'object' || Array.isArray(value))
++    throw new SettingsInputError('设置请求必须是对象');
++  return value as Record<string, unknown>;
++}
++function shape(rules: Record<string, Rule>, partial = false): Rule {
++  return value => {
++    if (!value || typeof value !== 'object' || Array.isArray(value))
++      return false;
++    const record = settingsObject(value);
++    return Object.keys(record).every(key => Object.hasOwn(rules, key) && rules[key]!(record[key])) && (partial || Object.keys(rules).every(key => Object.hasOwn(record, key)));
++  };
++}
++const selection: Rule = value => shape({
++  kind: one('default')
++})(value) || shape({
++  kind: one('explicit'),
++  model: text,
++  effort: one(...REASONING_EFFORTS)
++})(value);
++const title: Rule = value => shape({
++  enabled: one(false)
++})(value) || shape({
++  enabled: one(true),
++  model: text,
++  effort: one(...REASONING_EFFORTS)
++})(value);
++const schemas: Record<string, Record<string, Rule>> = {
++  agent: {
++    cards: shape({
++      showToolCalls: bool,
++      showModel: one('off', 'running', 'always')
++    }, true),
++    run: shape({
++      maxConcurrentRuns: integer(1, 50),
++      runIdleTimeoutSeconds: value => value === 0 || integer(10, 3600)(value),
++      pendingPolicy: one('steer', 'queue')
++    }, true),
++    completion: shape({
++      mode: one('manual', 'long', 'failures', 'always'),
++      longTaskMinutes: integer(1, 1440)
++    }, true),
++    cliBridge: shape({
++      agents: shape({
++        claude: bool,
++        codex: bool
++      }),
++      notifyScope: one('all', 'bound_projects', 'none'),
++      keepAwake: shape({
++        enabled: bool
++      }),
++      approval: shape({
++        enabled: bool,
++        timeoutSeconds: integer(1, 86400)
++      }),
++      taskCompletion: shape({
++        enabled: bool,
++        replyEnabled: bool,
++        replyTimeoutSeconds: integer(1, 86400)
++      }),
++      allowCache: shape({
++        enabled: bool,
++        scope: one('session')
++      }),
++      presence: shape({
++        enabled: bool,
++        platform: one('auto', 'macos'),
++        idleThresholdSeconds: integer(10, 3600)
++      })
++    }, true),
++    comments: shape({
++      backend: text,
++      selection
++    }, true),
++    titles: shape({
++      byBackend: value => {
++        const map = settingsObject(value);
++        return Object.keys(map).length === 1 && Object.entries(map).every(([key, policy]) => text(key) && !['__proto__', 'constructor', 'prototype'].includes(key) && title(policy));
++      }
++    }),
++    paths: shape({
++      projectsRootDir: path
++    }, true),
++    access: shape({
++      allowedChats: array(identifier('oc'))
++    }, true),
++  },
++  project: {
++    permission: shape({
++      mode: one('qa', 'write', 'full'),
++      guestMode: one('qa', 'write', 'full'),
++      network: bool
++    }, true),
++    response: shape({
++      noMention: bool
++    }, true),
++    compact: shape({
++      autoCompact: bool
++    }, true),
++    model: shape({
++      selection
++    })
++  },
++  session: {
++    model: shape({
++      selection
++    })
++  },
++  host: {
++    execution: shape({
++      codexBin: path
++    })
++  },
++};
++export function parseSettingsScope(input: unknown): SettingsScope {
++  const object = settingsObject(input);
++  const scopes: Record<string, Rule> = {
++    host: shape({
++      kind: one('host')
++    }),
++    agent: shape({
++      kind: one('agent'),
++      botId: identifier('cli')
++    }),
++    project: shape({
++      kind: one('project'),
++      botId: identifier('cli'),
++      projectName: text
++    }),
++    session: shape({
++      kind: one('session'),
++      botId: identifier('cli'),
++      threadId: text
++    }),
++  };
++  if (typeof object.kind !== 'string' || !Object.hasOwn(scopes, object.kind) || !scopes[object.kind]!(object))
++    throw new SettingsInputError('设置作用域无效');
++  return object as SettingsScope;
++}
++export function parseSettingsEdit(input: unknown): SettingsEdit {
++  const object = settingsObject(input);
++  if (!shape({
++    scope: () => true,
++    section: text,
++    revision: text,
++    patch: () => true
++  })(object))
++    throw new SettingsInputError('设置保存参数无效');
++  const scope = parseSettingsScope(object.scope);
++  const section = String(object.section);
++  const rule = schemas[scope.kind]?.[section];
++  if (!Object.hasOwn(schemas[scope.kind]!, section) || !rule || !rule(object.patch) || Object.keys(settingsObject(object.patch)).length === 0)
++    throw new SettingsInputError('设置字段、类型或范围无效');
++  return {
++    ...object,
++    scope
++  } as SettingsEdit;
++}
++export function parseModelQuery(input: unknown): ModelQuery {
++  if (!shape({
++    botId: identifier('cli'),
++    backend: text,
++    purpose: one('project', 'session', 'comments', 'titles')
++  })(input))
++    throw new SettingsInputError('模型查询无效');
++  return input as ModelQuery;
++}
++export function parseSettingsAction(input: unknown): SettingsAction {
++  const object = settingsObject(input);
++  const common = {
++    kind: text,
++    botId: identifier('cli')
++  };
++  const revision = text;
++  const membership = one('present', 'absent');
++  const rules: Record<string, Rule> = {
++    setCliBridgeEnabled: shape({
++      ...common,
++      enabled: bool,
++      revision
++    }),
++    repairCliHooks: shape(common),
++    voice: shape({
++      ...common,
++      action: shape({
++        action: one('enable', 'disable', 'test', 'refreshPermission')
++      })
++    }),
++    adminMember: shape({
++      ...common,
++      openId: identifier('ou'),
++      membership,
++      revision
++    }),
++    projectMember: shape({
++      ...common,
++      projectName: text,
++      openId: identifier('ou'),
++      membership,
++      revision
++    }),
++    projectAudience: shape({
++      ...common,
++      projectName: text,
++      audience: one('all'),
++      revision
++    }),
++    commentInstructions: shape({
++      ...common,
++      revision,
++      content: value => shape({
++        kind: one('default')
++      })(value) || shape({
++        kind: one('custom'),
++        text: v => typeof v === 'string' && v.trim().length > 0 && v.length <= 30000
++      })(value)
++    }),
++  };
++  if (typeof object.kind !== 'string' || !Object.hasOwn(rules, object.kind) || !rules[object.kind]!(object))
++    throw new SettingsInputError('设置操作参数无效');
++  return object as SettingsAction;
++}
+diff --git a/src/admin/settings-service.ts b/src/admin/settings-service.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..eee045c0bfff106294dec8ae2123d8b77ee4e495
+--- /dev/null
++++ b/src/admin/settings-service.ts
+@@ -0,0 +1,105 @@
++import { readFile } from 'node:fs/promises';
++import { join } from 'node:path';
++import { createBackend } from '../agent';
++import { botDir, botPaths } from '../config/paths';
++import { loadConfig } from '../config/store';
++import { isComplete } from '../config/schema';
++import { listProjectsIn } from '../project/registry';
++import { listSessionsIn } from '../bot/session-store';
++import { DEFAULT_COMMENT_INSTRUCTIONS } from '../bot/comments';
++import { createSettingsOwner, offlineSettings, SettingsInputError } from './settings';
++import { createHostSettings } from './host-settings';
++import type { AdminServiceDeps } from './service';
++import type { HostSettings, SettingsAccess, SettingsSave, SettingsActionResult, SettingsView, ModelCatalog } from './settings-types';
++export function createSettingsService(deps: AdminServiceDeps): HostSettings {
++  const host = createHostSettings({
++    readonly: deps.readonlyPreview
++  });
++  const unavailable = (): SettingsAccess => deps.readonlyPreview ? {
++    kind: 'readonly',
++    reason: 'preview',
++    message: '预览模式不可编辑，请先启动 Host'
++  } : offlineSettings;
++  const owned = async (botId: string) => !deps.readonlyPreview && !!deps.executeWrite && (await deps.liveStatus?.(botId))?.running === true;
++  return {
++    async read(scope) {
++      if (scope.kind === 'host')
++        return host.read(scope);
++      if (deps.executeSettingsRead && await owned(scope.botId))
++        return await deps.executeSettingsRead(scope.botId, {
++          kind: 'settingsRead',
++          scope
++        }) as SettingsView;
++      const cfg = await loadConfig(botPaths(scope.botId).configFile);
++      if (!isComplete(cfg))
++        throw new SettingsInputError('机器人不存在或配置不完整');
++      const files = botPaths(scope.botId);
++      return createSettingsOwner({
++        cfg,
++        access: unavailable(),
++        backendFor: createBackend,
++        writePreferences: async () => {
++          throw new Error('只读');
++        },
++        evictLiveSessionsForChat: async () => {
++        },
++        readProject: async (name) => (await listProjectsIn(files.projectsFile)).find(p => p.name === name),
++        listProjects: () => listProjectsIn(files.projectsFile),
++        readSession: async (id) => (await listSessionsIn(files.sessionsFile)).find(s => s.threadId === id),
++        instructions: {
++          read: () => readFile(join(botDir(scope.botId), 'comment-instructions.md'), 'utf8').catch(error => {
++            if (error.code === 'ENOENT')
++              return DEFAULT_COMMENT_INSTRUCTIONS;
++            throw error;
++          }),
++          save: async () => {
++            throw new Error('只读');
++          },
++          sync: async () => {
++            throw new Error('只读');
++          },
++        },
++      }).read(scope);
++    },
++    async save(edit) {
++      if (edit.scope.kind === 'host')
++        return host.save(edit);
++      if (!await owned(edit.scope.botId))
++        return {
++          kind: 'unavailable',
++          reason: unavailable()
++        };
++      return await deps.executeWrite!(edit.scope.botId, {
++        kind: 'settingsPatch',
++        edit: edit as import('./settings-types').BotSettingsEdit
++      }) as SettingsSave;
++    },
++    async act(action) {
++      if (!await owned(action.botId))
++        return {
++          kind: 'unavailable',
++          reason: unavailable()
++        };
++      return await deps.executeWrite!(action.botId, {
++        kind: 'settingsAction',
++        action
++      }) as SettingsActionResult;
++    },
++    async models(query) {
++      if (!deps.executeSettingsRead || !await owned(query.botId))
++        return {
++          backend: query.backend,
++          models: [],
++          state: 'unavailable',
++          source: 'backend-provided',
++          observedAt: new Date().toISOString(),
++          error: 'Agent 未运行',
++          titleEfforts: []
++        };
++      return await deps.executeSettingsRead(query.botId, {
++        kind: 'settingsModels',
++        query
++      }) as ModelCatalog;
++    },
++  };
++}
+diff --git a/src/admin/settings-types.ts b/src/admin/settings-types.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7a32e28e137d5405027951df0697ffcd3b60006
+--- /dev/null
++++ b/src/admin/settings-types.ts
+@@ -0,0 +1,300 @@
++import type { ModelInfo, PermissionMode, ReasoningEffort } from '../agent/types';
++import type { ModelDisplayMode, PendingPolicy, ResolvedCliBridgePreferences, ResolvedCompletionReminderConfig } from '../config/schema';
++import type { VoiceAction, VoiceView } from '../voice/types';
++import type { CliHookStatus } from '../cli-bridge/types';
++export type SettingsScope = {
++  kind: 'host';
++} | {
++  kind: 'agent';
++  botId: string;
++} | {
++  kind: 'project';
++  botId: string;
++  projectName: string;
++} | {
++  kind: 'session';
++  botId: string;
++  threadId: string;
++};
++export type BotSettingsScope = Exclude<SettingsScope, {
++  kind: 'host';
++}>;
++export type ModelSelection = {
++  kind: 'default';
++} | {
++  kind: 'explicit';
++  model: string;
++  effort: ReasoningEffort;
++};
++export type TitlePolicy = {
++  enabled: false;
++} | {
++  enabled: true;
++  model: string;
++  effort: ReasoningEffort;
++};
++export interface AgentSections {
++  cards: {
++    showToolCalls: boolean;
++    showModel: ModelDisplayMode;
++  };
++  run: {
++    maxConcurrentRuns: number;
++    runIdleTimeoutSeconds: number;
++    pendingPolicy: PendingPolicy;
++  };
++  completion: ResolvedCompletionReminderConfig;
++  cliBridge: Omit<ResolvedCliBridgePreferences, 'enabled' | 'delivery' | 'includeBridgeOwnedSessionsForDebugging'>;
++  comments: {
++    backend: string;
++    selection: ModelSelection;
++  };
++  titles: {
++    byBackend: Record<string, TitlePolicy>;
++  };
++  paths: {
++    projectsRootDir: string | null;
++  };
++  access: {
++    allowedChats: string[];
++  };
++}
++export interface ProjectSections {
++  permission: {
++    mode: PermissionMode;
++    guestMode: PermissionMode;
++    network: boolean;
++  };
++  response: {
++    noMention: boolean;
++  };
++  compact: {
++    autoCompact: boolean;
++  };
++  model: {
++    selection: ModelSelection;
++  };
++}
++export interface SessionSections {
++  model: {
++    selection: ModelSelection;
++  };
++}
++export interface HostSections {
++  execution: {
++    codexBin: string | null;
++  };
++}
++export type SettingsAccess = {
++  kind: 'writable';
++} | {
++  kind: 'readonly';
++  reason: 'preview' | 'owner-offline' | 'unsupported-host' | 'stale';
++  message: string;
++};
++export interface ApplyEffect {
++  fields: string[];
++  when: 'next-message' | 'next-turn' | 'task-completion' | 'new-session' | 'new-comment' | 'new-project' | 'next-hook' | 'next-presence-check' | 'restart' | 'session-rebind' | 'immediate';
++  detail: string;
++}
++export interface SettingsSection<T> {
++  stored: T;
++  effective: T;
++  revision: string;
++  access: SettingsAccess;
++  apply: ApplyEffect[];
++}
++type Sections<M> = {
++  [K in keyof M]: SettingsSection<M[K]>;
++};
++export interface AgentSettingsView {
++  scope: Extract<SettingsScope, {
++    kind: 'agent';
++  }>;
++  sections: Sections<AgentSections>;
++  ownerOpenId: string | null;
++  administrators: {
++    openIds: string[];
++    revision: string;
++  };
++  voice: VoiceView;
++  cliRuntime: {
++    enabled: boolean;
++    running: boolean;
++    revision: string;
++    hooks: {
++      claude: CliHookStatus;
++      codex: CliHookStatus;
++    };
++    keepAwakeSupported: boolean;
++  };
++  commentInstructions: {
++    content: {
++      kind: 'default';
++      text: string;
++    } | {
++      kind: 'custom';
++      text: string;
++    };
++    revision: string;
++    maxEditLength: number;
++  };
++}
++export interface ProjectSettingsView {
++  scope: Extract<SettingsScope, {
++    kind: 'project';
++  }>;
++  sections: Sections<ProjectSections>;
++  identity: {
++    chatId: string;
++    backend: string;
++    cwd: string;
++    kind: string;
++  };
++  members: {
++    openIds: string[];
++    revision: string;
++  };
++}
++export interface SessionSettingsView {
++  scope: Extract<SettingsScope, {
++    kind: 'session';
++  }>;
++  sections: Sections<SessionSections>;
++  identity: {
++    backend: string;
++    sessionId: string;
++    chatId: string;
++    projectName: string | null;
++  };
++}
++export interface HostSettingsView {
++  scope: {
++    kind: 'host';
++  };
++  sections: Sections<HostSections>;
++  runtime: {
++    codexBin: string | null;
++    fallbackCwd: string;
++    platform: string;
++  };
++}
++export type SettingsView = AgentSettingsView | ProjectSettingsView | SessionSettingsView | HostSettingsView;
++type SectionEdit<S, M> = {
++  [K in keyof M]: {
++    scope: S;
++    section: K;
++    revision: string;
++    patch: Partial<M[K]>;
++  };
++}[keyof M];
++export type BotSettingsEdit = SectionEdit<AgentSettingsView['scope'], AgentSections> | SectionEdit<ProjectSettingsView['scope'], ProjectSections> | SectionEdit<SessionSettingsView['scope'], SessionSections>;
++export type SettingsEdit = BotSettingsEdit | SectionEdit<HostSettingsView['scope'], HostSections>;
++type SectionView<S, M> = {
++  [K in keyof M]: {
++    scope: S;
++    section: K;
++    value: SettingsSection<M[K]>;
++  };
++}[keyof M];
++export type SettingsSectionView = SectionView<AgentSettingsView['scope'], AgentSections> | SectionView<ProjectSettingsView['scope'], ProjectSections> | SectionView<SessionSettingsView['scope'], SessionSections> | SectionView<HostSettingsView['scope'], HostSections>;
++export interface SettingsFieldError {
++  field: string;
++  message: string;
++}
++export type SettingsSave = {
++  kind: 'saved';
++  section: SettingsSectionView;
++  effects: ApplyEffect[];
++} | {
++  kind: 'conflict';
++  current: SettingsSectionView;
++} | {
++  kind: 'rejected';
++  fields: SettingsFieldError[];
++} | {
++  kind: 'unavailable';
++  reason: SettingsAccess;
++};
++export type SettingsAction = {
++  kind: 'setCliBridgeEnabled';
++  botId: string;
++  enabled: boolean;
++  revision: string;
++} | {
++  kind: 'repairCliHooks';
++  botId: string;
++} | {
++  kind: 'voice';
++  botId: string;
++  action: VoiceAction;
++} | {
++  kind: 'adminMember';
++  botId: string;
++  openId: string;
++  membership: 'present' | 'absent';
++  revision: string;
++} | {
++  kind: 'projectMember';
++  botId: string;
++  projectName: string;
++  openId: string;
++  membership: 'present' | 'absent';
++  revision: string;
++} | {
++  kind: 'projectAudience';
++  botId: string;
++  projectName: string;
++  audience: 'all';
++  revision: string;
++} | {
++  kind: 'commentInstructions';
++  botId: string;
++  revision: string;
++  content: {
++    kind: 'custom';
++    text: string;
++  } | {
++    kind: 'default';
++  };
++};
++export type BotSettingsAction = SettingsAction;
++export type SettingsActionResult = {
++  kind: 'saved';
++  view: AgentSettingsView | ProjectSettingsView;
++  effects: ApplyEffect[];
++  warnings: string[];
++} | {
++  kind: 'conflict';
++  view: AgentSettingsView | ProjectSettingsView;
++} | {
++  kind: 'rejected';
++  fields: SettingsFieldError[];
++} | {
++  kind: 'unavailable';
++  reason: SettingsAccess;
++} | {
++  kind: 'diverged';
++  view: AgentSettingsView;
++  message: string;
++};
++export interface ModelQuery {
++  botId: string;
++  backend: string;
++  purpose: 'project' | 'session' | 'comments' | 'titles';
++}
++export interface ModelCatalog {
++  backend: string;
++  models: ModelInfo[];
++  state: 'ready' | 'fallback' | 'unavailable';
++  source: 'backend-provided';
++  observedAt: string;
++  error?: string;
++  titleEfforts: ReasoningEffort[];
++}
++export interface HostSettings {
++  read(scope: SettingsScope): Promise<SettingsView>;
++  save(edit: SettingsEdit): Promise<SettingsSave>;
++  models(query: ModelQuery): Promise<ModelCatalog>;
++  act(action: SettingsAction): Promise<SettingsActionResult>;
++}
+diff --git a/src/admin/settings.ts b/src/admin/settings.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..dac54abcd099d85916e1e6d30d90fc9da71e84ed
+--- /dev/null
++++ b/src/admin/settings.ts
+@@ -0,0 +1,780 @@
++import { createHash } from 'node:crypto';
++import { readFile } from 'node:fs/promises';
++import { DEFAULT_BACKEND_ID, type AgentBackend, type ReasoningEffort } from '../agent/types';
++import { backendIds } from '../agent';
++import { getCliBridgePreferences, getCompletionReminderConfig, getMaxConcurrentRuns, getModelDisplay, getPendingPolicy, getRunIdleTimeoutMs, getSessionTitleConfig, getSessionTitleEfforts, getShowToolCalls, resolveOwner, type AppConfig, type AppPreferences } from '../config/schema';
++import { paths } from '../config/paths';
++import { resolveProjectsRootDir } from '../project/lifecycle';
++import { defaultNoMention, effectiveGuestMode, effectiveMode, getProjectByName, listProjects, mutateProject, type Project } from '../project/registry';
++import { getSession, mutateSession, type SessionRecord } from '../bot/session-store';
++import { DEFAULT_COMMENT_INSTRUCTIONS, saveCommentInstructions, syncAllCommentInstructions } from '../bot/comments';
++import { inspectCliBridgeHooks, installCliBridgeHooks, resolveBridgeHookCommand } from '../cli-bridge/hooks';
++import { voiceView } from '../voice/view';
++import type { VoiceAction } from '../voice/types';
++import { probeBackends, type AppPreferencesWriter } from './ops';
++import { parseSettingsAction, parseSettingsEdit, SettingsInputError } from './settings-parse';
++import type * as T from './settings-types';
++export type * from './settings-types';
++export { parseSettingsAction, parseSettingsEdit, parseSettingsScope, parseModelQuery, SettingsInputError } from './settings-parse';
++export function settingsRevision(value: unknown): string {
++  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
++}
++const writable: T.SettingsAccess = {
++  kind: 'writable'
++};
++export const offlineSettings: T.SettingsAccess = {
++  kind: 'readonly',
++  reason: 'owner-offline',
++  message: '请先启动此 Agent，再编辑设置'
++};
++export interface SettingsOwnerDeps {
++  cfg: AppConfig;
++  writePreferences: AppPreferencesWriter;
++  backendFor: (id: string) => AgentBackend;
++  evictLiveSessionsForChat: (chatId: string) => Promise<void>;
++  voiceAction?: (action: VoiceAction) => Promise<void>;
++  refreshCompletionReminders?: () => void;
++  cliBridge?: {
++    start(): Promise<void>;
++    shutdown(): Promise<void>;
++    isRunning?(): boolean;
++  };
++  access?: T.SettingsAccess;
++  runningConcurrency?: number;
++  readProject?: typeof getProjectByName;
++  listProjects?: typeof listProjects;
++  readSession?: typeof getSession;
++  mutateProject?: typeof mutateProject;
++  mutateSession?: typeof mutateSession;
++  hooks?: {
++    inspect: typeof inspectCliBridgeHooks;
++    install: typeof installCliBridgeHooks;
++  };
++  instructions?: {
++    read(): Promise<string>;
++    save(text: string): Promise<void>;
++    sync(text: string): Promise<number>;
++  };
++}
++function effect(fields: string[], when: T.ApplyEffect['when'], detail: string): T.ApplyEffect[] {
++  return [{
++      fields,
++      when,
++      detail
++    }];
++}
++const agentEffects: {
++  [K in keyof T.AgentSections]: T.ApplyEffect[];
++} = {
++  cards: effect(['showToolCalls', 'showModel'], 'next-message', '后续任务卡片输出生效'),
++  run: [...effect(['maxConcurrentRuns'], 'restart', '已保存的并发上限在 Host 重启后生效'), ...effect(['pendingPolicy'], 'next-message', '下一条消息生效'), ...effect(['runIdleTimeoutSeconds'], 'next-turn', '下一次超时检测生效')],
++  completion: effect(['mode', 'longTaskMinutes'], 'task-completion', '任务结束时读取最新策略'),
++  cliBridge: [...effect(['agents', 'notifyScope', 'approval', 'taskCompletion', 'allowCache', 'keepAwake'], 'next-hook', '下一次适用的 hook 操作生效；已有等待保留原截止时间'), ...effect(['presence'], 'next-presence-check', '下一次在场检测生效')],
++  comments: effect(['backend', 'selection'], 'new-comment', '下一条评论使用新设置'),
++  titles: effect(['byBackend'], 'new-session', '仅影响之后由 Bridge 新建的会话'),
++  paths: effect(['projectsRootDir'], 'new-project', '仅影响之后新建的空白项目'),
++  access: effect(['allowedChats'], 'next-message', '下一条消息使用新权限'),
++};
++function selection(model?: string, effort?: ReasoningEffort): T.ModelSelection {
++  return model ? {
++    kind: 'explicit',
++    model,
++    effort: effort ?? 'medium'
++  } : {
++    kind: 'default'
++  };
++}
++function applySelection(target: {
++  model?: string;
++  effort?: ReasoningEffort;
++}, value: T.ModelSelection): void {
++  if (value.kind === 'default') {
++    delete target.model;
++    delete target.effort;
++  }
++  else {
++    target.model = value.model;
++    target.effort = value.effort;
++  }
++}
++function agentData(cfg: AppConfig): T.AgentSections {
++  const p = cfg.preferences ?? {};
++  const { enabled: _enabled, delivery: _delivery, includeBridgeOwnedSessionsForDebugging: _debug, ...cli } = getCliBridgePreferences(cfg);
++  const titles: Record<string, T.TitlePolicy> = {};
++  for (const id of new Set([...backendIds(), ...Object.keys(p.sessionTitles?.byBackend ?? {})]))
++    titles[id] = getSessionTitleConfig(cfg, id);
++  return {
++    cards: {
++      showToolCalls: getShowToolCalls(cfg),
++      showModel: getModelDisplay(cfg)
++    },
++    run: {
++      maxConcurrentRuns: getMaxConcurrentRuns(cfg),
++      pendingPolicy: getPendingPolicy(cfg),
++      runIdleTimeoutSeconds: (getRunIdleTimeoutMs(cfg) ?? 0) / 1000
++    },
++    completion: getCompletionReminderConfig(cfg),
++    cliBridge: cli,
++    comments: {
++      backend: p.comments?.backend ?? DEFAULT_BACKEND_ID,
++      selection: selection(p.comments?.model, p.comments?.effort)
++    },
++    titles: {
++      byBackend: titles
++    },
++    paths: {
++      projectsRootDir: p.projectsRootDir ?? null
++    },
++    access: {
++      allowedChats: [...(p.access?.allowedChats ?? [])]
++    },
++  };
++}
++function agentRaw(p: AppPreferences, section: keyof T.AgentSections): unknown {
++  switch (section) {
++    case 'cards': return [p.showToolCalls, p.showModel];
++    case 'run': return [p.maxConcurrentRuns, p.runIdleTimeoutSeconds, p.pendingPolicy];
++    case 'completion': return [p.completionReminder?.mode, p.completionReminder?.longTaskMinutes];
++    case 'cliBridge': {
++      const c = p.cliBridge;
++      return [c?.agents?.claude, c?.agents?.codex, c?.notifyScope, c?.keepAwake?.enabled, c?.approval?.enabled, c?.approval?.timeoutSeconds, c?.taskCompletion?.enabled, c?.taskCompletion?.replyEnabled, c?.taskCompletion?.replyTimeoutSeconds, c?.allowCache?.enabled, c?.allowCache?.scope, c?.presence?.enabled, c?.presence?.platform, c?.presence?.idleThresholdSeconds];
++    }
++    case 'comments': return [p.comments?.backend, p.comments?.model, p.comments?.effort];
++    case 'titles': return Object.entries(p.sessionTitles?.byBackend ?? {}).sort(([a], [b]) => a.localeCompare(b)).map(([id, v]) => [id, v?.enabled, v?.model, v?.effort]);
++    case 'paths': return p.projectsRootDir ?? null;
++    case 'access': return p.access?.allowedChats ?? [];
++  }
++}
++function projectData(p: Project): T.ProjectSections {
++  return {
++    permission: {
++      mode: effectiveMode(p),
++      guestMode: effectiveGuestMode(p),
++      network: p.network ?? false
++    },
++    response: {
++      noMention: p.noMention ?? defaultNoMention(p)
++    },
++    compact: {
++      autoCompact: p.autoCompact ?? true
++    },
++    model: {
++      selection: selection(p.defaultModel, p.defaultEffort)
++    }
++  };
++}
++function projectRaw(p: Project, section: keyof T.ProjectSections): unknown {
++  const data = section === 'permission' ? [p.mode, p.guestMode, p.network] : section === 'response' ? p.noMention : section === 'compact' ? p.autoCompact : [p.defaultModel, p.defaultEffort];
++  return [p.name, p.chatId, p.cwd, p.backend, data];
++}
++function sessionRaw(s: SessionRecord): unknown {
++  return [s.threadId, s.backend, s.sessionId, s.chatId, s.model, s.effort];
++}
++function makeSection<V>(stored: V, raw: unknown, access: T.SettingsAccess, apply: T.ApplyEffect[], effective = stored): T.SettingsSection<V> {
++  return {
++    stored,
++    effective,
++    revision: settingsRevision(raw),
++    access,
++    apply
++  };
++}
++class Conflict extends Error {
++}
++function check(actual: unknown, revision: string): void {
++  if (settingsRevision(actual) !== revision)
++    throw new Conflict();
++}
++function rejected(error: unknown): {
++  kind: 'rejected';
++  fields: T.SettingsFieldError[];
++} {
++  return {
++    kind: 'rejected',
++    fields: [{
++        field: 'settings',
++        message: error instanceof SettingsInputError ? error.message : '保存失败，请刷新设置后重试；若配置被其他进程修改，请重启 Host'
++      }]
++  };
++}
++export function createSettingsOwner(deps: SettingsOwnerDeps): T.HostSettings {
++  const cfg = deps.cfg;
++  const botId = cfg.accounts.app.id;
++  const access = deps.access ?? writable;
++  const runningConcurrency = deps.runningConcurrency ?? getMaxConcurrentRuns(cfg);
++  const readProject = deps.readProject ?? getProjectByName;
++  const readSession = deps.readSession ?? getSession;
++  const changeProject = deps.mutateProject ?? mutateProject;
++  const changeSession = deps.mutateSession ?? mutateSession;
++  const hooks = deps.hooks ?? {
++    inspect: inspectCliBridgeHooks,
++    install: installCliBridgeHooks
++  };
++  const instructions = deps.instructions ?? {
++    read: () => readFile(paths.commentInstructionsFile, 'utf8').catch(error => {
++      if (error.code === 'ENOENT')
++        return DEFAULT_COMMENT_INSTRUCTIONS;
++      throw error;
++    }),
++    save: (text: string) => saveCommentInstructions(paths.commentInstructionsFile, text),
++    sync: (text: string) => syncAllCommentInstructions(paths.commentsRootDir, text, cfg.accounts.app.tenant),
++  };
++  let cliRunning = getCliBridgePreferences(cfg).enabled && access.kind === 'writable';
++  let actionChain: Promise<unknown> = Promise.resolve();
++  const own = (scope: T.SettingsScope) => {
++    if (scope.kind === 'host' || scope.botId !== botId)
++      throw new SettingsInputError('设置不属于此 Agent');
++  };
++  async function models(query: T.ModelQuery): Promise<T.ModelCatalog> {
++    own({
++      kind: 'agent',
++      botId: query.botId
++    });
++    const base = {
++      backend: query.backend,
++      source: 'backend-provided' as const,
++      observedAt: new Date().toISOString(),
++      titleEfforts: [...getSessionTitleEfforts(query.backend)]
++    };
++    if (!backendIds().includes(query.backend))
++      return {
++        ...base,
++        models: [],
++        state: 'unavailable',
++        error: '未知后端'
++      };
++    try {
++      const backend = deps.backendFor(query.backend);
++      const [status] = await probeBackends([backend]);
++      if (!status?.probe?.ok)
++        return {
++          ...base,
++          models: [],
++          state: 'unavailable',
++          error: '后端当前不可用，请检查安装或登录状态'
++        };
++      return {
++        ...base,
++        models: await backend.listModels(),
++        state: 'fallback'
++      };
++    }
++    catch {
++      return {
++        ...base,
++        models: [],
++        state: 'unavailable',
++        error: '后端模型列表暂时不可用'
++      };
++    }
++  }
++  async function validateSelection(backend: string, value: T.ModelSelection): Promise<void> {
++    if (!backendIds().includes(backend))
++      throw new SettingsInputError('未知后端');
++    if (value.kind === 'default')
++      return;
++    const catalog = await models({
++      botId,
++      backend,
++      purpose: 'project'
++    });
++    const model = catalog.models.find(item => item.id === value.model);
++    if (!model || model.hidden || !model.supportedEfforts.includes(value.effort))
++      throw new SettingsInputError('模型或推理强度不在当前后端支持列表中，请刷新模型列表');
++  }
++  async function effectiveSelection(backend: string, model?: string, effort?: ReasoningEffort): Promise<T.ModelSelection> {
++    if (access.kind !== 'writable')
++      return selection(model, effort);
++    const catalog = await models({
++      botId,
++      backend,
++      purpose: 'project'
++    });
++    const preferred = model ? catalog.models.find(item => item.id === model && !item.hidden) : undefined;
++    const chosen = preferred ?? catalog.models.find(item => item.isDefault && !item.hidden) ?? catalog.models.find(item => !item.hidden);
++    if (!chosen)
++      return selection(model, effort);
++    return {
++      kind: 'explicit',
++      model: chosen.id,
++      effort: preferred && effort && preferred.supportedEfforts.includes(effort) ? effort : chosen.defaultEffort
++    };
++  }
++  async function read(scope: T.SettingsScope): Promise<T.SettingsView> {
++    own(scope);
++    if (scope.kind === 'agent') {
++      const data = agentData(cfg);
++      const sections = Object.fromEntries(Object.entries(data).map(([key, value]) => [key, makeSection(value, [botId, agentRaw(cfg.preferences ?? {}, key as keyof T.AgentSections)], access, agentEffects[key as keyof T.AgentSections])])) as T.AgentSettingsView['sections'];
++      sections.paths.effective = {
++        projectsRootDir: resolveProjectsRootDir(cfg.preferences?.projectsRootDir)
++      };
++      sections.comments.effective = {
++        backend: data.comments.backend,
++        selection: await effectiveSelection(data.comments.backend, cfg.preferences?.comments?.model, cfg.preferences?.comments?.effort)
++      };
++      sections.run.effective = {
++        ...sections.run.stored,
++        maxConcurrentRuns: runningConcurrency
++      };
++      const text = await instructions.read();
++      return {
++        scope,
++        sections,
++        ownerOpenId: resolveOwner(cfg) ?? null,
++        administrators: {
++          openIds: [...(cfg.preferences?.access?.admins ?? [])],
++          revision: settingsRevision([botId, resolveOwner(cfg), cfg.preferences?.access?.admins ?? []])
++        },
++        voice: voiceView(cfg),
++        cliRuntime: {
++          enabled: getCliBridgePreferences(cfg).enabled,
++          running: deps.cliBridge?.isRunning?.() ?? cliRunning,
++          revision: settingsRevision([botId, cfg.preferences?.cliBridge?.enabled]),
++          hooks: await hooks.inspect().catch(() => ({
++            claude: {
++              agent: 'claude' as const,
++              status: 'needs_repair' as const,
++              details: ['读取 hook 状态失败，请重试']
++            },
++            codex: {
++              agent: 'codex' as const,
++              status: 'needs_repair' as const,
++              details: ['读取 hook 状态失败，请重试']
++            }
++          })),
++          keepAwakeSupported: process.platform === 'darwin'
++        },
++        commentInstructions: {
++          content: text === DEFAULT_COMMENT_INSTRUCTIONS ? {
++            kind: 'default',
++            text
++          } : {
++            kind: 'custom',
++            text
++          },
++          revision: settingsRevision([botId, text]),
++          maxEditLength: 30000
++        }
++      };
++    }
++    if (scope.kind === 'project') {
++      const p = await readProject(scope.projectName);
++      if (!p)
++        throw new SettingsInputError('项目不存在');
++      const data = projectData(p);
++      const sections = Object.fromEntries(Object.entries(data).map(([key, value]) => [key, makeSection(value, [botId, projectRaw(p, key as keyof T.ProjectSections)], access, effect(Object.keys(value), key === 'model' ? 'new-session' : key === 'permission' || key === 'compact' ? 'session-rebind' : 'next-message', key === 'model' ? '仅新会话使用项目默认模型' : '下一条消息生效'))])) as T.ProjectSettingsView['sections'];
++      sections.model.effective = {
++        selection: await effectiveSelection(p.backend ?? DEFAULT_BACKEND_ID, p.defaultModel, p.defaultEffort)
++      };
++      return {
++        scope,
++        sections,
++        identity: {
++          chatId: p.chatId,
++          backend: p.backend ?? DEFAULT_BACKEND_ID,
++          cwd: p.cwd,
++          kind: p.kind ?? 'multi'
++        },
++        members: {
++          openIds: [...(p.allowedUsers ?? [])],
++          revision: settingsRevision([botId, p.name, p.chatId, p.allowedUsers ?? []])
++        }
++      };
++    }
++    if (scope.kind === 'session') {
++      const s = await readSession(scope.threadId);
++      if (!s)
++        throw new SettingsInputError('会话不存在或已被删除');
++      const project = (await (deps.listProjects ?? listProjects)()).find(p => p.chatId === s.chatId);
++      return {
++        scope,
++        sections: {
++          model: makeSection({
++            selection: selection(s.model, s.effort)
++          }, [botId, sessionRaw(s)], access, effect(['selection'], 'next-turn', '下一轮对话使用新模型'))
++        },
++        identity: {
++          backend: s.backend,
++          sessionId: s.sessionId,
++          chatId: s.chatId,
++          projectName: project?.name ?? null
++        }
++      };
++    }
++    throw new SettingsInputError('安装设置由 Host 管理');
++  }
++  async function sectionView(edit: T.BotSettingsEdit): Promise<T.SettingsSectionView> {
++    const view = await read(edit.scope);
++    if (view.scope.kind !== edit.scope.kind || !(edit.section in view.sections))
++      throw new SettingsInputError('无效设置分区');
++    return {
++      scope: edit.scope,
++      section: edit.section,
++      value: view.sections[edit.section as keyof typeof view.sections]
++    } as T.SettingsSectionView;
++  }
++  async function save(input: T.SettingsEdit): Promise<T.SettingsSave> {
++    const parsed = parseSettingsEdit(input);
++    own(parsed.scope);
++    if (access.kind !== 'writable')
++      return {
++        kind: 'unavailable',
++        reason: access
++      };
++    if (parsed.scope.kind === 'host')
++      throw new SettingsInputError('安装设置由 Host 管理');
++    const edit = parsed as T.BotSettingsEdit;
++    let additionalEffects: T.ApplyEffect[] = [];
++    try {
++      if (edit.scope.kind === 'agent') {
++        const e = edit as Extract<T.BotSettingsEdit, {
++          section: keyof T.AgentSections;
++        }>;
++        await deps.writePreferences(async (p) => {
++          check([botId, agentRaw(p, e.section as keyof T.AgentSections)], e.revision);
++          switch (e.section) {
++            case 'cards':
++              Object.assign(p, e.patch);
++              break;
++            case 'run':
++              Object.assign(p, e.patch);
++              break;
++            case 'completion':
++              p.completionReminder = {
++                ...p.completionReminder,
++                ...e.patch
++              };
++              break;
++            case 'cliBridge': {
++              const patch = e.patch;
++              const c = {
++                ...p.cliBridge
++              };
++              if (patch.notifyScope !== undefined)
++                c.notifyScope = patch.notifyScope;
++              if (patch.agents)
++                c.agents = {
++                  ...c.agents,
++                  ...patch.agents
++                };
++              if (patch.keepAwake)
++                c.keepAwake = {
++                  ...c.keepAwake,
++                  ...patch.keepAwake
++                };
++              if (patch.approval)
++                c.approval = {
++                  ...c.approval,
++                  ...patch.approval
++                };
++              if (patch.taskCompletion)
++                c.taskCompletion = {
++                  ...c.taskCompletion,
++                  ...patch.taskCompletion
++                };
++              if (patch.allowCache)
++                c.allowCache = {
++                  ...c.allowCache,
++                  ...patch.allowCache
++                };
++              if (patch.presence)
++                c.presence = {
++                  ...c.presence,
++                  ...patch.presence
++                };
++              p.cliBridge = c;
++              break;
++            }
++            case 'comments': {
++              const backend = e.patch.backend ?? p.comments?.backend ?? DEFAULT_BACKEND_ID;
++              const choice = e.patch.selection ?? selection(p.comments?.model, p.comments?.effort);
++              await validateSelection(backend, choice);
++              p.comments = {
++                ...p.comments,
++                backend
++              };
++              applySelection(p.comments, choice);
++              break;
++            }
++            case 'titles': {
++              const [entry] = Object.entries(e.patch.byBackend ?? {});
++              if (!entry)
++                throw new SettingsInputError('请选择一个后端');
++              const [id, policy] = entry;
++              if (!backendIds().includes(id) || policy.enabled && !getSessionTitleEfforts(id).includes(policy.effort))
++                throw new SettingsInputError('标题后端或推理强度无效');
++              p.sessionTitles = {
++                ...p.sessionTitles,
++                byBackend: {
++                  ...p.sessionTitles?.byBackend,
++                  [id]: {
++                    ...p.sessionTitles?.byBackend?.[id],
++                    ...policy
++                  }
++                }
++              };
++              break;
++            }
++            case 'paths':
++              if (e.patch.projectsRootDir === null)
++                delete p.projectsRootDir;
++              else if (e.patch.projectsRootDir !== undefined)
++                p.projectsRootDir = e.patch.projectsRootDir;
++              break;
++            case 'access':
++              p.access = {
++                ...p.access,
++                ...e.patch
++              };
++              break;
++            default: throw new SettingsInputError('无效 Agent 设置');
++          }
++        });
++        if (e.section === 'completion')
++          deps.refreshCompletionReminders?.();
++      }
++      else if (edit.scope.kind === 'project') {
++        const e = edit as Extract<T.BotSettingsEdit, {
++          scope: T.ProjectSettingsView['scope'];
++        }>;
++        const p = await changeProject(e.scope.projectName, async (p) => {
++          check([botId, projectRaw(p, e.section)], e.revision);
++          switch (e.section) {
++            case 'permission': {
++              const next = {
++                ...p,
++                ...e.patch
++              };
++              const supported = deps.backendFor(p.backend ?? DEFAULT_BACKEND_ID).supportedModes;
++              if (supported && (!supported.includes(effectiveMode(next)) || !supported.includes(effectiveGuestMode(next))))
++                throw new SettingsInputError('后端不支持此权限档位');
++              Object.assign(p, e.patch);
++              break;
++            }
++            case 'response':
++              Object.assign(p, e.patch);
++              break;
++            case 'compact':
++              Object.assign(p, e.patch);
++              break;
++            case 'model': {
++              if (!e.patch.selection)
++                throw new SettingsInputError('缺少模型选择');
++              await validateSelection(p.backend ?? DEFAULT_BACKEND_ID, e.patch.selection);
++              if (e.patch.selection.kind === 'default') {
++                delete p.defaultModel;
++                delete p.defaultEffort;
++              }
++              else {
++                p.defaultModel = e.patch.selection.model;
++                p.defaultEffort = e.patch.selection.effort;
++              }
++            }
++          }
++        });
++        if (e.section === 'permission' || e.section === 'compact') {
++          try {
++            await deps.evictLiveSessionsForChat(p.chatId);
++          }
++          catch {
++            additionalEffects = effect([e.section], 'restart', '设置已保存，但活跃会话重新绑定失败。请重启 Host 使权限或压缩设置生效');
++          }
++        }
++      }
++      else {
++        const e = edit as Extract<T.BotSettingsEdit, {
++          scope: T.SessionSettingsView['scope'];
++        }>;
++        await changeSession(e.scope.threadId, async (s) => {
++          check([botId, sessionRaw(s)], e.revision);
++          if (!e.patch.selection)
++            throw new SettingsInputError('缺少模型选择');
++          await validateSelection(s.backend, e.patch.selection);
++          applySelection(s, e.patch.selection);
++        });
++      }
++      const section = await sectionView(edit);
++      return {
++        kind: 'saved',
++        section,
++        effects: [...section.value.apply.filter(item => item.fields.some(field => Object.hasOwn(edit.patch, field))), ...additionalEffects]
++      };
++    }
++    catch (error) {
++      if (error instanceof Conflict)
++        return {
++          kind: 'conflict',
++          current: await sectionView(edit)
++        };
++      return rejected(error);
++    }
++  }
++  async function performAction(action: T.SettingsAction): Promise<T.SettingsActionResult> {
++    own({
++      kind: 'agent',
++      botId: action.botId
++    });
++    if (access.kind !== 'writable')
++      return {
++        kind: 'unavailable',
++        reason: access
++      };
++    const scope: T.AgentSettingsView['scope'] | T.ProjectSettingsView['scope'] = action.kind === 'projectMember' || action.kind === 'projectAudience' ? {
++      kind: 'project',
++      botId,
++      projectName: action.projectName
++    } : {
++      kind: 'agent',
++      botId
++    };
++    const actionView = async () => await read(scope) as T.AgentSettingsView | T.ProjectSettingsView;
++    const warnings: string[] = [];
++    try {
++      switch (action.kind) {
++        case 'voice':
++          if (!deps.voiceAction)
++            return {
++              kind: 'unavailable',
++              reason: offlineSettings
++            };
++          await deps.voiceAction(action.action);
++          break;
++        case 'repairCliHooks':
++          for (const agent of ['claude', 'codex'] as const) {
++            try {
++              await hooks.install({
++                command: resolveBridgeHookCommand(botId),
++                agents: {
++                  claude: agent === 'claude',
++                  codex: agent === 'codex'
++                }
++              });
++            }
++            catch {
++              warnings.push(`${agent} hooks 修复失败，请查看状态并重试`);
++            }
++          }
++          break;
++        case 'setCliBridgeEnabled': {
++          if (!deps.cliBridge)
++            return {
++              kind: 'unavailable',
++              reason: offlineSettings
++            };
++          const previous = deps.cliBridge.isRunning?.() ?? cliRunning;
++          let changed = false;
++          try {
++            await deps.writePreferences(async (p) => {
++              if (getCliBridgePreferences(cfg).enabled !== action.enabled || previous !== action.enabled)
++                check([botId, p.cliBridge?.enabled], action.revision);
++              if (action.enabled && !resolveOwner(cfg))
++                throw new SettingsInputError('请先配置不可变的机器人所有者');
++              if (previous !== action.enabled) {
++                if (action.enabled)
++                  await deps.cliBridge!.start();
++                else
++                  await deps.cliBridge!.shutdown();
++                cliRunning = action.enabled;
++                changed = true;
++              }
++              p.cliBridge = {
++                ...p.cliBridge,
++                enabled: action.enabled
++              };
++            });
++          }
++          catch (error) {
++            if (changed) {
++              try {
++                if (previous)
++                  await deps.cliBridge.start();
++                else
++                  await deps.cliBridge.shutdown();
++                cliRunning = previous;
++              }
++              catch {
++                return {
++                  kind: 'diverged',
++                  view: await read({
++                    kind: 'agent',
++                    botId
++                  }) as T.AgentSettingsView,
++                  message: '配置保存失败，运行状态补偿也失败。请重启 Host 使运行状态与已保存配置一致'
++                };
++              }
++            }
++            throw error;
++          }
++          break;
++        }
++        case 'adminMember':
++          await deps.writePreferences(p => {
++            check([botId, resolveOwner(cfg), p.access?.admins ?? []], action.revision);
++            if (action.openId === resolveOwner(cfg) && action.membership === 'absent')
++              throw new SettingsInputError('所有者不可移除');
++            const admins = new Set(p.access?.admins ?? []);
++            if (action.membership === 'present')
++              admins.add(action.openId);
++            else
++              admins.delete(action.openId);
++            p.access = {
++              ...p.access,
++              admins: [...admins]
++            };
++          });
++          break;
++        case 'projectAudience':
++        case 'projectMember':
++          await changeProject(action.projectName, p => {
++            check([botId, p.name, p.chatId, p.allowedUsers ?? []], action.revision);
++            const members = new Set(p.allowedUsers ?? []);
++            if (action.kind === 'projectAudience')
++              members.clear();
++            else if (action.membership === 'present')
++              members.add(action.openId);
++            else
++              members.delete(action.openId);
++            p.allowedUsers = [...members];
++          });
++          break;
++        case 'commentInstructions': {
++          const current = await instructions.read();
++          check([botId, current], action.revision);
++          const text = action.content.kind === 'default' ? DEFAULT_COMMENT_INSTRUCTIONS : action.content.text;
++          await instructions.save(text);
++          try {
++            await instructions.sync(text);
++          }
++          catch {
++            warnings.push('回复规则已保存，但部分历史评论目录同步失败。可再次保存重试；新评论仍使用新规则');
++          }
++        }
++      }
++      return {
++        kind: 'saved',
++        view: await actionView(),
++        effects: effect([], action.kind === 'commentInstructions' ? 'new-comment' : 'immediate', '设置已保存'),
++        warnings
++      };
++    }
++    catch (error) {
++      if (error instanceof Conflict)
++        return {
++          kind: 'conflict',
++          view: await actionView()
++        };
++      return rejected(error);
++    }
++  }
++  return {
++    read,
++    save,
++    models,
++    act(input) {
++      const action = parseSettingsAction(input);
++      const result = actionChain.then(() => performAction(action));
++      actionChain = result.then(() => undefined, () => undefined);
++      return result;
++    }
++  };
++}
+diff --git a/src/bot/bridge.ts b/src/bot/bridge.ts
+index 26d9ad1b70ac187bce6bd14cc6c813b459caed4d..6baff150be849923637ba062b91431cb1a19a94a 100644
+--- a/src/bot/bridge.ts
++++ b/src/bot/bridge.ts
+@@ -1,3 +1,5 @@
++import type { HostSettings } from '../admin/settings-types';
++import type { AdminWriteResult } from '../admin/ops';
+ import { createGroupExecutor, type AdminGroupOp, type JoinedGroups } from '../admin/groups';
+ import type { Project } from '../project/registry';
+ import { createLarkChannel, Domain, type LarkChannel } from '@larksuiteoapi/node-sdk';
+@@ -37,7 +39,8 @@ export interface BridgeHandle {
+   /** 管理面写操作（Web 控制台 / supervisor IPC）：进程内执行，与 DM 卡片回调
+    * 同一套共享逻辑（admin/ops.ts）；校验拒绝抛 AdminWriteError。 */
+   adminGroups: (op: AdminGroupOp) => Promise<JoinedGroups | Project>;
+-  adminExecute: (op: AdminWriteOp) => Promise<void>;
++  adminExecute: (op: AdminWriteOp) => Promise<AdminWriteResult>;
++  settings: HostSettings;
+   /** Graceful teardown: close every codex session (no orphan app-servers) then
+    *  drop the long connection. Idempotent enough for a signal handler. */
+   shutdown: () => Promise<void>;
+@@ -161,5 +164,5 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
+     await cliBridge.shutdown().catch((err) => log.fail('cli-bridge', err, { phase: 'shutdown' }));
+     await channel.disconnect().catch((err) => log.fail('ws', err, { phase: 'disconnect' }));
+   };
+-  return { channel, adminGroups: createGroupExecutor(channel), adminExecute: orchestrator.adminExecute, shutdown };
++  return { channel, adminGroups: createGroupExecutor(channel), adminExecute: orchestrator.adminExecute, settings: orchestrator.settings, shutdown };
+ }
+diff --git a/src/bot/comments.ts b/src/bot/comments.ts
+index a598554f31d5abea847dbd21356412c18492f6e0..1aa6a77c076efb9f24b0ee7801c4763780ceee1a 100644
+--- a/src/bot/comments.ts
++++ b/src/bot/comments.ts
+@@ -1,4 +1,5 @@
+-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
++import { mkdir, readdir, readFile, writeFile, rename, rm } from 'node:fs/promises';
++import { randomUUID } from 'node:crypto';
+ import { dirname, join } from 'node:path';
+ import type { CommentEvent, LarkChannel } from '@larksuiteoapi/node-sdk';
+ import type { TenantBrand } from '../config/schema';
+@@ -319,7 +320,9 @@ export async function syncCommentInstructions(cwd: string, instructions: string)
+  * Creates the parent dir if needed. The caller then re-syncs all comment dirs. */
+ export async function saveCommentInstructions(masterFile: string, content: string): Promise<void> {
+   await mkdir(dirname(masterFile), { recursive: true });
+-  await writeFile(masterFile, content, 'utf8');
++  const temporary = `${masterFile}.tmp-${randomUUID()}`;
++  try { await writeFile(temporary, content, { encoding: 'utf8', mode: 0o600 }); await rename(temporary, masterFile); }
++  finally { await rm(temporary, { force: true }).catch(() => undefined); }
+ }
+ 
+ /** Substitute the doc-level variables ({fileType}/{fileToken}/{docUrl}) in the
+@@ -353,8 +356,9 @@ export async function syncAllCommentInstructions(
+   rawTemplate: string,
+   tenant: TenantBrand,
+ ): Promise<number> {
+-  const entries = await readdir(projectsRoot, { withFileTypes: true }).catch(() => []);
++  const entries = await readdir(projectsRoot, { withFileTypes: true }).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
+   let synced = 0;
++  let failed = 0;
+   for (const e of entries) {
+     if (!e.isDirectory() || !e.name.startsWith('comment-')) continue;
+     const m = /^comment-([a-z]+)-(.+)$/.exec(e.name);
+@@ -362,9 +366,9 @@ export async function syncAllCommentInstructions(
+     const fileToken = m?.[2];
+     if (!fileType || !fileToken) continue;
+     const rendered = renderCommentInstructions(rawTemplate, tenant, fileType, fileToken);
+-    await syncCommentInstructions(join(projectsRoot, e.name), rendered).catch(() => undefined);
+-    synced++;
++    try { await syncCommentInstructions(join(projectsRoot, e.name), rendered); synced++; } catch { failed++; }
+   }
++  if (failed) throw new Error(`回复规则已保存，${failed} 个历史目录同步失败，${synced} 个已同步`);
+   return synced;
+ }
+ 
+diff --git a/src/bot/handle-message.ts b/src/bot/handle-message.ts
+index bc911972d6ffbd4746e6e91d43d8a9c36f6e26c2..33a3ce37dd38802e24f31972e9bbc25a1895129b 100644
+--- a/src/bot/handle-message.ts
++++ b/src/bot/handle-message.ts
+@@ -1,3 +1,6 @@
++import { createSettingsOwner, settingsRevision } from '../admin/settings';
++import type { HostSettings } from '../admin/settings-types';
++import type { AdminWriteResult } from '../admin/ops';
+ import { registerVoiceConsole } from './voice-console';
+ import { createVoiceService } from '../voice/service';
+ import { ingestVoice, createIntakeQueue, type IngestedContext } from '../voice/inbound';
+@@ -149,7 +152,7 @@ import {
+   type DoctorInfo,
+ } from '../card/dm-cards';
+ import { cliBridgeSettingsSection, CLI } from '../cli-bridge/cards';
+-import { inspectCliBridgeHooks, installCliBridgeHooks, resolveBridgeHookCommand } from '../cli-bridge/hooks';
++import { inspectCliBridgeHooks } from '../cli-bridge/hooks';
+ import type { CliBridgeRuntimeHooks } from '../cli-bridge/service';
+ export type { CliBridgeRuntimeHooks };
+ import {
+@@ -242,10 +245,8 @@ import {
+   renderCommentInstructions,
+   REPLY_MAX_CHARS,
+   resolveComment,
+-  saveCommentInstructions,
+   stripMarkdown,
+   SUPPORTED_FILE_TYPES,
+-  syncAllCommentInstructions,
+   syncCommentInstructions,
+ } from './comments';
+ import { createGracefulInterrupt, Semaphore, withIdleTimeout } from './watchdog';
+@@ -522,7 +523,8 @@ export interface Orchestrator {
+   /** 进程内管理写面（Web 控制台 / supervisor IPC 共用）：四个写操作走与 DM
+    * 卡片回调完全同一套共享函数（admin/ops.ts），含同样的校验与活跃会话驱逐；
+    * 校验拒绝抛 AdminWriteError（HTTP 409 / IPC code 还原）。 */
+-  adminExecute: (op: AdminWriteOp) => Promise<void>;
++  adminExecute: (op: AdminWriteOp) => Promise<AdminWriteResult>;
++  settings: HostSettings;
+   /** Close every live codex session (SIGKILLs the app-server children) so a
+    *  graceful exit leaves no orphan processes. */
+   shutdown: () => Promise<void>;
+@@ -2493,39 +2495,15 @@ export function createOrchestrator(
+     return saved;
+   }
+ 
+-  // CLI service state and its persisted enabled flag are one transition. Keep
+-  // rapid on/off clicks ordered; if persistence fails after the side effect,
+-  // compensate back to the last committed config so runtime and disk agree.
+-  let cliEnabledTransition: Promise<unknown> = Promise.resolve();
++  let cardCliTransitions: Promise<unknown> = Promise.resolve();
+   function setCliBridgeEnabled(evt: CardActionEvent, enabled: boolean): Promise<void> {
+-    const run = cliEnabledTransition.then(async () => {
+-      if (getCliBridgePreferences(cfg).enabled === enabled) return;
+-      try {
+-        if (enabled) await cliBridge?.start?.();
+-        else await cliBridge?.shutdown?.();
+-
+-        const saved = await applyPref(
+-          evt,
+-          (p) => {
+-            p.cliBridge = { ...(p.cliBridge ?? {}), enabled };
+-          },
+-          { render: false },
+-        );
+-        if (!saved) {
+-          // Best-effort rollback of the runtime side effect. The persisted and
+-          // LIVE config deliberately stayed unchanged on write failure.
+-          if (enabled) await cliBridge?.shutdown?.();
+-          else await cliBridge?.start?.();
+-        }
+-      } catch (err) {
+-        log.fail('cli-bridge', err, { phase: enabled ? 'enable' : 'disable' });
+-      }
+-    });
+-    cliEnabledTransition = run.then(
+-      () => undefined,
+-      () => undefined,
+-    );
+-    return run;
++    if (!dmAdmin(evt.operator?.openId)) return Promise.resolve();
++    const next = cardCliTransitions.then(async () => {
++      const result = await settings.act({ kind: 'setCliBridgeEnabled', botId: cfg.accounts.app.id, enabled, revision: settingsRevision([cfg.accounts.app.id, cfg.preferences?.cliBridge?.enabled]) });
++      if (result.kind !== 'saved') log.info('cli-bridge', 'settings-transition-failed', { result: result.kind });
++    }).catch(() => { log.info('cli-bridge', 'settings-transition-failed'); });
++    cardCliTransitions = next;
++    return next;
+   }
+ 
+   // 「☕ 咖啡一下」那组控件现在独立成二级卡（buildCoffeeSettingsCard），主设置卡只放入口。
+@@ -2639,7 +2617,7 @@ export function createOrchestrator(
+       const current = prefs.sessionTitles ?? {};
+       prefs.sessionTitles = {
+         ...current,
+-        byBackend: { ...(current.byBackend ?? {}), [backendId]: config },
++        byBackend: { ...(current.byBackend ?? {}), [backendId]: { ...current.byBackend?.[backendId], ...config } },
+       };
+     }).then(
+       () => true,
+@@ -2659,6 +2637,18 @@ export function createOrchestrator(
+     }
+   }
+ 
++  async function saveCommentRulesFromCard(evt: CardActionEvent, content: { kind: 'custom'; text: string } | { kind: 'default' }): Promise<void> {
++    try {
++      const view = await settings.read({ kind: 'agent', botId: cfg.accounts.app.id });
++      if (!('commentInstructions' in view)) return;
++      const result = await settings.act({ kind: 'commentInstructions', botId: cfg.accounts.app.id, revision: view.commentInstructions.revision, content });
++      const notice = result.kind === 'saved' ? result.warnings.join('；') || '✅ 回复规则已保存并同步，下一条评论生效。' : '⚠️ 保存失败或规则已被修改，请刷新后重试。';
++      sendFreshSettingsResult(evt, () => buildCommentPromptCard(content.kind === 'custom' ? content.text : DEFAULT_COMMENT_INSTRUCTIONS, notice, paths.commentInstructionsFile), 'comment-prompt-result');
++    } catch {
++      sendFreshSettingsResult(evt, () => buildCommentPromptCard(content.kind === 'custom' ? content.text : DEFAULT_COMMENT_INSTRUCTIONS, '⚠️ 回复规则不能为空或过长，未保存。', paths.commentInstructionsFile), 'comment-prompt-validation');
++    }
++  }
++
+   // ── 📝 云文档评论 @bot 全局设置（DM「⚙️ 设置 → 📝 云文档评论」）───────────
+   /** Installed backends offered for the comment flow (codex always; others when
+    * downloaded) — same gate as the project backend picker. */
+@@ -2966,30 +2956,16 @@ export function createOrchestrator(
+     .on(DM.coffeeSettings, async ({ evt }) => {
+       if (dmAdmin(evt.operator?.openId)) await patch(evt, () => renderCoffeeSettings(true));
+     })
+-    .on(CLI.toggleEnabled, ({ evt, value }) => {
++    .on(CLI.toggleEnabled, async ({ evt, value }) => {
+       if (!dmAdmin(evt.operator?.openId)) return;
+       const enabled = value.v === 'on';
+       if (enabled && !canEnableCliBridge(cfg).ok) return;
+-      const transition = setCliBridgeEnabled(evt, enabled);
+-      void patch(evt, async () => {
+-        await transition;
+-        return renderCoffeeSettings();
+-      });
++      await setCliBridgeEnabled(evt, enabled);
++      void patch(evt, () => renderCoffeeSettings());
+     })
+     .on(CLI.repairHooks, async ({ evt }) => {
+       if (!dmAdmin(evt.operator?.openId)) return;
+-      // installCliBridgeHooks does raw fs writes (~/.claude, ~/.codex) that can
+-      // throw (EACCES/ENOSPC); keep it inside the awaited handler so the
+-      // dispatcher's try/catch covers it — there is no global rejection net
+-      // (see cli-bridge/ipc.ts). Still refresh the card on failure.
+-      try {
+-        await installCliBridgeHooks({
+-          agents: { claude: true, codex: true },
+-          command: resolveBridgeHookCommand(cfg.accounts.app.id),
+-        });
+-      } catch (err) {
+-        log.fail('cli-bridge', err, { phase: 'repair-hooks' });
+-      }
++      await settings.act({ kind: 'repairCliHooks', botId: cfg.accounts.app.id });
+       // Just wrote the hook files — force a fresh inspect so the status reflects it.
+       await patch(evt, () => renderCoffeeSettings(true));
+     })
+@@ -3459,85 +3435,11 @@ export function createOrchestrator(
+     .on(DM.commentPromptSubmit, ({ evt, formValue }) => {
+       if (!dmAdmin(evt.operator?.openId)) return;
+       const content = typeof formValue?.prompt === 'string' ? formValue.prompt : '';
+-      void (async () => {
+-        if (!content.trim()) {
+-          const cur = await loadCommentInstructions(paths.commentInstructionsFile);
+-          sendFreshSettingsResult(
+-            evt,
+-            () => buildCommentPromptCard(cur, '⚠️ 回复规则不能为空，未保存。', paths.commentInstructionsFile),
+-            'comment-prompt-submit-validation',
+-          );
+-          return;
+-        }
+-        try {
+-          await saveCommentInstructions(paths.commentInstructionsFile, content);
+-        } catch (err) {
+-          log.fail('console', err, { phase: 'save-comment-prompt' });
+-          sendFreshSettingsResult(
+-            evt,
+-            () => buildCommentPromptCard(content, '⚠️ 回复规则保存失败，原规则未改变，请重试。', paths.commentInstructionsFile),
+-            'comment-prompt-submit-result',
+-          );
+-          return;
+-        }
+-        const n = await syncAllCommentInstructions(paths.commentsRootDir, content, cfg.accounts.app.tenant).catch(
+-          (err) => {
+-            log.fail('console', err, { phase: 'sync-comment-prompt' });
+-            return undefined;
+-          },
+-        );
+-        sendFreshSettingsResult(
+-          evt,
+-          () => buildCommentPromptCard(
+-            content,
+-            n === undefined
+-              ? '⚠️ 回复规则已保存，但同步到已有文档失败，请重试。'
+-              : `✅ 回复规则已保存，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
+-            paths.commentInstructionsFile,
+-          ),
+-          'comment-prompt-submit-result',
+-        );
+-      })();
++      void saveCommentRulesFromCard(evt, { kind: 'custom', text: content });
+     })
+-    // 重置为默认：忽略输入框内容，把内置默认模板写回 master + 同步进所有评论工作目录（含历史），
+-    // 重渲编辑卡并预填默认（与「保存」一样即时生效、即时同步）。
+     .on(DM.commentResetPrompt, ({ evt }) => {
+       if (!dmAdmin(evt.operator?.openId)) return;
+-      void (async () => {
+-        try {
+-          await saveCommentInstructions(paths.commentInstructionsFile, DEFAULT_COMMENT_INSTRUCTIONS);
+-        } catch (err) {
+-          log.fail('console', err, { phase: 'reset-comment-prompt' });
+-          const current = await loadCommentInstructions(paths.commentInstructionsFile).catch(
+-            () => DEFAULT_COMMENT_INSTRUCTIONS,
+-          );
+-          sendFreshSettingsResult(
+-            evt,
+-            () => buildCommentPromptCard(current, '⚠️ 重置失败，原回复规则未改变，请重试。', paths.commentInstructionsFile),
+-            'comment-prompt-reset-result',
+-          );
+-          return;
+-        }
+-        const n = await syncAllCommentInstructions(
+-          paths.commentsRootDir,
+-          DEFAULT_COMMENT_INSTRUCTIONS,
+-          cfg.accounts.app.tenant,
+-        ).catch((err) => {
+-          log.fail('console', err, { phase: 'sync-comment-prompt' });
+-          return undefined;
+-        });
+-        sendFreshSettingsResult(
+-          evt,
+-          () => buildCommentPromptCard(
+-            DEFAULT_COMMENT_INSTRUCTIONS,
+-            n === undefined
+-              ? '⚠️ 已重置为默认回复规则，但同步到已有文档失败，请重试。'
+-              : `↩️ 已重置为默认回复规则，已同步到 ${n} 个文档（含历史），下一条评论生效。`,
+-            paths.commentInstructionsFile,
+-          ),
+-          'comment-prompt-reset-result',
+-        );
+-      })();
++      void saveCommentRulesFromCard(evt, { kind: 'default' });
+     })
+     // In-group settings: toggle 免@ for the project bound to evt.chatId. Admin-gated.
+     // 写路径走管理面共享层（admin/ops.ts）——与 DM 卡片 / Web 控制台同一套落盘逻辑。
+@@ -5280,8 +5182,8 @@ export function createOrchestrator(
+ 
+   /** Reuse the in-memory thread for a comment session, else resume the persisted
+    * one, else start a fresh thread in `cwd` (the per-doc comment dir, holding the
+-   * synced AGENTS.md / CLAUDE.md). Fresh threads pick their backend + model/effort
+-   * from the global comments config; resumed ones keep what they were created with.
++   * synced AGENTS.md / CLAUDE.md). Each comment reads current global backend/model preferences. A backend change
++   * starts a new session; a model change resumes the existing backend session.
+    * `instructions` is the prompt content just synced to the cwd: a live thread read
+    * those files only at start/resume, so if they changed since (user edited the
+    * master prompt) we recycle the live thread to force a re-read. */
+@@ -5291,30 +5193,22 @@ export function createOrchestrator(
+     instructions: string,
+     question: string,
+   ): Promise<AgentThread> {
++    const comments = getCommentsConfig(cfg);
++    const be = backendFor(comments.backend);
++    const { model, effort } = pickDefault(await listModels(be), { model: comments.model, effort: comments.effort });
++    const rec = await getSession(sessionKey);
++    const selectionChanged = rec && (rec.backend !== be.id || rec.model !== model || rec.effort !== effort);
+     const live = sessions.get(sessionKey);
+     if (live) {
+-      const alive = live.isAlive();
+-      // Instructions unchanged + alive → reuse the warm thread (the common case).
+-      if (alive && commentInstrUsed.get(sessionKey) === instructions) return live;
+-      // Edited prompt (alive but stale) → close the in-memory thread we're discarding
+-      // so the resume below re-reads the freshly-synced AGENTS.md/CLAUDE.md. Dead
+-      // thread → just evict (与 resolveThread 同款守卫；app-server 死后死线程留在缓存，
+-      // 每次 @ 评论都立即失败)，落进下面的 resume-or-fresh 兜底自愈。
+-      if (alive && commentInstrUsed.get(sessionKey) !== instructions) void live.close().catch(() => undefined);
++      if (live.isAlive() && !selectionChanged && commentInstrUsed.get(sessionKey) === instructions) return live;
++      await live.close().catch(() => undefined);
+       sessions.delete(sessionKey);
+       commentInstrUsed.delete(sessionKey);
+-      log.info('agent', alive ? 'comment-instr-changed-evict' : 'dead-thread-evict', { sessionKey });
+     }
+-    const rec = await getSession(sessionKey);
+-    if (rec) {
++    if (rec && rec.backend === be.id) {
+       try {
+-        // Same record-backend routing as resolveThread (doc sessions persist too).
+-        const resumed = await backendFor(rec.backend).resumeThread({
+-          cwd: rec.cwd,
+-          sessionId: rec.sessionId,
+-          model: rec.model,
+-          effort: rec.effort,
+-        });
++        const resumed = await be.resumeThread({ cwd: rec.cwd, sessionId: rec.sessionId, model, effort });
++        await patchSession(sessionKey, { model, effort });
+         trackSession(sessionKey, resumed);
+         commentInstrUsed.set(sessionKey, instructions);
+         return resumed;
+@@ -5322,15 +5216,6 @@ export function createOrchestrator(
+         log.fail('agent', err, { phase: 'comment-resume', sessionKey });
+       }
+     }
+-    // Fresh thread: backend + model/effort from the global comments config.
+-    // backendFor falls back to the default backend for an unset/unknown id;
+-    // pickDefault carries the configured model/effort when the live list supports them.
+-    const comments = getCommentsConfig(cfg);
+-    const be = backendFor(comments.backend);
+-    const { model, effort } = pickDefault(await listModels(be), {
+-      model: comments.model,
+-      effort: comments.effort,
+-    });
+     const fresh = await be.startThread({ cwd, model, effort });
+     trackSession(sessionKey, fresh);
+     commentInstrUsed.set(sessionKey, instructions);
+@@ -5653,13 +5538,17 @@ export function createOrchestrator(
+   // 管理面写执行器（Web 控制台 / supervisor IPC 入口）：与上面 DM 回调共用
+   // admin/ops.ts 的 perform*，注入同一个 backendFor + evictLiveSessionsForChat
+   // —— 双端写行为同源（同校验、同落盘、同驱逐）。
+-  const executeAdminWrite = createAdminWriteExecutor({ cfg, backendFor, evictLiveSessionsForChat, writePreferences, voiceAction: voice.action });
+-  const adminExecute = async (op: AdminWriteOp): Promise<void> => {
+-    await executeAdminWrite(op);
++  const settings = createSettingsOwner({ cfg, backendFor, evictLiveSessionsForChat, writePreferences, voiceAction: voice.action, refreshCompletionReminders: refreshCompletionReminderCards,
++    cliBridge: cliBridge?.start && cliBridge.shutdown ? { start: cliBridge.start, shutdown: cliBridge.shutdown, isRunning: cliBridge.isRunning } : undefined,
++  });
++  const executeAdminWrite = createAdminWriteExecutor({ cfg, backendFor, evictLiveSessionsForChat, writePreferences, voiceAction: voice.action, settings });
++  const adminExecute = async (op: AdminWriteOp): Promise<AdminWriteResult> => {
++    const result = await executeAdminWrite(op);
+     if (op.kind === 'setCompletionReminder') refreshCompletionReminderCards();
++    return result;
+   };
+ 
+-  return { onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, shutdown };
++  return { onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, settings, shutdown };
+ }
+ 
+ /** Resolve a message's thread_id via raw API (reply response omits it). The
+diff --git a/src/bot/session-store.ts b/src/bot/session-store.ts
+index d9d979d42b02a58d486123767ae8fe7756d2d6a0..1d2329668b52ea9ccae82cfe5d6436cc4ff93edf 100644
+--- a/src/bot/session-store.ts
++++ b/src/bot/session-store.ts
+@@ -135,7 +135,7 @@ async function readStoreIn(file: string): Promise<StoreFile> {
+       typeof parsed.version === 'number' && parsed.version >= 3 && Array.isArray(parsed.titleJobs)
+         ? (parsed.titleJobs as SessionTitleJob[])
+         : [];
+-    return { version: FILE_VERSION, sessions, titleJobs };
++    return { ...parsed, version: FILE_VERSION, sessions, titleJobs };
+   } catch (err) {
+     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return emptyStore();
+     throw err;
+@@ -169,7 +169,7 @@ function withLock<T>(fn: () => Promise<T>): Promise<T> {
+ async function write(store: StoreFile): Promise<void> {
+   await mkdir(dirname(paths.sessionsFile), { recursive: true });
+   const tmp = `${paths.sessionsFile}.tmp-${process.pid}-${randomUUID()}`;
+-  const body: StoreFile = { version: FILE_VERSION, sessions: store.sessions, titleJobs: store.titleJobs };
++  const body: StoreFile = { ...store, version: FILE_VERSION };
+   await writeFile(tmp, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
+   await rename(tmp, paths.sessionsFile);
+ }
+@@ -295,3 +295,15 @@ export async function updateSessionTitleJob(
+     return true;
+   });
+ }
++
++export async function mutateSession(threadId: string, mutate: (session: SessionRecord) => void | Promise<void>): Promise<SessionRecord> {
++  return withLock(async () => {
++    const store = await read();
++    const session = store.sessions.find(item => item.threadId === threadId);
++    if (!session) throw new Error('会话不存在或已被删除');
++    await mutate(session);
++    session.updatedAt = Date.now();
++    await write(store);
++    return session;
++  });
++}
+diff --git a/src/bot/supervisor.ts b/src/bot/supervisor.ts
+index 393a74d9a9b1c98a8c57d43c7f25c7a074fd98e7..af5f2ddc604016ce86e4901fbfb97d59f94ad56f 100644
+--- a/src/bot/supervisor.ts
++++ b/src/bot/supervisor.ts
+@@ -155,11 +155,16 @@ export async function runSupervisor(bots: BotEntry[], options: { control?: Shutd
+           if (!child?.proc || !child.ipc) throw new AdminWriteError('机器人不在运行中的活跃集里');
+           return child.ipc.call(op, 60_000);
+         },
++        executeSettingsRead: async (botId, op) => {
++          const child = byAppId(botId);
++          if (!child?.proc || !child.ipc) throw new AdminWriteError('机器人不在运行中的活跃集里');
++          return child.ipc.call(op);
++        },
+         executeWrite: async (botId, op) => {
+           const c = byAppId(botId);
+           if (!c) throw new AdminWriteError(`机器人「${botId}」不在本次启动的活跃集里（先 \`bot use\` 勾选后重启）。`);
+           if (!c.proc || !c.ipc) throw new AdminWriteError(`机器人「${c.bot.name}」进程未在运行（崩溃重启中），稍后重试。`);
+-          await c.ipc.call(op);
++          return c.ipc.call(op);
+         },
+         liveStatus: async (botId) => {
+           const c = byAppId(botId);
+diff --git a/src/cli-bridge/service.ts b/src/cli-bridge/service.ts
+index 3c4f7edafdd7dca08e9668b371af411027dd3165..c969e2cc7534da4b18b1bd7a6699af3e9376ef87 100644
+--- a/src/cli-bridge/service.ts
++++ b/src/cli-bridge/service.ts
+@@ -33,6 +33,7 @@ const LOCAL_RETURN = 'local_return';
+  *  the two shapes drift); structural so bridge.ts can pass the full service without
+  *  a circular import. */
+ export interface CliBridgeRuntimeHooks {
++  isRunning?: () => boolean;
+   onMessage: (msg: { parentId?: string; rootId?: string; text?: string; messageId?: string }) => boolean;
+   register: (dispatcher: CardDispatcher) => void;
+   start?: () => Promise<void>;
+@@ -472,6 +473,7 @@ export function createCliBridgeService(opts: {
+   }
+ 
+   return {
++    isRunning: () => ipc !== undefined,
+     start: async () => {
+       if (ipc) return;
+       ipc = await startCliBridgeIpcServer({ socketPath: opts.socketPath, handleMessage });
+diff --git a/src/cli/commands/run.ts b/src/cli/commands/run.ts
+index e561e5c6d31657ea061df400a09542a2b3f59588..dba5bb34cd438bc61ee088e1df445940f64ba3c5 100644
+--- a/src/cli/commands/run.ts
++++ b/src/cli/commands/run.ts
+@@ -173,8 +173,9 @@ async function runSingle(botName: string | undefined, control: ShutdownControl,
+           return { connection: handle.channel.getConnectionStatus?.()?.state ?? 'unknown' };
+         }
+         if (op.kind === 'joinedGroups' || op.kind === 'bindGroup') return handle.adminGroups(op);
+-        await handle.adminExecute(op);
+-        return { done: true };
++        if (op.kind === 'settingsRead') return handle.settings.read(op.scope);
++        if (op.kind === 'settingsModels') return handle.settings.models(op.query);
++        return handle.adminExecute(op);
+       },
+       (msg) => void process.send?.(msg),
+     );
+@@ -191,13 +192,17 @@ async function runSingle(botName: string | undefined, control: ShutdownControl,
+           if (botId !== ownAppId) throw new AdminWriteError('机器人不在本进程的活跃集里');
+           return handle.adminGroups(op);
+         },
++        executeSettingsRead: async (botId, op) => {
++          if (botId !== ownAppId) throw new AdminWriteError('机器人不在本进程的活跃集里');
++          return op.kind === 'settingsRead' ? handle.settings.read(op.scope) : handle.settings.models(op.query);
++        },
+         executeWrite: async (botId, op) => {
+           if (botId !== ownAppId) {
+             throw new AdminWriteError(
+               '该机器人不归本进程管：当前是单 bot 运行模式，只能改本 bot 的项目。多 bot 请 `bot use` 勾选后重启，由 supervisor 聚合管理。',
+             );
+           }
+-          await handle.adminExecute(op);
++          return handle.adminExecute(op);
+         },
+         liveStatus: async (botId) =>
+           botId === ownAppId
+diff --git a/src/config/schema.ts b/src/config/schema.ts
+index dcc45e3ce4a907a4ea24690c2b6abafda648dd81..44f9d63b3fb5205890eba73c50ff5aa94f042ed1 100644
+--- a/src/config/schema.ts
++++ b/src/config/schema.ts
+@@ -138,7 +138,7 @@ export interface SessionTitleAiConfig {
+ }
+ 
+ /** 某一 agent 后端的会话标题策略。开启 AI 时 model + effort 必须成对存在。 */
+-export type SessionTitleBackendConfig = { enabled?: false; model?: never; effort?: never } | SessionTitleAiConfig;
++export type SessionTitleBackendConfig = { enabled?: false; model?: string; effort?: ReasoningEffort } | SessionTitleAiConfig;
+ 
+ /** 后端 id → 该后端的标题策略。不设全局模型，也不设模型白名单。 */
+ export interface SessionTitlesConfig {
+diff --git a/src/config/store.ts b/src/config/store.ts
+index ea0b0927ff401f27c5eec5b8830dbb5971d1cc2a..c760d34ac9af4e58ea54fb44a491ff155787806c 100644
+--- a/src/config/store.ts
++++ b/src/config/store.ts
+@@ -70,8 +70,9 @@ export async function ensureSecretsGetterWrapper(): Promise<string> {
+ // 同进程内并发 saveConfig 串行化 + tmp 唯一名：避免两次写共用 tmp 文件交错（rename
+ // 命中被对方写一半的 tmp → JSON 损坏，或丢写）。
+ let saveChain: Promise<unknown> = Promise.resolve();
+-export function saveConfig(cfg: AppConfig, path: string = paths.configFile): Promise<void> {
++export function saveConfig(cfg: AppConfig, path: string = paths.configFile, expected?: AppConfig): Promise<void> {
+   const run = saveChain.then(async () => {
++    if (expected && JSON.stringify(await loadConfig(path)) !== JSON.stringify(expected)) throw new Error('配置已被其他进程修改，请重启 Host 后重新加载');
+     await mkdir(dirname(path), { recursive: true });
+     const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`;
+     await writeFile(tmp, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
+diff --git a/src/host/bootstrap.ts b/src/host/bootstrap.ts
+index d6bcfb2de79a3d001d0e82e171c62b5f3a5b175f..a840cae0e8d807916c1975c8abe31c6f67b01795 100644
+--- a/src/host/bootstrap.ts
++++ b/src/host/bootstrap.ts
+@@ -3,6 +3,7 @@ import { acquireMutex, closeMutex } from '../config/data-access';
+ import { readHostEndpoint } from './discovery';
+ import { observeShutdown, type ShutdownControl } from './lifecycle';
+ import { assertKnownOwnersStopped, inspectInstallation } from '../service/control';
++import { readServiceCodexBin } from '../service/codex-bin';
+ 
+ export async function runHostRuntime(options: { bot?: string; managed: boolean; control?: ShutdownControl }): Promise<void> {
+   const control = options.control ?? observeShutdown(options.managed);
+@@ -19,6 +20,11 @@ export async function runHostRuntime(options: { bot?: string; managed: boolean;
+       }
+     }
+     if (control.requested) return;
++    if (options.managed) {
++      const codexBin = readServiceCodexBin();
++      if (codexBin === null) delete process.env.CODEX_BIN;
++      else if (codexBin !== undefined) process.env.CODEX_BIN = codexBin;
++    }
+     const { runRun } = await import('../cli/commands/run');
+     await runRun(options.bot, { control, managed: options.managed });
+   } finally {
+diff --git a/src/host/client.ts b/src/host/client.ts
+index 25ce49e4e6b1246e8175c8964c12cc79f87ef8f0..c610f0328efe73e2816bccee253a8b4463883e6f 100644
+--- a/src/host/client.ts
++++ b/src/host/client.ts
+@@ -104,3 +104,5 @@ export async function connectHost(input: HostOptions): Promise<HostHandle | Host
+     };
+   } catch (error) { return { ...refusal(error), reason: 'startup-failed' }; }
+ }
++
++export type * from '../admin/settings-types';
+diff --git a/src/project/registry.ts b/src/project/registry.ts
+index 0b5986e6775e5969d14d77d832ce473840e1700a..a567f298de2126d1508f6010308fcb485768e530 100644
+--- a/src/project/registry.ts
++++ b/src/project/registry.ts
+@@ -164,7 +164,8 @@ function withLock<T>(fn: () => Promise<T>): Promise<T> {
+ async function write(projects: Project[]): Promise<void> {
+   await mkdir(dirname(paths.projectsFile), { recursive: true });
+   const tmp = `${paths.projectsFile}.tmp-${process.pid}-${randomUUID()}`;
+-  const body: StoreFile = { version: FILE_VERSION, projects };
++  const previous = await readFile(paths.projectsFile, 'utf8').then(text => JSON.parse(text)).catch(error => { if (error.code === 'ENOENT') return {}; throw error; });
++  const body: StoreFile = { ...previous, version: FILE_VERSION, projects };
+   await writeFile(tmp, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
+   await rename(tmp, paths.projectsFile);
+ }
+@@ -230,3 +231,14 @@ export async function removeProject(name: string): Promise<Project | undefined>
+     return removed;
+   });
+ }
++
++export async function mutateProject(name: string, mutate: (project: Project) => void | Promise<void>): Promise<Project> {
++  return withLock(async () => {
++    const projects = await read();
++    const project = projects.find(item => item.name === name);
++    if (!project) throw new Error('项目不存在');
++    await mutate(project);
++    await write(projects);
++    return project;
++  });
++}
+diff --git a/src/web/server.ts b/src/web/server.ts
+index be8ff0330b8a4b40c6f60135de0d99dfb45a6182..15ea4bc2917b270fa6650f15a582bae9795a61a6 100644
+--- a/src/web/server.ts
++++ b/src/web/server.ts
+@@ -1,3 +1,4 @@
++import { handleSettingsRoute } from './settings-routes';
+ import { GroupUpstreamError, InvalidGroupInput, parseBindGroupInput } from '../admin/groups';
+ import { CodexSetupConflict } from '../agent/codex-appserver/setup';
+ import { validateVoiceAction } from '../voice/service';
+@@ -161,6 +162,8 @@ export function createWebServer(opts: WebServerOptions): WebServer {
+ 
+     if (closing) { sendJson(res, 503, { error: 'closing', message: 'Host 正在退出' }); return; }
+ 
++    if (await handleSettingsRoute(req, res, url, opts.service.settings)) return;
++
+     // ── 路由 ──────────────────────────────────────────────────────────────
+     if (req.method === 'GET' && pathName === '/') {
+       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+@@ -581,6 +584,14 @@ export function createWebServer(opts: WebServerOptions): WebServer {
+         return;
+       }
+       try {
++        if ((action === 'no-mention' || action === 'auto-compact') && typeof body.on !== 'boolean') {
++          sendJson(res, 400, { error: 'bad_body', message: 'on 必须是布尔值' });
++          return;
++        }
++        if (action === 'permission' && body.network !== undefined && typeof body.network !== 'boolean') {
++          sendJson(res, 400, { error: 'bad_body', message: 'network 必须是布尔值' });
++          return;
++        }
+         if (action === 'backend') {
+           await opts.service.switchBackend(botId, project, String(body.backend ?? ''));
+         } else if (action === 'permission') {
+diff --git a/src/web/settings-routes.ts b/src/web/settings-routes.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4d4b28cb91344a92c0b28005c3ec7a736e82a2fb
+--- /dev/null
++++ b/src/web/settings-routes.ts
+@@ -0,0 +1,114 @@
++import type { IncomingMessage, ServerResponse } from 'node:http';
++import { parseSettingsScope, parseSettingsEdit, parseSettingsAction, parseModelQuery, settingsObject, SettingsInputError } from '../admin/settings-parse';
++import type { HostSettings, SettingsScope } from '../admin/settings-types';
++function send(res: ServerResponse, code: number, body: unknown): void {
++  res.writeHead(code, {
++    'Content-Type': 'application/json; charset=utf-8',
++    'Cache-Control': 'no-store'
++  });
++  res.end(JSON.stringify(body));
++}
++async function body(req: IncomingMessage): Promise<Record<string, unknown>> {
++  const chunks: Buffer[] = [];
++  let bytes = 0;
++  for await (const chunk of req) {
++    bytes += chunk.length;
++    if (bytes > 200000)
++      throw new SettingsInputError('设置请求过大');
++    chunks.push(chunk);
++  }
++  try {
++    return settingsObject(JSON.parse(Buffer.concat(chunks).toString('utf8')));
++  }
++  catch {
++    throw new SettingsInputError('请求体必须是 JSON 对象');
++  }
++}
++export async function handleSettingsRoute(req: IncomingMessage, res: ServerResponse, url: URL, settings?: HostSettings): Promise<boolean> {
++  const agent = /^\/api\/bots\/([^/]+)\/settings(?:\/([^/]+))?$/.exec(url.pathname);
++  const project = /^\/api\/project\/([^/]+)\/settings$/.exec(url.pathname);
++  const session = /^\/api\/bots\/([^/]+)\/sessions\/([^/]+)\/settings$/.exec(url.pathname);
++  const models = /^\/api\/bots\/([^/]+)\/models$/.exec(url.pathname);
++  const host = url.pathname === '/api/settings/host';
++  if (!agent && !project && !session && !models && !host)
++    return false;
++  if (!settings) {
++    send(res, 404, {
++      error: 'unsupported_settings',
++      message: '当前 Bridge 版本不支持此设置'
++    });
++    return true;
++  }
++  try {
++    if (models && req.method === 'GET') {
++      send(res, 200, await settings.models(parseModelQuery({
++        botId: decodeURIComponent(models[1]!),
++        backend: url.searchParams.get('backend'),
++        purpose: url.searchParams.get('purpose')
++      })));
++      return true;
++    }
++    if (agent?.[2] === 'actions' && req.method === 'POST') {
++      const action = parseSettingsAction(await body(req));
++      if (action.botId !== decodeURIComponent(agent[1]!))
++        throw new SettingsInputError('Agent 标识不一致');
++      const result = await settings.act(action);
++      send(res, result.kind === 'conflict' ? 409 : result.kind === 'unavailable' ? 503 : result.kind === 'rejected' ? 400 : 200, result);
++      return true;
++    }
++    const scope: SettingsScope = parseSettingsScope(host ? {
++      kind: 'host'
++    } : project ? {
++      kind: 'project',
++      botId: url.searchParams.get('bot'),
++      projectName: decodeURIComponent(project[1]!)
++    } : session ? {
++      kind: 'session',
++      botId: decodeURIComponent(session[1]!),
++      threadId: decodeURIComponent(session[2]!)
++    } : {
++      kind: 'agent',
++      botId: decodeURIComponent(agent?.[1] ?? '')
++    });
++    if (req.method === 'GET' && !agent?.[2]) {
++      send(res, 200, await settings.read(scope));
++      return true;
++    }
++    if (req.method === 'PATCH') {
++      const input = await body(req);
++      const edit = parseSettingsEdit({
++        ...input,
++        scope,
++        ...(agent ? {
++          section: agent[2]
++        } : {})
++      });
++      const result = await settings.save(edit);
++      send(res, result.kind === 'conflict' ? 409 : result.kind === 'unavailable' ? 503 : result.kind === 'rejected' ? 400 : 200, result);
++      return true;
++    }
++    send(res, 405, {
++      error: 'method_not_allowed'
++    });
++  }
++  catch (error) {
++    if (error instanceof SettingsInputError)
++      send(res, req.method === 'GET' && /不存在/.test(error.message) ? 404 : 400, {
++        kind: 'rejected',
++        fields: [{
++            field: 'settings',
++            message: error.message
++          }]
++      });
++    else
++      send(res, 503, {
++        kind: 'unavailable',
++        reason: {
++          kind: 'readonly',
++          reason: 'owner-offline',
++          message: '设置读取或保存失败，请刷新后重试'
++        }
++      });
++  }
++  return true;
++}
+diff --git a/test/admin-ops.test.ts b/test/admin-ops.test.ts
+index 32cb71d97726631ef98ba46ad0ec1c2e3f74b0b5..3b7ed4035fd088659654186ffed3e404bfc75b2b 100644
+--- a/test/admin-ops.test.ts
++++ b/test/admin-ops.test.ts
+@@ -399,9 +399,9 @@ describe('createAdminWriteExecutor / runAdminWriteOp（Web · IPC 入口）', ()
+     expect((await getProjectByName('demo'))?.noMention).toBe(false);
+   });
+ 
+-  it('执行器：成功静默返回，拒绝抛 AdminWriteError（带 code，IPC/HTTP 可还原）', async () => {
++  it('执行器：成功返回 done，拒绝抛 AdminWriteError（带 code，IPC/HTTP 可还原）', async () => {
+     const exec = createAdminWriteExecutor(deps);
+-    await expect(exec({ kind: 'setAutoCompact', project: 'demo', on: true })).resolves.toBeUndefined();
++    await expect(exec({ kind: 'setAutoCompact', project: 'demo', on: true })).resolves.toEqual({ kind: 'done' });
+     const err = await exec({ kind: 'switchBackend', project: 'demo', backend: 'gpt-9' }).catch((e: unknown) => e);
+     expect(err).toBeInstanceOf(AdminWriteError);
+     expect((err as AdminWriteError).code).toBe('ADMIN_WRITE_REJECTED');
+@@ -415,7 +415,7 @@ describe('createAdminWriteExecutor / runAdminWriteOp（Web · IPC 入口）', ()
+     const exec = createAdminWriteExecutor({ ...deps, cfg, persistConfig: persist });
+     await expect(
+       exec({ kind: 'setCompletionReminder', mode: 'manual', longTaskMinutes: 3 }),
+-    ).resolves.toBeUndefined();
++    ).resolves.toEqual({ kind: 'done' });
+     expect(cfg.preferences?.completionReminder).toEqual({ mode: 'manual', longTaskMinutes: 3 });
+ 
+     const missingCfg = createAdminWriteExecutor(deps);
+diff --git a/test/cli-bridge-runtime.test.ts b/test/cli-bridge-runtime.test.ts
+index 9c5ae2af2db5e9253acbcb1b689cae0ef4d86700..98638a4cc886cfc148eec1cd60362003f4f454bb 100644
+--- a/test/cli-bridge-runtime.test.ts
++++ b/test/cli-bridge-runtime.test.ts
+@@ -1,8 +1,22 @@
+-import { beforeEach, describe, expect, it, vi } from 'vitest';
++import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+ 
++const fixtureStore = vi.hoisted(() => ({ config: {} as unknown }));
+ vi.mock('../src/config/store', () => ({
+-  saveConfig: vi.fn(async () => undefined),
++  saveConfig: vi.fn(async (config: unknown) => { fixtureStore.config = structuredClone(config); }),
++  loadConfig: vi.fn(async () => structuredClone(fixtureStore.config)),
+ }));
++vi.mock('../src/config/paths', async () => {
++  const { mkdtempSync } = await import('node:fs'); const { tmpdir } = await import('node:os'); const { join } = await import('node:path');
++  const appDir = mkdtempSync(join(tmpdir(), 'cli-settings-runtime-'));
++  return { paths: { appDir, commentInstructionsFile: join(appDir, 'comment-instructions.md'), commentsRootDir: join(appDir, 'comments'), projectsRootDir: join(appDir, 'projects') } };
++});
++vi.mock('../src/cli-bridge/hooks', () => ({
++  inspectCliBridgeHooks: async () => ({ claude: { agent: 'claude', status: 'installed', details: [] }, codex: { agent: 'codex', status: 'installed', details: [] } }),
++  installCliBridgeHooks: vi.fn(), resolveBridgeHookCommand: () => 'fixture',
++}));
++import { paths } from '../src/config/paths';
++import { rm } from 'node:fs/promises';
++afterAll(() => rm(paths.appDir, { recursive: true, force: true }));
+ 
+ vi.mock('../src/core/logger', () => ({
+   log: {
+@@ -19,13 +33,15 @@ import type { AppConfig } from '../src/config/schema';
+ import { saveConfig } from '../src/config/store';
+ 
+ function cfg(enabled: boolean): AppConfig {
+-  return {
+-    accounts: { app: { id: 'app', secret: 'secret', tenant: 'feishu' } },
++  const result: AppConfig = {
++    accounts: { app: { id: 'cli_fixture', secret: 'secret', tenant: 'feishu' } },
+     preferences: {
+       access: { ownerOpenId: 'ou_owner' },
+       cliBridge: { enabled },
+     },
+   };
++  fixtureStore.config = structuredClone(result);
++  return result;
+ }
+ 
+ function channel() {
+@@ -70,7 +86,7 @@ function cliBridge(overrides: Partial<CliBridgeRuntimeHooks> = {}): CliBridgeRun
+ 
+ describe('cli bridge runtime settings', () => {
+   beforeEach(() => {
+-    vi.mocked(saveConfig).mockReset().mockResolvedValue(undefined);
++    vi.mocked(saveConfig).mockReset().mockImplementation(async config => { fixtureStore.config = structuredClone(config); });
+   });
+ 
+   it('starts the runtime service when Local agents is enabled from settings', async () => {
+diff --git a/test/comment-settings-runtime.test.ts b/test/comment-settings-runtime.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3cec6db4a2456b3ddf3a9a23c6640c1e738943c
+--- /dev/null
++++ b/test/comment-settings-runtime.test.ts
+@@ -0,0 +1,58 @@
++import { afterAll, expect, it, vi } from 'vitest';
++import { rm } from 'node:fs/promises';
++import type { AgentBackend, AgentEvent } from '../src/agent/types';
++import type { AppConfig } from '../src/config/schema';
++import { paths } from '../src/config/paths';
++import { getSession } from '../src/bot/session-store';
++import { createOrchestrator } from '../src/bot/handle-message';
++
++vi.mock('../src/config/paths', async () => {
++  const { mkdtempSync } = await import('node:fs'); const { tmpdir } = await import('node:os'); const { join } = await import('node:path');
++  const appDir = mkdtempSync(join(tmpdir(), 'comment-settings-runtime-'));
++  return { paths: { appDir, sessionsFile: join(appDir, 'sessions.json'), projectsFile: join(appDir, 'projects.json'), commentInstructionsFile: join(appDir, 'instructions.md'), commentsRootDir: join(appDir, 'comments'), projectsRootDir: join(appDir, 'projects') } };
++});
++const fixture = vi.hoisted(() => ({ backends: new Map<string, unknown>(), replies: 0 }));
++vi.mock('../src/agent', async original => ({ ...await original<object>(), createBackend: (id = 'codex-appserver') => fixture.backends.get(id) }));
++vi.mock('../src/core/logger', () => ({ log: { info() {}, warn() {}, fail() {} }, withTrace: (_context: unknown, callback: () => unknown) => callback() }));
++vi.mock('../src/bot/comments', async original => ({
++  ...await original<object>(),
++  resolveComment: async () => ({ target: { fileType: 'docx', fileToken: 'fixture-doc' }, ctx: { question: 'fixture question', isWhole: true, targetReplyId: undefined } }),
++  postCommentReply: async () => { fixture.replies++; },
++}));
++function backend(id: string) {
++  let next = 0;
++  const threads: ReturnType<typeof thread>[] = [];
++  function thread(sessionId: string) {
++    return { sessionId, isAlive: () => true, close: vi.fn(async () => {}), runStreamed: vi.fn(() => ({ turnId: () => 'turn', events: (async function* (): AsyncGenerator<AgentEvent> { yield { type: 'done', turnId: 'turn' }; })() })) };
++  }
++  const result = {
++    id, displayName: id,
++    listModels: async () => ['one', 'two'].map(model => ({ id: model, displayName: model, description: '', supportedEfforts: ['low', 'high'], defaultEffort: 'low', isDefault: model === 'one', hidden: false })),
++    startThread: vi.fn(async () => { const t = thread(`${id}-${++next}`); threads.push(t); return t; }),
++    resumeThread: vi.fn(async (input: { sessionId: string }) => { const t = thread(input.sessionId); threads.push(t); return t; }),
++  };
++  fixture.backends.set(id, result as unknown as AgentBackend);
++  return { ...result, threads };
++}
++afterAll(() => rm(paths.appDir, { recursive: true, force: true }));
++it('the next comment applies model changes to the same native session and backend changes to a new session', async () => {
++  const codex = backend('codex-appserver'); const claude = backend('claude-agent');
++  const cfg: AppConfig = { accounts: { app: { id: 'cli_fixture', secret: 'fixture', tenant: 'feishu' } }, preferences: { access: { ownerOpenId: 'ou_owner' }, comments: { backend: 'codex-appserver', model: 'one', effort: 'low' } } };
++  const orchestrator = createOrchestrator({} as never, cfg, paths.appDir);
++  const event = (replyId: string) => ({ fileType: 'docx', fileToken: 'fixture-doc', commentId: 'comment', replyId, mentionedBot: true, operator: { openId: 'ou_owner' } });
++  try {
++    await orchestrator.onComment(event('one') as never);
++    const original = await getSession('doc:fixture-doc:comment');
++    expect(original).toMatchObject({ backend: 'codex-appserver', model: 'one', effort: 'low' });
++    cfg.preferences!.comments = { backend: 'codex-appserver', model: 'two', effort: 'high' };
++    await orchestrator.onComment(event('two') as never);
++    expect(codex.threads[0]!.close).toHaveBeenCalledOnce();
++    expect(codex.resumeThread).toHaveBeenCalledWith(expect.objectContaining({ sessionId: original!.sessionId, model: 'two', effort: 'high' }));
++    expect(await getSession('doc:fixture-doc:comment')).toMatchObject({ sessionId: original!.sessionId, model: 'two', effort: 'high' });
++    cfg.preferences!.comments = { backend: 'claude-agent', model: 'one', effort: 'low' };
++    await orchestrator.onComment(event('three') as never);
++    expect(claude.startThread).toHaveBeenCalledOnce();
++    expect(await getSession('doc:fixture-doc:comment')).toMatchObject({ backend: 'claude-agent', model: 'one' });
++    expect(fixture.replies).toBe(3);
++  } finally { await orchestrator.shutdown(); }
++});
+diff --git a/test/host-settings.test.ts b/test/host-settings.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..09baecdcb7258b1ee593ee28cfcf2083b75dbd7c
+--- /dev/null
++++ b/test/host-settings.test.ts
+@@ -0,0 +1,85 @@
++import { afterEach, describe, expect, it } from 'vitest';
++import { mkdtemp, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { createHostSettings } from '../src/admin/host-settings';
++import { readServiceCodexBin, saveServiceCodexBin } from '../src/service/codex-bin';
++import type { HostSettingsView } from '../src/admin/settings-types';
++
++const homes: string[] = [];
++afterEach(async () => { await Promise.all(homes.splice(0).map(home => rm(home, { recursive: true, force: true }))); });
++
++async function fixture() {
++  const appDir = await mkdtemp(join(tmpdir(), 'vonvon-host-settings-'));
++  homes.push(appDir);
++  const first = join(appDir, process.platform === 'win32' ? 'codex-first.cmd' : 'codex-first');
++  const second = join(appDir, process.platform === 'win32' ? 'codex-second.cmd' : 'codex-second');
++  await writeFile(first, '', { mode: 0o700 });
++  await writeFile(second, '', { mode: 0o700 });
++  const settings = createHostSettings({ appDir, runningCodexBin: first });
++  const read = async (): Promise<HostSettingsView> => {
++    const value = await settings.read({ kind: 'host' });
++    if (!('runtime' in value)) throw new Error('Expected host view');
++    return value;
++  };
++  const save = (revision: string, codexBin: string | null) => settings.save({ scope: { kind: 'host' }, section: 'execution', revision, patch: { codexBin } });
++  return { appDir, first, second, settings, read, save };
++}
++
++describe('Host executable settings', () => {
++  it('persists a selection without pretending the running executable changed', async () => {
++    const f = await fixture();
++    const initial = await f.read();
++    const result = await f.save(initial.sections.execution.revision, f.second);
++    expect(result.kind).toBe('saved');
++    if (result.kind === 'saved') expect(result.effects.map(effect => effect.when)).toEqual(['restart']);
++    expect(readServiceCodexBin(f.appDir)).toBe(f.second);
++    expect((await f.read()).sections.execution.effective.codexBin).toBe(f.first);
++    const reopened = createHostSettings({ appDir: f.appDir, runningCodexBin: f.second });
++    const value = await reopened.read({ kind: 'host' });
++    if (!('runtime' in value)) throw new Error('Expected host view');
++    expect(value.sections.execution.stored.codexBin).toBe(f.second);
++    expect(value.sections.execution.effective.codexBin).toBe(f.second);
++  });
++
++  it('persists an explicit reset even when no previous service selection exists', async () => {
++    const f = await fixture();
++    const initial = await f.read();
++    expect(readServiceCodexBin(f.appDir)).toBeUndefined();
++    expect((await f.save(initial.sections.execution.revision, null)).kind).toBe('saved');
++    expect(readServiceCodexBin(f.appDir)).toBeNull();
++    expect((await f.read()).runtime.codexBin).toBe(f.first);
++  });
++
++  it('rejects a stale competing edit and accepts an identical retry', async () => {
++    const f = await fixture();
++    const initial = await f.read();
++    const results = await Promise.all([
++      f.save(initial.sections.execution.revision, f.first),
++      f.save(initial.sections.execution.revision, f.second),
++    ]);
++    expect(results.map(result => result.kind)).toEqual(['saved', 'conflict']);
++    expect(readServiceCodexBin(f.appDir)).toBe(f.first);
++    const retry = await f.save(initial.sections.execution.revision, f.first);
++    expect(retry.kind).toBe('saved');
++    if (retry.kind === 'saved') expect(retry.effects).toEqual([]);
++  });
++
++  it('refuses missing, relative, directory and malformed paths without overwriting selection', async () => {
++    const f = await fixture();
++    saveServiceCodexBin(f.first, f.appDir);
++    for (const path of ['relative/codex', join(f.appDir, 'missing'), f.appDir, `${f.second}\nother`]) {
++      const before = await f.read();
++      expect((await f.save(before.sections.execution.revision, path)).kind).toBe('rejected');
++      expect(readServiceCodexBin(f.appDir)).toBe(f.first);
++    }
++  });
++
++  it('refuses preview mutations and leaves the service record absent', async () => {
++    const f = await fixture();
++    const preview = createHostSettings({ appDir: f.appDir, readonly: true });
++    const initial = await f.read();
++    expect((await preview.save({ scope: { kind: 'host' }, section: 'execution', revision: initial.sections.execution.revision, patch: { codexBin: f.first } })).kind).toBe('unavailable');
++    expect(readServiceCodexBin(f.appDir)).toBeUndefined();
++  });
++});
+diff --git a/test/settings-owner.test.ts b/test/settings-owner.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a77c94b6fdc2b091e983ec6c22e14331c3b45ef2
+--- /dev/null
++++ b/test/settings-owner.test.ts
+@@ -0,0 +1,193 @@
++import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
++import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
++import { paths } from '../src/config/paths';
++import { saveConfig, loadConfig } from '../src/config/store';
++import { createAppPreferencesWriter, createAdminWriteExecutor } from '../src/admin/ops';
++import { createSettingsOwner, type SettingsOwnerDeps } from '../src/admin/settings';
++import { parseSettingsEdit, parseSettingsAction } from '../src/admin/settings-parse';
++import type { AgentSettingsView, ProjectSettingsView, SessionSettingsView } from '../src/admin/settings-types';
++import { addProject, getProjectByName, updateProject } from '../src/project/registry';
++import { getSession, upsertSession } from '../src/bot/session-store';
++import { createAdminIpcCaller, createAdminIpcResponder } from '../src/admin/ipc';
++import type { AppConfig } from '../src/config/schema';
++import type { AgentBackend } from '../src/agent/types';
++
++vi.mock('../src/config/paths', async () => {
++  const { mkdtempSync } = await import('node:fs'); const { tmpdir } = await import('node:os'); const { join } = await import('node:path');
++  const appDir = mkdtempSync(join(tmpdir(), 'settings-owner-'));
++  return { paths: { appDir, configFile: join(appDir, 'config.json'), projectsFile: join(appDir, 'projects.json'), sessionsFile: join(appDir, 'sessions.json'), commentInstructionsFile: join(appDir, 'instructions.md'), commentsRootDir: join(appDir, 'comments') } };
++});
++const botId = 'cli_fixture';
++const agent = { kind: 'agent' as const, botId };
++const project = { kind: 'project' as const, botId, projectName: 'demo' };
++const session = { kind: 'session' as const, botId, threadId: 'omt_fixture' };
++const backend = { id: 'codex-appserver', doctor: async () => ({ ok: true }), supportedModes: ['qa', 'write', 'full'], listModels: async () => [{ id: 'fixture-model', displayName: 'Fixture', description: '', defaultEffort: 'high', supportedEfforts: ['low', 'high'], isDefault: true, hidden: false }] } as unknown as AgentBackend;
++const hooks = { inspect: async () => ({ claude: { agent: 'claude' as const, status: 'installed' as const, details: [] }, codex: { agent: 'codex' as const, status: 'installed' as const, details: [] } }), install: vi.fn(async () => {}) };
++let cfg: AppConfig;
++async function fixture(overrides: Partial<SettingsOwnerDeps> = {}) {
++  const writer = createAppPreferencesWriter({ cfg });
++  return { writer, owner: createSettingsOwner({ cfg, writePreferences: writer, backendFor: () => backend, evictLiveSessionsForChat: vi.fn(async () => {}), hooks, ...overrides }) };
++}
++beforeEach(async () => {
++  await rm(paths.appDir, { recursive: true, force: true }); await mkdir(paths.appDir, { recursive: true });
++  cfg = JSON.parse(JSON.stringify({ accounts: { app: { id: botId, tenant: 'feishu', secret: { source: 'exec', id: 'fixture-secret' } } }, secrets: { providers: { sentinel: { source: 'env', allowlist: ['SECRET'] } } }, futureRoot: 17, preferences: { access: { ownerOpenId: 'ou_owner', admins: ['ou_admin'], unknownAccess: 'preserve' }, completionReminder: { mode: 'long', longTaskMinutes: 3, future: true }, cliBridge: { enabled: false, presence: { future: 8 } }, sessionTitles: { future: 'keep', byBackend: { 'codex-appserver': { enabled: true, model: 'custom-title', effort: 'high', future: 3 } } }, futurePreference: true } }));
++  await saveConfig(cfg);
++  await addProject({ name: 'demo', chatId: 'oc_demo', cwd: '/tmp/demo', createdAt: 1, blank: false });
++  await upsertSession({ threadId: session.threadId, chatId: 'oc_demo', sessionId: 'native-one', backend: 'codex-appserver', cwd: '/tmp/demo', model: 'fixture-model', effort: 'high', createdAt: 1, updatedAt: 1, summary: '' });
++});
++afterAll(() => rm(paths.appDir, { recursive: true, force: true }));
++describe('strict boundaries', () => {
++  it.each([{ maxConcurrentRuns: '2' }, { runIdleTimeoutSeconds: 1 }, { runIdleTimeoutSeconds: 3601 }, { pendingPolicy: 'other' }, { ownerOpenId: 'ou_steal' }])('rejects malformed run edits %j', patch => expect(() => parseSettingsEdit({ scope: agent, section: 'run', revision: 'x', patch })).toThrow());
++  it('rejects wrong action values and arbitrary fields', () => {
++    expect(() => parseSettingsAction({ kind: 'setCliBridgeEnabled', botId, enabled: 'true', revision: 'x' })).toThrow();
++    expect(() => parseSettingsAction({ kind: 'adminMember', botId, openId: 'bad', membership: 'present', revision: 'x' })).toThrow();
++    expect(() => parseSettingsEdit({ scope: agent, section: 'cliBridge', revision: 'x', patch: { includeBridgeOwnedSessionsForDebugging: true } })).toThrow();
++  });
++});
++it('serializes card and HTTP preference edits, preserves unknown nested keys and secrets, reports running concurrency', async () => {
++  const { owner, writer } = await fixture(); const view = await owner.read(agent) as AgentSettingsView;
++  const [save] = await Promise.all([owner.save({ scope: agent, section: 'run', revision: view.sections.run.revision, patch: { maxConcurrentRuns: 7 } }), writer(p => { p.showToolCalls = false; })]);
++  expect(save.kind).toBe('saved');
++  const fresh = await owner.read(agent) as AgentSettingsView;
++  expect(fresh.sections.run.stored.maxConcurrentRuns).toBe(7); expect(fresh.sections.run.effective.maxConcurrentRuns).toBe(10);
++  expect(fresh.sections.cards.effective.showToolCalls).toBe(false);
++  await owner.save({ scope: agent, section: 'completion', revision: fresh.sections.completion.revision, patch: { mode: 'always' } });
++  await owner.save({ scope: agent, section: 'cliBridge', revision: fresh.sections.cliBridge.revision, patch: { presence: { enabled: true, platform: 'auto', idleThresholdSeconds: 77 } } });
++  await owner.save({ scope: agent, section: 'titles', revision: fresh.sections.titles.revision, patch: { byBackend: { 'codex-appserver': { enabled: false } } } });
++  const disk = await loadConfig() as AppConfig & { futureRoot: number };
++  expect(disk.accounts).toEqual(cfg.accounts); expect(disk.secrets).toEqual(cfg.secrets); expect(disk.futureRoot).toBe(17);
++  expect(disk.preferences?.completionReminder).toMatchObject({ future: true, mode: 'always' });
++  expect(disk.preferences?.cliBridge?.presence).toMatchObject({ future: 8, idleThresholdSeconds: 77 });
++  expect(disk.preferences?.sessionTitles?.byBackend?.['codex-appserver']).toMatchObject({ model: 'custom-title', future: 3, enabled: false });
++  expect(JSON.stringify(fresh)).not.toMatch(/fixture-secret|SECRET|futurePreference|futureRoot/);
++});
++it('checks same-section revision inside owner queue', async () => {
++  const { owner } = await fixture(); const view = await owner.read(agent) as AgentSettingsView;
++  const results = await Promise.all([5, 6].map(maxConcurrentRuns => owner.save({ scope: agent, section: 'run', revision: view.sections.run.revision, patch: { maxConcurrentRuns } })));
++  expect(results.map(r => r.kind)).toEqual(['saved', 'conflict']);
++});
++it('rejects external file changes and leaves LIVE untouched', async () => {
++  const { owner } = await fixture(); const view = await owner.read(agent) as AgentSettingsView;
++  await saveConfig({ ...cfg, preferences: { ...cfg.preferences, showToolCalls: false } });
++  const result = await owner.save({ scope: agent, section: 'run', revision: view.sections.run.revision, patch: { maxConcurrentRuns: 5 } });
++  expect(result.kind).toBe('rejected'); expect(cfg.preferences?.maxConcurrentRuns).toBeUndefined(); expect((await loadConfig()).preferences?.showToolCalls).toBe(false);
++});
++it('failed persistence cannot mutate nested live preferences', async () => {
++  const write = createAppPreferencesWriter({ cfg, persistConfig: async () => { throw new Error('disk'); } });
++  await expect(write(p => { p.cliBridge!.presence!.enabled = false; })).rejects.toThrow();
++  expect(cfg.preferences?.cliBridge?.presence?.enabled).toBeUndefined();
++});
++it('validates models, allows custom title ids, resets actual project and session overrides', async () => {
++  const { owner } = await fixture(); let p = await owner.read(project) as ProjectSettingsView;
++  expect((await owner.save({ scope: project, section: 'model', revision: p.sections.model.revision, patch: { selection: { kind: 'explicit', model: 'missing', effort: 'high' } } })).kind).toBe('rejected');
++  expect((await owner.save({ scope: project, section: 'model', revision: p.sections.model.revision, patch: { selection: { kind: 'explicit', model: 'fixture-model', effort: 'high' } } })).kind).toBe('saved');
++  p = await owner.read(project) as ProjectSettingsView;
++  await owner.save({ scope: project, section: 'model', revision: p.sections.model.revision, patch: { selection: { kind: 'default' } } });
++  expect((await getProjectByName('demo'))?.defaultModel).toBeUndefined();
++  const s = await owner.read(session) as SessionSettingsView;
++  await owner.save({ scope: session, section: 'model', revision: s.sections.model.revision, patch: { selection: { kind: 'default' } } });
++  expect(await getSession(session.threadId)).not.toHaveProperty('model'); expect(await getSession(session.threadId)).not.toHaveProperty('effort');
++  const a = await owner.read(agent) as AgentSettingsView;
++  expect((await owner.save({ scope: agent, section: 'titles', revision: a.sections.titles.revision, patch: { byBackend: { 'codex-appserver': { enabled: true, model: 'third-party-custom', effort: 'ultra' } } } })).kind).toBe('saved');
++});
++it('stale resume identity conflicts and cannot change the replacement session', async () => {
++  const { owner } = await fixture(); const old = await owner.read(session) as SessionSettingsView;
++  const rec = (await getSession(session.threadId))!; await upsertSession({ ...rec, sessionId: 'native-two' });
++  expect((await owner.save({ scope: session, section: 'model', revision: old.sections.model.revision, patch: { selection: { kind: 'default' } } })).kind).toBe('conflict');
++  expect((await getSession(session.threadId))?.model).toBe('fixture-model');
++});
++it('membership operations retain owner and preserve concurrent project edits', async () => {
++  const { owner } = await fixture(); const a = await owner.read(agent) as AgentSettingsView;
++  expect((await owner.act({ kind: 'adminMember', botId, openId: 'ou_owner', membership: 'absent', revision: a.administrators.revision })).kind).toBe('rejected');
++  const p = await owner.read(project) as ProjectSettingsView;
++  await updateProject('demo', { autoCompact: false });
++  expect((await owner.act({ kind: 'projectMember', botId, projectName: 'demo', openId: 'ou_member', membership: 'present', revision: p.members.revision })).kind).toBe('saved');
++  const now = await owner.read(project) as ProjectSettingsView;
++  await owner.act({ kind: 'projectMember', botId, projectName: 'demo', openId: 'ou_member', membership: 'absent', revision: now.members.revision });
++  expect(await getProjectByName('demo')).toMatchObject({ autoCompact: false, allowedUsers: [] });
++});
++it.each([false, true])('CLI persist failure compensates runtime; compensation failure=%s is explicit', async failedRollback => {
++  const start = vi.fn(async () => {}); const shutdown = vi.fn(async () => { if (failedRollback) throw new Error('stop failed'); });
++  const { owner } = await fixture({ cliBridge: { start, shutdown }, writePreferences: createAppPreferencesWriter({ cfg, persistConfig: async () => { throw new Error('disk'); } }) });
++  const view = await owner.read(agent) as AgentSettingsView;
++  const result = await owner.act({ kind: 'setCliBridgeEnabled', botId, enabled: true, revision: view.cliRuntime.revision });
++  expect(result.kind).toBe(failedRollback ? 'diverged' : 'rejected'); expect(start).toHaveBeenCalledOnce(); expect(shutdown).toHaveBeenCalledOnce(); expect(cfg.preferences?.cliBridge?.enabled).toBe(false);
++});
++it('comment partial propagation reports saved master and retryable warning', async () => {
++  let text = 'original';
++  const { owner } = await fixture({ instructions: { read: async () => text, save: async next => { text = next; }, sync: async () => { throw new Error('partial'); } } });
++  const view = await owner.read(agent) as AgentSettingsView;
++  const result = await owner.act({ kind: 'commentInstructions', botId, revision: view.commentInstructions.revision, content: { kind: 'custom', text: 'Updated {fileToken}' } });
++  expect(result.kind).toBe('saved'); if (result.kind === 'saved') expect(result.warnings).toHaveLength(1); expect(text).toBe('Updated {fileToken}');
++});
++it('returns the exact settings result through executor and real IPC responder', async () => {
++  const { owner } = await fixture(); const executor = createAdminWriteExecutor({ settings: owner, backendFor: () => backend, evictLiveSessionsForChat: async () => {} });
++  const caller = createAdminIpcCaller(request => responder(request));
++  const responder = createAdminIpcResponder(op => op.kind === 'settingsRead' ? owner.read(op.scope) : executor(op as Parameters<typeof executor>[0]), response => caller.onMessage(response));
++  const view = await caller.call({ kind: 'settingsRead', scope: agent }) as AgentSettingsView;
++  const result = await caller.call({ kind: 'settingsPatch', edit: { scope: agent, section: 'cards', revision: view.sections.cards.revision, patch: { showToolCalls: false } } });
++  expect(result).toMatchObject({ kind: 'saved', section: { section: 'cards', value: { stored: { showToolCalls: false } } } });
++});
++it('authenticated HTTP preserves result unions and rejects malformed or cross-agent requests', async () => {
++  const { createWebServer } = await import('../src/web/server');
++  const { owner } = await fixture();
++  const service = { settings: owner } as import('../src/admin/service').AdminService;
++  const server = createWebServer({ service, token: 'fixture-token' });
++  const { port } = await server.listen(0);
++  const base = `http://127.0.0.1:${port}`;
++  const request = (route: string, method = 'GET', value?: unknown, headers: Record<string, string> = {}) => fetch(base + route, { method, headers: { Authorization: 'Bearer fixture-token', 'Content-Type': 'application/json', ...headers }, ...(value === undefined ? {} : { body: JSON.stringify(value) }) });
++  try {
++    const route = `/api/bots/${botId}/settings`;
++    expect((await fetch(base + route)).status).toBe(401);
++    expect((await request(route, 'GET', undefined, { Origin: 'https://evil.invalid' })).status).toBe(403);
++    const view = await (await request(route)).json() as AgentSettingsView;
++    const input = { revision: view.sections.run.revision, patch: { maxConcurrentRuns: 3 } };
++    const result = await request(route + '/run', 'PATCH', input);
++    expect(result.status).toBe(200); expect(await result.json()).toMatchObject({ kind: 'saved', section: { value: { stored: { maxConcurrentRuns: 3 } } } });
++    expect((await request(route + '/run', 'PATCH', input)).status).toBe(409);
++    expect((await request(route + '/run', 'PATCH', { ...input, patch: { maxConcurrentRuns: '5' } })).status).toBe(400);
++    expect((await request(route + '/actions', 'POST', { kind: 'repairCliHooks', botId: 'cli_other' })).status).toBe(400);
++    const projectView = await (await request('/api/project/demo/settings?bot=cli_fixture')).json() as ProjectSettingsView;
++    expect((await request('/api/project/demo/settings?bot=cli_fixture', 'PATCH', { section: 'compact', revision: projectView.sections.compact.revision, patch: { autoCompact: false } })).status).toBe(200);
++    expect((await request('/api/project/demo/no-mention?bot=cli_fixture', 'POST', { on: 'yes' })).status).toBe(400);
++    expect((await request(`/api/bots/${botId}/sessions/missing/settings`)).status).toBe(404);
++  } finally { await server.close(); }
++});
++it('readonly owner never permits writes; failed catalogs do not disable unrelated settings', async () => {
++  const { owner: readonly } = await fixture({ access: { kind: 'readonly', reason: 'owner-offline', message: 'Stopped' } });
++  const view = await readonly.read(agent) as AgentSettingsView;
++  expect((await readonly.save({ scope: agent, section: 'cards', revision: view.sections.cards.revision, patch: { showToolCalls: false } })).kind).toBe('unavailable');
++  const { owner } = await fixture({ backendFor: () => ({ ...backend, listModels: async () => { throw new Error('private diagnostics'); } }) });
++  const p = await owner.read(project) as ProjectSettingsView;
++  expect((await owner.save({ scope: project, section: 'model', revision: p.sections.model.revision, patch: { selection: { kind: 'explicit', model: 'fixture-model', effort: 'high' } } })).kind).toBe('rejected');
++  expect((await owner.save({ scope: agent, section: 'cards', revision: view.sections.cards.revision, patch: { showToolCalls: false } })).kind).toBe('saved');
++  expect(JSON.stringify(await owner.models({ botId, backend: 'codex-appserver', purpose: 'project' }))).not.toContain('private diagnostics');
++});
++it('CLI desired-state retries start once and repair hooks reports each failed backend', async () => {
++  const start = vi.fn(async () => {}); const shutdown = vi.fn(async () => {});
++  const install = vi.fn(async (options: import('../src/cli-bridge/hooks').InstallCliBridgeHooksOptions) => { if ((options as { agents: { claude: boolean } }).agents.claude) throw new Error('claude readonly'); });
++  const { owner } = await fixture({ cliBridge: { start, shutdown }, hooks: { inspect: hooks.inspect, install } });
++  const view = await owner.read(agent) as AgentSettingsView;
++  const action = { kind: 'setCliBridgeEnabled' as const, botId, enabled: true, revision: view.cliRuntime.revision };
++  expect((await owner.act(action)).kind).toBe('saved'); expect((await owner.act(action)).kind).toBe('saved'); expect(start).toHaveBeenCalledOnce();
++  const result = await owner.act({ kind: 'repairCliHooks', botId });
++  expect(install).toHaveBeenCalledTimes(2); if (result.kind === 'saved') expect(result.warnings).toHaveLength(1); else throw new Error(result.kind);
++});
++it('project persistence survives failed runtime eviction with an explicit restart effect', async () => {
++  const { owner } = await fixture({ evictLiveSessionsForChat: async () => { throw new Error('busy'); } });
++  const view = await owner.read(project) as ProjectSettingsView;
++  const result = await owner.save({ scope: project, section: 'compact', revision: view.sections.compact.revision, patch: { autoCompact: false } });
++  expect(result.kind).toBe('saved'); if (result.kind === 'saved') expect(result.effects.some(e => e.when === 'restart')).toBe(true);
++  expect((await getProjectByName('demo'))?.autoCompact).toBe(false);
++});
++it('real instruction propagation retains saved master and reports partial filesystem failure', async () => {
++  const { join } = await import('node:path');
++  const healthy = join(paths.commentsRootDir, 'comment-docx-healthy');
++  const broken = join(paths.commentsRootDir, 'comment-docx-broken');
++  await mkdir(healthy, { recursive: true }); await mkdir(join(broken, 'AGENTS.md'), { recursive: true });
++  const { owner } = await fixture(); const view = await owner.read(agent) as AgentSettingsView;
++  const result = await owner.act({ kind: 'commentInstructions', botId, revision: view.commentInstructions.revision, content: { kind: 'custom', text: 'Use {fileToken} safely' } });
++  expect(result.kind).toBe('saved'); if (result.kind === 'saved') expect(result.warnings).toHaveLength(1);
++  expect(await readFile(paths.commentInstructionsFile, 'utf8')).toBe('Use {fileToken} safely');
++  expect(await readFile(join(healthy, 'AGENTS.md'), 'utf8')).toBe('Use healthy safely');
++});
+diff --git a/test/web-admin-host.test.ts b/test/web-admin-host.test.ts
+index 658b4d4fac4cbc9c0963735a0ac02dc69418a734..4ce286374c60e4bc176c09807ddd7b315957853b 100644
+--- a/test/web-admin-host.test.ts
++++ b/test/web-admin-host.test.ts
+@@ -204,17 +204,35 @@ describe('AdminService · setBotEnabled（活跃集 enabled 落盘）', () => {
+ });
+ 
+ describe('AdminService · deleteBot（删除 + 保护分支）', () => {
+-  it('唯一 bot 拒删（给清晰提示），注册表/密钥/目录都不动', async () => {
++  it('启用中的唯一 bot 拒删，注册表/密钥/目录都不动', async () => {
+     await saveBots({ version: 1, current: BOT_A, bots: [{ name: 'alpha', appId: BOT_A, tenant: 'feishu', createdAt: 1, active: true }] });
+     await setSecret(secretKeyForApp(BOT_A), 'secret-A');
+     const svc = createAdminService();
+     const r = await svc.deleteBot(BOT_A);
+     expect(r.ok).toBe(false);
+-    if (!r.ok) expect(r.reason).toContain('唯一');
++    if (!r.ok) expect(r.reason).toContain('启用');
+     expect((await loadBots()).bots).toHaveLength(1);
+     expect(await listSecretIds()).toContain(secretKeyForApp(BOT_A));
+   });
+ 
++  it('已停用且停止的唯一 bot 可删除，空注册表可读并能再次注册', async () => {
++    await saveBots({ version: 1, current: BOT_A, bots: [{ name: 'alpha', appId: BOT_A, tenant: 'feishu', createdAt: 1, active: false }] });
++    const service = createAdminService();
++    expect((await service.deleteBot(BOT_A)).ok).toBe(true);
++    expect((await loadBots()).bots).toEqual([]);
++    expect(await service.listBots()).toEqual([]);
++    await saveBots({ version: 1, current: BOT_A, bots: [{ name: 'alpha', appId: BOT_A, tenant: 'feishu', createdAt: 2, active: false }] });
++    expect((await service.listBots()).map(bot => bot.appId)).toEqual([BOT_A]);
++  });
++
++  it('运行中即使零会话也拒绝删除，保留注册表和凭据', async () => {
++    const svc = createAdminService({ liveStatus: async () => ({ running: true }) });
++    const result = await svc.deleteBot(BOT_B);
++    expect(result.ok).toBe(false);
++    if (!result.ok) expect(result.reason).toContain('仍在运行');
++    expect((await loadBots()).bots.some(bot => bot.appId === BOT_B)).toBe(true);
++  });
++
+   it('运行中且有活跃会话的 bot 拒删（liveStatus 注入 running + 写 session 记录）', async () => {
+     useBotDir(BOT_B);
+     await addProject({ name: 'p-b', chatId: 'oc_b', cwd: '/tmp/p-b', blank: false, createdAt: 1 });
+@@ -227,7 +245,7 @@ describe('AdminService · deleteBot（删除 + 保护分支）', () => {
+     });
+     const r = await svc.deleteBot(BOT_B);
+     expect(r.ok).toBe(false);
+-    if (!r.ok) expect(r.reason).toContain('活跃会话');
++    if (!r.ok) expect(r.reason).toContain('仍在运行');
+     expect((await loadBots()).bots.some((b) => b.appId === BOT_B)).toBe(true);
+   });
+ 
+@@ -239,6 +257,7 @@ describe('AdminService · deleteBot（删除 + 保护分支）', () => {
+ 
+     // 未运行（无 liveStatus、无锁文件）→ 保护②不触发，可删。
+     const svc = createAdminService();
++    await svc.setBotEnabled(BOT_B, false);
+     const r = await svc.deleteBot(BOT_B);
+     expect(r.ok).toBe(true);
+     const reg = await loadBots();

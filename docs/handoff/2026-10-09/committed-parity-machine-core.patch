@@ -1,0 +1,220 @@
+diff --git a/src/admin/host.ts b/src/admin/host.ts
+index 65b0d0d904fdf8a67bf3270af9b28ad929f2b12c..aaf65eed8e4335afea76277edae0a759b74c4d5e 100644
+--- a/src/admin/host.ts
++++ b/src/admin/host.ts
+@@ -1,3 +1,4 @@
++import type {Distribution} from '../service/distribution';
+ import { readdir, stat } from 'node:fs/promises';
+ import { dirname, join, resolve } from 'node:path';
+ import { fileURLToPath } from 'node:url';
+@@ -36,6 +37,7 @@ import type { UpdateCheck } from '../service/update';
+ 
+ /** daemon 生命周期快照（GET /api/daemon）。service 注册状态 + 运行 pid/版本/时长。 */
+ export interface DaemonStatus {
++  distribution?: Distribution;
+   /** 本平台的服务管理器名（launchd / Task Scheduler / systemd），未支持平台为 undefined。 */
+   platformName?: string;
+   /** 服务定义（plist/task/unit）已注册到 OS。 */
+diff --git a/src/admin/service.ts b/src/admin/service.ts
+index 376d017d84849a00b9925a112e97a92a7d6a8c58..dcf72323f3bb8263f6b4012d4c43c9fa348e338a 100644
+--- a/src/admin/service.ts
++++ b/src/admin/service.ts
+@@ -1,3 +1,4 @@
++import {runtimeDistribution} from '../service/distribution';
+ import { createSettingsService } from './settings-service';
+ import type { HostSettings } from './settings-types';
+ import type { AdminSettingsReadOp } from './ipc';
+@@ -871,7 +872,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
+       } catch {
+         status = undefined;
+       }
+-      return toDaemonStatus({ status, version: bridgeVersion(), startedAt: deps.daemonStartedAt });
++      return {...toDaemonStatus({ status, version: bridgeVersion(), startedAt: deps.daemonStartedAt }), distribution:await runtimeDistribution()};
+     },
+ 
+     async restartDaemon(): Promise<void> {
+@@ -908,6 +909,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
+ 
+     async applyUpdate(): Promise<void> {
+       if (!deps.applyUpdate) throw new NotWiredYetError('⬆️ 升级');
++      if ((await runtimeDistribution()).kind !== 'global-npm') throw new Error('This Core is not owned by the global npm installation. Update its desktop app or source distribution instead.');
+       // 清掉上一次的结果，之后 Web 轮询读到的状态才确定属于本次升级（helper 会重写）。
+       clearUpdateStatus();
+       deps.applyUpdate();
+diff --git a/src/host/service.ts b/src/host/service.ts
+index aef1f2978927ba83ca251f784644d221f70df057..08c109689404105cda566e5ac0547ba870b4c131 100644
+--- a/src/host/service.ts
++++ b/src/host/service.ts
+@@ -8,6 +8,9 @@ export async function controlDesktopService(
+   inspect:()=>Promise<HostInspection> = ()=>inspectHost(homedir()),
+ ) {
+   if (!['status','install','start','stop','uninstall'].includes(action)) throw new Error('Unknown service operation.');
++  const before = await adapter.status();
++  if (action === 'start' && (!before.installed || before.running)) throw new Error('Service must be installed and stopped before starting.');
++  if (action === 'install' && before.installed) throw new Error('Service is already installed.');
+   if (action === 'install' || action === 'start') {
+     const host = await inspect();
+     if (host.kind !== 'absent') throw new Error('Stop the current Bridge before changing its service registration.');
+diff --git a/src/service/distribution.ts b/src/service/distribution.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c824cec10c7ae7c829a15275c713a79fb6316fc2
+--- /dev/null
++++ b/src/service/distribution.ts
+@@ -0,0 +1,31 @@
++import {existsSync, realpathSync} from 'node:fs';
++import {dirname, join, resolve} from 'node:path';
++import {fileURLToPath} from 'node:url';
++import {spawnProcess} from '../platform/spawn';
++
++export type Distribution = {kind:'global-npm'|'bundled'|'development'|'unknown';cliPath:string};
++
++export function classifyDistribution(root:string, globalRoot?:string):Distribution {
++  const cliPath = join(root,'bin','feishu-codex-bridge.mjs');
++  if (existsSync(join(root,'.git'))) return {kind:'development',cliPath};
++  if (existsSync(join(root,'..','provenance.json')) && /[\\/]runtime[\\/]core$/.test(root)) return {kind:'bundled',cliPath};
++  try {
++    if (globalRoot && realpathSync(root) === realpathSync(join(globalRoot,'@modelzen','feishu-codex-bridge'))) return {kind:'global-npm',cliPath};
++  } catch {}
++  return {kind:'unknown',cliPath};
++}
++
++export async function runtimeDistribution():Promise<Distribution> {
++  const root = resolve(dirname(fileURLToPath(import.meta.url)),'..');
++  const local = classifyDistribution(root);
++  if (local.kind !== 'unknown') return local;
++  const globalRoot = await new Promise<string|undefined>(resolveRoot=>{
++    const child = spawnProcess('npm',['root','-g'],{stdio:['ignore','pipe','ignore']});
++    let output = '';
++    const timer = setTimeout(()=>{child.kill();resolveRoot(undefined);},5000);
++    child.stdout?.on('data',(chunk:Buffer)=>{output += chunk.toString();if(output.length>8192) child.kill();});
++    child.once('error',()=>{clearTimeout(timer);resolveRoot(undefined);});
++    child.once('close',code=>{clearTimeout(timer);resolveRoot(code===0 && output.length<=8192 ? output.trim():undefined);});
++  });
++  return classifyDistribution(root,globalRoot);
++}
+diff --git a/src/service/update.ts b/src/service/update.ts
+index 634bae78f7f5a1657b5b0c7c27968d6cc29028fb..b7e44d4098a45b83923118f6f9f568f1c2180a5f 100644
+--- a/src/service/update.ts
++++ b/src/service/update.ts
+@@ -1,3 +1,4 @@
++import {runtimeDistribution} from './distribution';
+ import { closeSync, existsSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+ import { dirname, join, resolve } from 'node:path';
+ import { fileURLToPath } from 'node:url';
+@@ -111,6 +112,7 @@ export interface InstallResult {
+  * it, output is captured and the tail returned for surfacing in a card.
+  */
+ export async function installLatest(opts: { inherit?: boolean } = {}): Promise<InstallResult> {
++  if ((await runtimeDistribution()).kind !== 'global-npm') return {ok:false,message:'当前 Core 不属于全局 npm 安装，请更新所属桌面应用或源码。'};
+   const target = `${packageName()}@latest`;
+   return await new Promise<InstallResult>((resolveP) => {
+     const child = spawnProcess(NPM, ['install', '-g', target], {
+diff --git a/test/desktop-service.test.ts b/test/desktop-service.test.ts
+index f5deac10ca929ee42c22f30bd270a98e51056cf5..e957f02dfb77d6be27a1ec5a340fe135debf8992 100644
+--- a/test/desktop-service.test.ts
++++ b/test/desktop-service.test.ts
+@@ -3,9 +3,9 @@ import {controlDesktopService} from '../src/host/service';
+ import type {ServiceAdapter} from '../src/service/adapter';
+ 
+ const state={platformName:'fixture',installed:false,running:false,servicePath:'/isolated/service',stdoutPath:'/isolated/out',stderrPath:'/isolated/err',raw:'private manager output'};
+-function fixture() {
++function fixture(installed=false) {
+   const calls:string[]=[];
+-  const adapter:ServiceAdapter={status:async()=>({...state}),install:async()=>{calls.push('install');return state;},restart:async()=>{calls.push('start');return state;},uninstall:async()=>{calls.push('uninstall');},logs:async()=>{}};
++  const adapter:ServiceAdapter={status:async()=>({...state,installed}),install:async()=>{calls.push('install');installed=true;return state;},restart:async()=>{calls.push('start');return state;},uninstall:async()=>{calls.push('uninstall');},logs:async()=>{}};
+   return {adapter,calls};
+ }
+ describe('desktop service boundary',()=>{
+@@ -19,11 +19,16 @@ describe('desktop service boundary',()=>{
+   });
+   it('does not replace a live or blocked host service registration',async()=>{
+     for(const action of ['install','start']) {
+-      const {adapter,calls}=fixture();
++      const {adapter,calls}=fixture(action==='start');
+       await expect(controlDesktopService(action,adapter,async()=>({kind:'attached',pid:123}))).rejects.toThrow('Stop the current Bridge');
+       expect(calls).toEqual([]);
+     }
+   });
++  it('refuses starting an absent service without invoking restart',async()=>{
++    const {adapter,calls}=fixture();
++    await expect(controlDesktopService('start',adapter,async()=>({kind:'absent'}))).rejects.toThrow('installed and stopped');
++    expect(calls).toEqual([]);
++  });
+   it('maps fixed operations and rejects arbitrary commands',async()=>{
+     const {adapter,calls}=fixture();
+     for(const action of ['install','start','stop','uninstall']) await controlDesktopService(action,adapter,async()=>({kind:'absent'}));
+diff --git a/test/distribution-update.test.ts b/test/distribution-update.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d56484245c4aa168a78194073b41964a2aa7183f
+--- /dev/null
++++ b/test/distribution-update.test.ts
+@@ -0,0 +1,9 @@
++import {it,expect,vi} from 'vitest';
++import {installLatest} from '../src/service/update';
++import {spawnProcess} from '../src/platform/spawn';
++vi.mock('../src/service/distribution',()=>({runtimeDistribution:async()=>({kind:'bundled',cliPath:'/App/runtime/core/bin/bridge'})}));
++vi.mock('../src/platform/spawn',()=>({spawnProcess:vi.fn()}));
++it('bundled CLI and card update cannot install an unrelated global npm package',async()=>{
++  expect((await installLatest()).ok).toBe(false);
++  expect(spawnProcess).not.toHaveBeenCalled();
++});
+diff --git a/test/distribution.test.ts b/test/distribution.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..cbda0806e6141fec16fb124521f09aba13856cd6
+--- /dev/null
++++ b/test/distribution.test.ts
+@@ -0,0 +1,22 @@
++import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';
++import {tmpdir} from 'node:os';
++import {join} from 'node:path';
++import {it,expect} from 'vitest';
++import {classifyDistribution} from '../src/service/distribution';
++
++it('distinguishes bundled service from the active global npm package',()=>{
++  const dir=mkdtempSync(join(tmpdir(),'bridge-distribution-'));
++  try {
++    const globalRoot=join(dir,'node_modules');
++    const globalPackage=join(globalRoot,'@modelzen','feishu-codex-bridge');
++    const bundled=join(dir,'App','runtime','core');
++    mkdirSync(globalPackage,{recursive:true});
++    mkdirSync(bundled,{recursive:true});
++    writeFileSync(join(bundled,'..','provenance.json'),'{}');
++    expect(classifyDistribution(globalPackage,globalRoot).kind).toBe('global-npm');
++    expect(classifyDistribution(bundled,globalRoot).kind).toBe('bundled');
++    expect(classifyDistribution(join(dir,'unknown'),globalRoot).kind).toBe('unknown');
++    mkdirSync(join(dir,'source','.git'),{recursive:true});
++    expect(classifyDistribution(join(dir,'source'),globalRoot).kind).toBe('development');
++  } finally {rmSync(dir,{recursive:true,force:true});}
++});
+diff --git a/test/web-admin-host.test.ts b/test/web-admin-host.test.ts
+index 4ce286374c60e4bc176c09807ddd7b315957853b..5ee97a14cfa2f1ab97bcad9956033355c96fdca8 100644
+--- a/test/web-admin-host.test.ts
++++ b/test/web-admin-host.test.ts
+@@ -1,3 +1,4 @@
++import {runtimeDistribution} from '../src/service/distribution';
+ import { rmSync, existsSync } from 'node:fs';
+ import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+ import { paths, botDir, useBotDir } from '../src/config/paths';
+@@ -8,6 +9,8 @@ import { setSecret, listSecretIds } from '../src/config/keystore';
+ import { secretKeyForApp } from '../src/config/schema';
+ import { createAdminService, createReadonlyAdminService, NotWiredYetError } from '../src/admin/service';
+ 
++vi.mock('../src/service/distribution',()=>({runtimeDistribution:vi.fn(async()=>({kind:'global-npm',cliPath:'/fixture/bin/bridge'}))}));
++
+ // 临时目录隔离 ~/.feishu-codex-bridge（同 web-admin-service.test 的做法）。
+ vi.mock('../src/config/paths', async () => {
+   const { mkdtempSync } = await import('node:fs');
+@@ -135,6 +138,13 @@ describe('AdminService · restartDaemon / applyUpdate（detached helper 注入
+     await expect(svc.applyUpdate()).rejects.toBeInstanceOf(NotWiredYetError);
+   });
+ 
++  it('bundled service refuses global npm update before invoking its helper',async()=>{
++    vi.mocked(runtimeDistribution).mockResolvedValueOnce({kind:'bundled',cliPath:'/App/runtime/core/bin/bridge'});
++    const update=vi.fn();
++    await expect(createAdminService({applyUpdate:update}).applyUpdate()).rejects.toThrow('not owned');
++    expect(update).not.toHaveBeenCalled();
++  });
++
+   it('daemon 内：调用注入的 helper 触发器（不真跑，只验证被调一次）', async () => {
+     const restart = vi.fn();
+     const update = vi.fn();

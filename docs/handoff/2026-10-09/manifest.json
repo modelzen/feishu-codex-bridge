@@ -1,0 +1,82 @@
+{
+  "date": "2026-10-09",
+  "developmentBase": "codex/m1-desktop-capabilities",
+  "snapshots": [
+    {
+      "name": "full-parity-tests",
+      "sourceBranch": "codex/full-parity-tests",
+      "baseCommit": "21ed17cab64df7c1b481c56d63ea6aa51fc212ad",
+      "baseRef": "codex/archive-20261009/full-parity-tests",
+      "patch": "full-parity-tests.patch",
+      "sha256": "ca1a1e022b798448e38f6bce8cfee94b7e2ace9cb49d0f1dde24425bf9ba1a83",
+      "resultTree": "d7ef01db1471a86ca9b35815e50aec104af75b71",
+      "files": [
+        "test/no-mention-parity.test.ts",
+        "test/settings-parity-cases.test.ts"
+      ],
+      "verification": "Patch replay against baseCommit reproduces the captured Git tree."
+    },
+    {
+      "name": "settings-parity-core",
+      "sourceBranch": "codex/settings-parity-core",
+      "baseCommit": "5674cc9b1c74a8de5c0785fa4927d4382c93515d",
+      "baseRef": "codex/archive-20261009/settings-parity-core",
+      "patch": "settings-parity-core.patch",
+      "sha256": "7e1932d4073ab176bb8494b4e28c079a0f2b3a78d1b655c5e183366ba72c7d5e",
+      "resultTree": "266ffd2950810809d32790a4d1e29f019abbb16b",
+      "files": [
+        "src/admin/host-settings.ts",
+        "src/admin/ipc.ts",
+        "src/admin/ops.ts",
+        "src/admin/service.ts",
+        "src/admin/settings-parse.ts",
+        "src/admin/settings-service.ts",
+        "src/admin/settings-types.ts",
+        "src/admin/settings.ts",
+        "src/bot/bridge.ts",
+        "src/bot/comments.ts",
+        "src/bot/handle-message.ts",
+        "src/bot/session-store.ts",
+        "src/bot/supervisor.ts",
+        "src/cli-bridge/service.ts",
+        "src/cli/commands/run.ts",
+        "src/config/schema.ts",
+        "src/config/store.ts",
+        "src/host/bootstrap.ts",
+        "src/host/client.ts",
+        "src/project/registry.ts",
+        "src/web/server.ts",
+        "src/web/settings-routes.ts",
+        "test/admin-ops.test.ts",
+        "test/cli-bridge-runtime.test.ts",
+        "test/comment-settings-runtime.test.ts",
+        "test/host-settings.test.ts",
+        "test/settings-owner.test.ts",
+        "test/web-admin-host.test.ts"
+      ],
+      "verification": "Patch replay against baseCommit reproduces the captured Git tree."
+    },
+    {
+      "name": "committed-parity-machine-core",
+      "sourceBranch": "codex/parity-machine-core",
+      "sourceCommit": "7aee10843b52eba720039f1fb901f4582314a7f1",
+      "baseCommit": "b9b08d85cdc5e48db79907b617ba1b50d0a7dd26",
+      "baseRef": "codex/archive-20261009/committed-parity-machine-core",
+      "patch": "committed-parity-machine-core.patch",
+      "sha256": "811d2edcde14b8d3809422f51913a0d0bea5a4a13f844d3933cb49601b989af6",
+      "resultTree": "69283de754a50817cca7a5b44248332f1c985e91",
+      "files": [
+        "src/admin/host.ts",
+        "src/admin/service.ts",
+        "src/host/service.ts",
+        "src/service/distribution.ts",
+        "src/service/update.ts",
+        "test/desktop-service.test.ts",
+        "test/distribution-update.test.ts",
+        "test/distribution.test.ts",
+        "test/web-admin-host.test.ts"
+      ],
+      "verification": "Patch replay against baseCommit reproduces the historical committed Git tree."
+    }
+  ]
+}
