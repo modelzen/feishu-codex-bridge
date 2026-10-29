@@ -50,7 +50,9 @@ export interface FileContext {
 }
 interface Manifest extends FileContext { files: FileEntry[]; sequence?: number }
 type Paint = (elementId: string, element: CardElement) => Promise<boolean>;
-type Authorize = (context: FileContext, openId: string) => Promise<PermissionMode | undefined>;
+export interface AutoFilePolicy { mode: PermissionMode; directories: string[] }
+type AutoAuthorize = (context: FileContext, openId: string) => Promise<AutoFilePolicy | undefined>;
+type Authorize = (context: FileContext, openId: string) => Promise<PermissionMode | AutoFilePolicy | undefined>;
 interface FileClick { messageId: string; chatId: string; operator?: { openId?: string } }
 
 /** Raw IM responses return message_position; message_app_link is sometimes
@@ -109,6 +111,22 @@ async function inspect(path: string, cwd: string, mode: PermissionMode): Promise
   if (info.size === 0) throw new Error('飞书不支持发送空文件');
   if (info.size > MAX_FILE_BYTES) throw new Error('文件超过 30 MB，无法作为飞书附件发送');
   return { path: canonical, label: basename(path), size: info.size, mtimeMs: info.mtimeMs, ino: info.ino, dev: info.dev };
+}
+
+/** Publication is narrower than the agent's sandbox, including in full mode.
+ * Only explicit relative subdirectories with canonical roots inside cwd qualify. */
+async function inspectPublication(path: string, cwd: string, directories: string[]): Promise<FileSnapshot> {
+  const projectRoot = await realpath(cwd);
+  const canonical = await realpath(path);
+  for (const directory of directories) {
+    if (typeof directory !== 'string' || !directory.trim() || isAbsolute(directory)) continue;
+    const root = resolve(cwd, directory);
+    if (root === resolve(cwd) || !inside(resolve(cwd), root)) continue;
+    const canonicalRoot = await realpath(root).catch(() => undefined);
+    if (!canonicalRoot || canonicalRoot === projectRoot || !inside(projectRoot, canonicalRoot)) continue;
+    if (inside(canonicalRoot, canonical)) return inspect(path, cwd, 'qa');
+  }
+  throw new Error('文件不在本项目配置的自动投递目录内，请由任务发起人确认后手动获取');
 }
 
 function unchanged(a: FileSnapshot, b: Pick<FileSnapshot, 'size' | 'mtimeMs' | 'ino' | 'dev'>): boolean {
@@ -342,6 +360,30 @@ export class OutboundFiles {
     });
   }
 
+  /** Called only after a successful terminal card. Never replay historical
+   * manifests on startup; the current process must have prepared this card. */
+  async sendCompleted(channel: LarkChannel, context: FileContext, outcome: string, authorize: AutoAuthorize): Promise<void> {
+    if (outcome !== 'done' || !context.requesterOpenId) return;
+    await this.ready;
+    const id = createHash('sha256').update(context.messageId).digest('hex');
+    if (!this.bindings.has(id)) return;
+    const manifest = await readFile(join(this.dir, `${id}.json`), 'utf8')
+      .then((raw) => JSON.parse(raw) as Manifest).catch(() => undefined);
+    if (!manifest || manifest.chatId !== context.chatId || manifest.cwd !== context.cwd
+      || manifest.messageId !== context.messageId || manifest.requesterOpenId !== context.requesterOpenId) return;
+    const policy = await authorize(manifest, context.requesterOpenId);
+    if (!policy) return;
+    for (const [index, file] of manifest.files.entries()) {
+      if (!file.occurrences?.length) continue;
+      // Input/source references outside publication roots remain manual. Do not
+      // turn an ordinary final answer into a batch of permission warnings.
+      if (!await inspectPublication(file.path, manifest.cwd, policy.directories).catch(() => undefined)) continue;
+      await this.deliver(channel, {
+        messageId: context.messageId, chatId: context.chatId, operator: { openId: context.requesterOpenId },
+      }, { id, i: index }, authorize);
+    }
+  }
+
   async deliver(
     channel: LarkChannel,
     evt: FileClick,
@@ -380,7 +422,8 @@ export class OutboundFiles {
     try {
       manifest = JSON.parse(await readFile(join(this.dir, `${id}.json`), 'utf8')) as Manifest;
       if (manifest.messageId !== evt.messageId || manifest.chatId !== evt.chatId) return;
-      const mode = await authorize(manifest, evt.operator?.openId ?? '');
+      const permission = await authorize(manifest, evt.operator?.openId ?? '');
+      const mode = typeof permission === 'string' ? permission : permission?.mode;
       if (!mode) throw new Error('当前无权获取此文件，请由任务发起人或管理员操作');
       authorized = true;
       file = manifest.files[index];
@@ -403,11 +446,21 @@ export class OutboundFiles {
       await this.save(id, manifest);
       await this.repaint(channel, id, manifest, index, true);
       const policy = manifest.mode === 'full' && mode === 'full' ? 'full' : 'qa';
-      const current = await inspect(file.path, manifest.cwd, policy);
+      const current = typeof permission === 'object'
+        ? await inspectPublication(file.path, manifest.cwd, permission.directories)
+        : await inspect(file.path, manifest.cwd, policy);
       if (!unchanged(file, current) || current.path !== file.path) throw new Error('本地文件已变化，请让 agent 重新引用后获取');
       if (!file.fileKey) {
         file.fileKey = await uploadFile(channel, file);
         await this.save(id, manifest);
+      }
+      if (typeof permission === 'object') {
+        // Upload can take seconds. Recheck the current opt-in, membership and
+        // canonical publication roots before making the attachment visible.
+        const latest = await authorize(manifest, evt.operator?.openId ?? '');
+        if (!latest || typeof latest === 'string') throw new Error('项目自动投递设置或任务发起人权限已变化，请确认后重试');
+        const checked = await inspectPublication(file.path, manifest.cwd, latest.directories);
+        if (!unchanged(file, checked) || checked.path !== file.path) throw new Error('本地文件已变化，请让 agent 重新引用后获取');
       }
       file.sendStartedAt ??= Date.now();
       file.sendUuid ??= randomUUID();

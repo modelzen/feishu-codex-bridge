@@ -33,6 +33,10 @@ export interface Project {
   /** 项目级响应白名单：谁能让 bot 在本群响应/跑 codex。空/缺省 = 所有人；
    * admin/owner 恒豁免（见 isUserAllowedInProject）。 */
   allowedUsers?: string[];
+  /** File publication policy, independent of the agent sandbox. Missing/manual
+   * preserves click-to-send. Auto only sends final references in relative cwd
+   * subdirectories after a successful turn; never scans/replays old outputs. */
+  fileDelivery?: { mode: 'manual' | 'auto'; directories: string[] };
   /** permission tier for codex's sandbox — the tier ADMINS/owner get. Omitted on
    * old data → treated as 'full' (danger-full-access), preserving prior behavior.
    * Read via {@link effectiveMode}. 'qa'/'write' confine reads+writes to `cwd`. */

@@ -178,7 +178,7 @@ import { serviceStdoutPath, serviceStderrPath } from '../service/common';
 import { bridgeVersion } from '../core/version';
 import { webConsoleUrl } from '../web/discovery';
 import { paths } from '../config/paths';
-import { OutboundFiles } from './outbound-files';
+import { OutboundFiles, type FileContext } from './outbound-files';
 import { getSecret } from '../config/keystore';
 import { buildScopeGrantUrl, JOIN_GROUP_SCOPES } from '../config/scopes';
 import { validateAppCredentials } from '../utils/feishu-auth';
@@ -2171,6 +2171,15 @@ export function createOrchestrator(
     if (openId !== record.requesterOpenId && !isAdmin(cfg, openId)) return undefined;
     return turnTier(project, isAdmin(cfg, openId)).mode;
   });
+  const sendCompletedFiles = (context: FileContext, outcome: string): Promise<void> =>
+    outboundFiles.sendCompleted(channel, context, outcome, async (record, openId) => {
+      if (!openId || !isChatAllowed(cfg, record.chatId)) return undefined;
+      const project = await getProjectByChatId(record.chatId);
+      if (!project || project.cwd !== record.cwd || !isUserAllowedInProject(cfg, project, openId)
+        || openId !== record.requesterOpenId || project.fileDelivery?.mode !== 'auto'
+        || !Array.isArray(project.fileDelivery.directories)) return undefined;
+      return { mode: turnTier(project, isAdmin(cfg, openId)).mode, directories: project.fileDelivery.directories };
+    }).catch((err) => log.fail('outbound', err, { phase: 'file-auto-delivery' }));
   cliBridge?.register(dispatcher);
   const PENDING_TTL_MS = 30 * 60_000; // abandoned config cards expire after 30 min
   // Goal runs have NO total wall-clock cap (a healthy goal may legitimately run
@@ -4494,6 +4503,7 @@ export function createOrchestrator(
         let lastEvAt = tStart;
         let evCount = 0;
         let textChars = 0;
+        let completionReceived = false;
         for await (const ev of cardEvents.consume(guarded)) {
           if (ev.type === 'steer_accepted') {
             await splitCard(ev);
@@ -4502,6 +4512,7 @@ export function createOrchestrator(
           const tEv = Date.now();
           if (!firstEvAt) firstEvAt = tEv;
           const et = (ev as { type?: string }).type;
+          if (et === 'done') completionReceived = true;
           if (et === 'turn_started') {
             // Host accepted the first turn. Title generation now overlaps the
             // remainder of that turn; the binding was persisted before this loop.
@@ -4621,6 +4632,11 @@ export function createOrchestrator(
           const manuallyRequested = Boolean(state.completionReminderRequested);
           completionReminderRefreshers.delete(cardMsgId);
           const terminalCardUpdated = await stream.finalizeCard(channel, buildRunCard(rc));
+          if (terminalCardUpdated && completionReceived && rc.localFiles.links.length) await sendCompletedFiles({
+            messageId: finalMsgId, chatId: opts.chatId, cwd: runCwd,
+            mode: opts.mode ?? DEFAULT_PERMISSION_MODE, requesterOpenId: currentTurn.requesterOpenId,
+            replyInThread: !opts.flat, cardId: stream.getCardId(),
+          }, rc.rs.terminal);
           // One-line per-turn timeline; all ms are relative to the turn's stream start.
           {
             const terminalAt = Date.now();
@@ -4856,7 +4872,7 @@ export function createOrchestrator(
     // context (null between turns); assigned directly in the loop so TS narrows it.
     // `stream`/`cardMsgId` are null until the turn produces real output — a card is
     // sent LAZILY on first content, so a planning-only turn leaves no empty box.
-    type GoalTurnCtx = { render: RunRender; rc: RunCardState; stream: RunCardStream | null; cardMsgId: string | null; clock?: ReturnType<typeof setInterval> };
+    type GoalTurnCtx = { render: RunRender; rc: RunCardState; stream: RunCardStream | null; cardMsgId: string | null; completed?: boolean; clock?: ReturnType<typeof setInterval> };
     let cur: GoalTurnCtx | null = null;
     let replyTo = opts.replyTo;
     let replyInThread = opts.flat ? false : (opts.replyInThread ?? Boolean(opts.knownThreadId));
@@ -4910,7 +4926,12 @@ export function createOrchestrator(
         replyInThread: !opts.flat, cardId: ctx.stream.getCardId(),
       }, (elementId, element) => ctx.stream!.updateElement(channel, elementId, element));
       ctx.rc.images = await ctx.stream.settleImages(answerText);
-      await ctx.stream.updateCard(channel, buildRunCard(ctx.rc));
+      const cardUpdated = await ctx.stream.updateCard(channel, buildRunCard(ctx.rc));
+      if (cardUpdated && ctx.completed && ctx.rc.localFiles.links.length) await sendCompletedFiles({
+        messageId: ctx.cardMsgId, chatId: opts.chatId, cwd: runCwd,
+        mode: opts.mode ?? DEFAULT_PERMISSION_MODE, requesterOpenId: opts.requesterOpenId,
+        replyInThread: !opts.flat, cardId: ctx.stream.getCardId(),
+      }, ctx.rc.rs.terminal);
       runsByCard.delete(ctx.cardMsgId);
       promoteCard(ctx.cardMsgId, ctx.rc);
     };
@@ -5050,6 +5071,7 @@ export function createOrchestrator(
           // codex auto-continues with the next turn (a terminal goal status, handled
           // after the loop, preempts the final turn's done).
           if (cur) {
+            cur.completed = true;
             cur.render.apply(ev);
             await finalizeCard(cur);
             cur = null;
