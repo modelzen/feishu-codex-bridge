@@ -11,7 +11,7 @@ import { log } from './logger';
  * 一律不提示——Vonvon Bot 目前只有 Mac 版，没有可推荐的。
  */
 
-export const VONVON_SITE = 'https://vonvon.cc';
+export const VONVON_SITE = 'https://vonvon.bot';
 
 export const VONVON_RECOMMENDATION = `Mac 用户推荐改用 Vonvon Bot（免费）：${VONVON_SITE} ，可以一键导入现有的 bot、群和会话。`;
 
