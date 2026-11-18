@@ -44,7 +44,7 @@ describe('终端推荐行', () => {
     expect(log).toHaveBeenCalledTimes(1);
     const line = String(log.mock.calls[0]![0]);
     expect(line).toBe(
-      'Mac 用户推荐改用 Vonvon Bot（免费）：https://vonvon.cc ，可以一键导入现有的 bot、群和会话。',
+      'Mac 用户推荐改用 Vonvon Bot（免费）：https://vonvon.bot ，可以一键导入现有的 bot、群和会话。',
     );
     expect(line).toBe(VONVON_RECOMMENDATION);
     expect(line).not.toContain('停止维护');
